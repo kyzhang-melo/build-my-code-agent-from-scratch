@@ -26,9 +26,9 @@ print(f"[init] OPENROUTER_BASE_URL={OPENROUTER_BASE_URL!r}")
 print(f"[init] OPENROUTER_API_KEY present={bool(OPENROUTER_API_KEY)}")
 
 if not OPENROUTER_API_KEY:
-    raise RuntimeError("KIMI_API_KEY is not set. Please set it in .env")
+    raise RuntimeError("OPENROUTER_API_KEY is not set. Please set it in .env")
 if not OPENROUTER_BASE_URL:
-    raise RuntimeError("KIMI_BASE_URL is not set. Please set it in .env")
+    raise RuntimeError("OPENROUTER_BASE_URL is not set. Please set it in .env")
 if not MODEL_ID:
     raise RuntimeError("MODEL_ID is not set. Please set it in .env")
 
