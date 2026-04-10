@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from message_utils import extract_text, normalize_messages
 from prompts import SYSTEM
 from tools import TOOLS, execute_tool_calls
 
@@ -47,26 +48,11 @@ class LoopState:
     transition_reason: str | None = None
 
 
-def extract_text(content) -> str:
-    if isinstance(content, str):
-        return content.strip()
-    if not isinstance(content, list):
-        return ""
-    texts = []
-    for block in content:
-        text = getattr(block, "text", None)
-        if text is None and isinstance(block, dict):
-            text = block.get("text")
-        if text:
-            texts.append(text)
-    return "\n".join(texts).strip()
-
-
 def run_one_turn(state: LoopState) -> bool:
     response = client.responses.create(
         model=MODEL_ID,
         instructions=SYSTEM,
-        input=state.messages,
+        input=normalize_messages(state.messages),
         tools=TOOLS,
         max_output_tokens=8000,
     )
