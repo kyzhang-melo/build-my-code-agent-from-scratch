@@ -1,22 +1,29 @@
 """Message protocol adapter helpers."""
 
 
-def extract_text(content) -> str:
-    """
-    Extract the final text after the agent loop.
-    """
-    if isinstance(content, str):
-        return content.strip()
-    if not isinstance(content, list):
-        return ""
-    texts = []
-    for block in content:
-        text = getattr(block, "text", None)
-        if text is None and isinstance(block, dict):
-            text = block.get("text")
-        if text:
-            texts.append(text)
-    return "\n".join(texts).strip()
+def extract_text(messages: list[dict]) -> str:
+    """Extract the latest assistant text from message history."""
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") != "assistant":
+            continue
+
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if not isinstance(content, list):
+            continue
+
+        texts = []
+        for block in content:
+            text = getattr(block, "text", None)
+            if text is None and isinstance(block, dict):
+                text = block.get("text")
+            if text:
+                texts.append(text)
+        return "\n".join(texts).strip()
+    return ""
 
 
 def normalize_messages(messages: list[dict]) -> list[dict]:
