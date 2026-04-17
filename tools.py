@@ -414,10 +414,10 @@ def run_tool_call(item) -> tuple[dict, bool]:
     }, used_todo
 
 
-def execute_tool_calls(response_output) -> tuple[list[dict], bool]:
+def execute_tool_calls(tool_calls) -> tuple[list[dict], bool]:
     results = []
     used_todo = False
-    for item in response_output:
+    for item in tool_calls:
         if item.type != "function_call":
             continue
         tool_result, called_todo = run_tool_call(item)

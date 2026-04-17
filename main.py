@@ -121,6 +121,14 @@ def run_one_turn(state: LoopState) -> bool:
         tools=TOOLS,
         max_output_tokens=8000,
     )
+
+    if response.output_text:
+        state.messages.append({
+            "role": "assistant",
+            "content": response.output_text,
+        })
+    
+    tool_calls = []
     for item in response.output:
         if item.type == "function_call":
             state.messages.append({
@@ -130,17 +138,12 @@ def run_one_turn(state: LoopState) -> bool:
                 "arguments": item.arguments,
             })
 
-    if response.output_text:
-        state.messages.append({
-            "role": "assistant",
-            "content": response.output_text,
-        })
+            tool_calls.append(item)
 
-    tool_calls = [item for item in response.output if item.type == "function_call"]
     if not tool_calls:
         return handle_no_tool_calls(state)
 
-    return handle_tool_calls(state, response.output)
+    return handle_tool_calls(state, tool_calls)
 
 
 def agent_loop(state: LoopState) -> None:
