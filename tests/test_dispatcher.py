@@ -84,3 +84,25 @@ def test_execute_tool_calls_todo_sets_used_flag(load_module) -> None:
     assert len(out) == 1
     assert used_todo is True
     assert "[>] step 1" in out[0]["output"]
+
+
+@pytest.mark.parametrize(
+    "arguments, expected_substring",
+    [
+        ('{"items":[{"content":"one","status":"in_progress"},{"content":"two","status":"in_progress"}]}',
+         "Only one plan item can be in_progress"),
+        ('{"items":[{"content":"step","status":"blocked"}]}', "Input should be"),
+        ('{"items":[{"content":"   ","status":"pending"}]}', "String should have at least 1 character"),
+    ],
+)
+def test_execute_tool_calls_todo_validates_with_pydantic(
+    load_module,
+    arguments,
+    expected_substring,
+) -> None:
+    tools = load_module("tools", "tools.py")
+    out, used_todo = tools.execute_tool_calls([_fc("todo", "t1", arguments)])
+
+    assert used_todo is True
+    assert "Error: tool 'todo' failed:" in out[0]["output"]
+    assert expected_substring in out[0]["output"]

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import sys
 import types
+
+
+def _todo_params(items: list[dict]):
+    return sys.modules["tools"].TodoParams.model_validate({"items": items})
 
 
 def test_run_one_turn_full_iteration(load_module, monkeypatch) -> None:
@@ -55,7 +60,7 @@ def test_run_one_turn_full_iteration(load_module, monkeypatch) -> None:
 
 def test_run_one_turn_contract_nudge_when_unresolved_todo(load_module, monkeypatch) -> None:
     main_module = load_module("main", "main.py")
-    main_module.TODO.update([{"content": "unfinished", "status": "in_progress"}])
+    main_module.TODO.update(_todo_params([{"content": "unfinished", "status": "in_progress"}]))
 
     fake_response = types.SimpleNamespace(output=[], output_text="All done.")
     monkeypatch.setattr(
@@ -76,7 +81,7 @@ def test_run_one_turn_contract_nudge_when_unresolved_todo(load_module, monkeypat
 
 def test_run_one_turn_contract_allows_finish_after_rewrite_ack(load_module, monkeypatch) -> None:
     main_module = load_module("main", "main.py")
-    main_module.TODO.update([{"content": "unfinished", "status": "pending"}])
+    main_module.TODO.update(_todo_params([{"content": "unfinished", "status": "pending"}]))
 
     fake_response = types.SimpleNamespace(output=[], output_text="Done.")
     monkeypatch.setattr(
@@ -98,7 +103,7 @@ def test_run_one_turn_contract_allows_finish_after_rewrite_ack(load_module, monk
 
 def test_run_one_turn_contract_warns_after_max_nudges(load_module, monkeypatch) -> None:
     main_module = load_module("main", "main.py")
-    main_module.TODO.update([{"content": "unfinished", "status": "pending"}])
+    main_module.TODO.update(_todo_params([{"content": "unfinished", "status": "pending"}]))
 
     fake_response = types.SimpleNamespace(output=[], output_text="Done.")
     monkeypatch.setattr(
@@ -120,7 +125,7 @@ def test_run_one_turn_contract_warns_after_max_nudges(load_module, monkeypatch) 
 
 def test_run_one_turn_adds_todo_reminder_after_interval(load_module, monkeypatch) -> None:
     main_module = load_module("main", "main.py")
-    main_module.TODO.update([{"content": "one", "status": "pending"}])
+    main_module.TODO.update(_todo_params([{"content": "one", "status": "pending"}]))
     main_module.TODO.state.rounds_since_update = 2
 
     function_call = types.SimpleNamespace(
@@ -151,7 +156,7 @@ def test_run_one_turn_adds_todo_reminder_after_interval(load_module, monkeypatch
 
 def test_handle_no_tool_calls_unresolved_todo_nudges(load_module) -> None:
     main_module = load_module("main", "main.py")
-    main_module.TODO.update([{"content": "unfinished", "status": "in_progress"}])
+    main_module.TODO.update(_todo_params([{"content": "unfinished", "status": "in_progress"}]))
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
 
     should_continue = main_module.handle_no_tool_calls(state)
@@ -164,7 +169,7 @@ def test_handle_no_tool_calls_unresolved_todo_nudges(load_module) -> None:
 
 def test_handle_tool_calls_updates_transition_and_turn(load_module, monkeypatch) -> None:
     main_module = load_module("main", "main.py")
-    main_module.TODO.update([])
+    main_module.TODO.update(_todo_params([]))
     monkeypatch.setattr(
         main_module,
         "execute_tool_calls",

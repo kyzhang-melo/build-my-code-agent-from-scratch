@@ -1,9 +1,11 @@
 import json
 import os
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 WORKDIR = Path.cwd()
@@ -99,16 +101,46 @@ TOOLS = [
 ]
 
 
-@dataclass
-class PlanItem:
-    content: str
-    status: str = "pending"
-    active_form: str = ""
+class PlanItem(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    content: str = Field(min_length=1)
+    status: Literal["pending", "in_progress", "completed"] = "pending"
+    active_form: str = Field(default="", alias="activeForm")
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def normalize_content(cls, value) -> str:
+        return str(value).strip()
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def normalize_status(cls, value) -> str:
+        return str(value).strip().lower()
+
+    @field_validator("active_form", mode="before")
+    @classmethod
+    def normalize_active_form(cls, value) -> str:
+        return str(value).strip()
 
 
-@dataclass
-class PlanningState:
-    items: list[PlanItem] = field(default_factory=list)
+class TodoParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[PlanItem] = Field(max_length=12)
+
+    @model_validator(mode="after")
+    def validate_single_in_progress(self):
+        in_progress_count = sum(1 for item in self.items if item.status == "in_progress")
+        if in_progress_count > 1:
+            raise ValueError("Only one plan item can be in_progress")
+        return self
+
+
+class PlanningState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[PlanItem] = Field(default_factory=list)
     rounds_since_update: int = 0
 
 
@@ -116,35 +148,8 @@ class TodoManager:
     def __init__(self):
         self.state = PlanningState()
 
-    def update(self, items: list) -> str:
-        if len(items) > 12:
-            raise ValueError("Keep the session plan short (max 12 items)")
-
-        normalized = []
-        in_progress_count = 0
-        for index, raw_item in enumerate(items):
-            content = str(raw_item.get("content", "")).strip()
-            status = str(raw_item.get("status", "pending")).lower()
-            active_form = str(raw_item.get("activeForm", "")).strip()
-
-            if not content:
-                raise ValueError(f"Item {index}: content required")
-            if status not in {"pending", "in_progress", "completed"}:
-                raise ValueError(f"Item {index}: invalid status '{status}'")
-            if status == "in_progress":
-                in_progress_count += 1
-
-            normalized.append(PlanItem(
-                content=content,
-                status=status,
-                active_form=active_form,
-            ))
-
-        if in_progress_count > 1:
-            raise ValueError("Only one plan item can be in_progress")
-
-        self.state.items = normalized
-        self.state.rounds_since_update = 0
+    def update(self, params: TodoParams) -> str:
+        self.state = PlanningState(items=params.items, rounds_since_update=0)
         return self.render()
 
     def note_round_without_update(self) -> None:
@@ -289,6 +294,10 @@ def sanitize_passthrough(args: dict) -> dict:
     return dict(args)
 
 
+def run_todo(args: dict) -> str:
+    return TODO.update(TodoParams.model_validate(args))
+
+
 def validate_tool_args(spec: ToolRuntimeSpec, args: dict) -> list[str]:
     errors = []
     allowed = spec.required_fields | spec.optional_fields
@@ -358,7 +367,7 @@ def build_tool_registry() -> dict[str, ToolRuntimeSpec]:
             string_fields=set(),
             int_fields=set(),
             sanitize_args=sanitize_passthrough,
-            execute=lambda args: TODO.update(args["items"]),
+            execute=run_todo,
         ),
     }
 
