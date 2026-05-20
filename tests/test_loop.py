@@ -101,6 +101,26 @@ def test_run_one_turn_contract_allows_finish_after_rewrite_ack(load_module, monk
     assert state.todo_rewrite_ack_pending is False
 
 
+def test_run_one_turn_does_not_finish_after_initial_todo_rewrite(load_module, monkeypatch) -> None:
+    main_module = load_module("main", "main.py")
+    main_module.TODO.update(_todo_params([{"content": "unfinished", "status": "pending"}]))
+
+    fake_response = types.SimpleNamespace(output=[], output_text="Done.")
+    monkeypatch.setattr(
+        main_module,
+        "client",
+        types.SimpleNamespace(responses=types.SimpleNamespace(create=lambda **_: fake_response)),
+    )
+
+    state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
+    should_continue = main_module.run_one_turn(state)
+
+    assert should_continue is True
+    assert state.transition_reason == "todo_contract_nudge"
+    assert state.todo_rewrite_ack_pending is False
+    assert "Before ending, either complete all todo items" in state.messages[-1]["content"]
+
+
 def test_run_one_turn_contract_warns_after_max_nudges(load_module, monkeypatch) -> None:
     main_module = load_module("main", "main.py")
     main_module.TODO.update(_todo_params([{"content": "unfinished", "status": "pending"}]))
@@ -159,7 +179,7 @@ def test_handle_no_tool_calls_unresolved_todo_nudges(load_module) -> None:
     main_module.TODO.update(_todo_params([{"content": "unfinished", "status": "in_progress"}]))
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
 
-    should_continue = main_module.handle_no_tool_calls(state)
+    should_continue = main_module.TODO_POLICY.handle_no_tool_calls(state)
 
     assert should_continue is True
     assert state.transition_reason == "todo_contract_nudge"
@@ -167,20 +187,48 @@ def test_handle_no_tool_calls_unresolved_todo_nudges(load_module) -> None:
     assert "Before ending, either complete all todo items" in state.messages[-1]["content"]
 
 
-def test_handle_tool_calls_updates_transition_and_turn(load_module, monkeypatch) -> None:
+def test_run_one_turn_tool_calls_update_transition_and_turn(load_module, monkeypatch) -> None:
     main_module = load_module("main", "main.py")
     main_module.TODO.update(_todo_params([]))
+    function_call = types.SimpleNamespace(type="function_call", call_id="c1", name="bash", arguments="{}")
+    fake_response = types.SimpleNamespace(output=[function_call], output_text="")
+    monkeypatch.setattr(
+        main_module,
+        "client",
+        types.SimpleNamespace(responses=types.SimpleNamespace(create=lambda **_: fake_response)),
+    )
     monkeypatch.setattr(
         main_module,
         "execute_tool_calls",
         lambda _output: ([{"type": "function_call_output", "call_id": "c1", "output": "ok"}], False),
     )
-    response_output = [types.SimpleNamespace(type="function_call", call_id="c1", name="bash", arguments="{}")]
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
 
-    should_continue = main_module.handle_tool_calls(state, response_output)
+    should_continue = main_module.run_one_turn(state)
 
     assert should_continue is True
     assert state.turn_count == 2
     assert state.transition_reason == "function_call_output"
     assert state.messages[-1]["type"] == "function_call_output"
+
+
+def test_after_tool_calls_sets_rewrite_ack_only_after_contract_nudge(load_module) -> None:
+    main_module = load_module("main", "main.py")
+    main_module.TODO.update(_todo_params([{"content": "old", "status": "pending"}]))
+    before = main_module.TODO_POLICY.before_tool_calls()
+    main_module.TODO.update(_todo_params([{"content": "new", "status": "pending"}]))
+    after = main_module.TODO.snapshot_signature()
+    state = main_module.LoopState(
+        messages=[{"role": "user", "content": "task"}],
+        transition_reason="todo_contract_nudge",
+    )
+
+    main_module.TODO_POLICY.after_tool_calls(
+        state,
+        used_todo=True,
+        signature_before=before,
+        signature_after=after,
+    )
+
+    assert state.todo_rewrite_ack_pending is True
+    assert state.contract_nudges == 0

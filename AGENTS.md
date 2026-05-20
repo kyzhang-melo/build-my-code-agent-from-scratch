@@ -4,7 +4,7 @@ Guidelines for contributors and coding agents working in this repository.
 
 ## Project Goal
 
-This project is a learning-focused code agent split into multiple modules:
+This project is a personal code agent project:
 
 - `main.py`: loop control and app entrypoint
 - `tools.py`: tool schema, tool runtime validation/sanitization, and todo manager

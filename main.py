@@ -51,66 +51,73 @@ class LoopState:
     todo_rewrite_ack_pending: bool = False
 
 
-def handle_no_tool_calls(state: LoopState) -> bool:
-    if not TODO.has_active_plan() or TODO.all_items_completed() or state.todo_rewrite_ack_pending:
-        state.contract_nudges = 0
-        state.todo_rewrite_ack_pending = False
-        state.transition_reason = None
-        return False
+class TodoPlanningPolicy:
+    def __init__(self, todo, max_contract_nudges: int):
+        self.todo = todo
+        self.max_contract_nudges = max_contract_nudges
 
-    if state.contract_nudges >= TODO_CONTRACT_MAX_NUDGES:
+    def handle_no_tool_calls(self, state: LoopState) -> bool:
+        if not self.todo.has_active_plan() or self.todo.all_items_completed() or state.todo_rewrite_ack_pending:
+            state.contract_nudges = 0
+            state.todo_rewrite_ack_pending = False
+            state.transition_reason = None
+            return False
+
+        if state.contract_nudges >= self.max_contract_nudges:
+            state.messages.append({
+                "role": "assistant",
+                "content": (
+                    "Warning: Ending with unresolved todo items after repeated contract reminders.\n"
+                    f"{self.todo.render()}"
+                ),
+            })
+            state.todo_rewrite_ack_pending = False
+            state.transition_reason = None
+            return False
+
+        state.contract_nudges += 1
         state.messages.append({
-            "role": "assistant",
+            "role": "user",
             "content": (
-                "Warning: Ending with unresolved todo items after repeated contract reminders.\n"
-                f"{TODO.render()}"
+                "<contract>Before ending, either complete all todo items, "
+                "or call todo to explicitly rewrite/remove items that are no longer needed.</contract>"
             ),
         })
-        state.todo_rewrite_ack_pending = False
-        state.transition_reason = None
-        return False
+        state.transition_reason = "todo_contract_nudge"
+        return True
 
-    state.contract_nudges += 1
-    state.messages.append({
-        "role": "user",
-        "content": (
-            "<contract>Before ending, either complete all todo items, "
-            "or call todo to explicitly rewrite/remove items that are no longer needed.</contract>"
-        ),
-    })
-    state.transition_reason = "todo_contract_nudge"
-    return True
+    def before_tool_calls(self) -> tuple[tuple[str, str, str], ...]:
+        return self.todo.snapshot_signature()
+
+    def after_tool_calls(
+        self,
+        state: LoopState,
+        *,
+        used_todo: bool,
+        signature_before: tuple[tuple[str, str, str], ...],
+        signature_after: tuple[tuple[str, str, str], ...],
+    ) -> None:
+        was_contract_nudge_response = state.transition_reason == "todo_contract_nudge"
+
+        if used_todo:
+            self.todo.state.rounds_since_update = 0
+            if was_contract_nudge_response and signature_before != signature_after:
+                state.todo_rewrite_ack_pending = True
+        else:
+            self.todo.note_round_without_update()
+            reminder = self.todo.reminder()
+            if reminder:
+                state.messages.append({
+                    "role": "user",
+                    "content": reminder,
+                })
+
+        if not self.todo.has_active_plan() or self.todo.all_items_completed():
+            state.todo_rewrite_ack_pending = False
+        state.contract_nudges = 0
 
 
-def handle_tool_calls(state: LoopState, response_output) -> bool:
-    todo_signature_before = TODO.snapshot_signature()
-    results, used_todo = execute_tool_calls(response_output)
-    if not results:
-        state.transition_reason = None
-        return False
-
-    todo_signature_after = TODO.snapshot_signature()
-    state.messages.extend(results)
-    if used_todo:
-        TODO.state.rounds_since_update = 0
-        if todo_signature_before != todo_signature_after:
-            state.todo_rewrite_ack_pending = True
-    else:
-        TODO.note_round_without_update()
-        reminder = TODO.reminder()
-        if reminder:
-            state.messages.append({
-                "role": "user",
-                "content": reminder,
-            })
-
-    if not TODO.has_active_plan() or TODO.all_items_completed():
-        state.todo_rewrite_ack_pending = False
-    state.contract_nudges = 0
-
-    state.turn_count += 1
-    state.transition_reason = "function_call_output"
-    return True
+TODO_POLICY = TodoPlanningPolicy(TODO, TODO_CONTRACT_MAX_NUDGES)
 
 
 def run_one_turn(state: LoopState) -> bool:
@@ -141,9 +148,26 @@ def run_one_turn(state: LoopState) -> bool:
             tool_calls.append(item)
 
     if not tool_calls:
-        return handle_no_tool_calls(state)
+        return TODO_POLICY.handle_no_tool_calls(state)
 
-    return handle_tool_calls(state, tool_calls)
+    todo_signature_before = TODO_POLICY.before_tool_calls()
+    results, used_todo = execute_tool_calls(tool_calls)
+    if not results:
+        state.transition_reason = None
+        return False
+
+    todo_signature_after = TODO.snapshot_signature()
+    state.messages.extend(results)
+    TODO_POLICY.after_tool_calls(
+        state,
+        used_todo=used_todo,
+        signature_before=todo_signature_before,
+        signature_after=todo_signature_after,
+    )
+
+    state.turn_count += 1
+    state.transition_reason = "function_call_output"
+    return True
 
 
 def agent_loop(state: LoopState) -> None:
