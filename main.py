@@ -39,13 +39,14 @@ client = OpenAI(
 )
 print("[init] OpenAI client initialized")
 TODO_CONTRACT_MAX_NUDGES = 2
+MAX_API_CALLS_PER_USER_TURN = 30
 
 
 @dataclass
 class LoopState:
-    # The minimal loop state: history, loop count, and why we continue.
+    # The minimal loop state: history, API call count, and why we continue.
     messages: list
-    turn_count: int = 1
+    api_call_count: int = 0
     transition_reason: str | None = None
     contract_nudges: int = 0
     todo_rewrite_ack_pending: bool = False
@@ -57,7 +58,7 @@ class TodoPlanningPolicy:
         self.max_contract_nudges = max_contract_nudges
 
     def handle_no_tool_calls(self, state: LoopState) -> bool:
-        if not self.todo.has_active_plan() or self.todo.all_items_completed() or state.todo_rewrite_ack_pending:
+        if not self.todo.has_active_plan() or self.todo.all_items_completed():
             state.contract_nudges = 0
             state.todo_rewrite_ack_pending = False
             state.transition_reason = None
@@ -121,6 +122,18 @@ TODO_POLICY = TodoPlanningPolicy(TODO, TODO_CONTRACT_MAX_NUDGES)
 
 
 def run_one_turn(state: LoopState) -> bool:
+    if state.api_call_count >= MAX_API_CALLS_PER_USER_TURN:
+        state.messages.append({
+            "role": "assistant",
+            "content": (
+                "Warning: stopped after "
+                f"MAX_API_CALLS_PER_USER_TURN={MAX_API_CALLS_PER_USER_TURN}."
+            ),
+        })
+        state.transition_reason = None
+        return False
+
+    state.api_call_count += 1
     response = client.responses.create(
         model=MODEL_ID,
         instructions=SYSTEM,
@@ -165,7 +178,6 @@ def run_one_turn(state: LoopState) -> bool:
         signature_after=todo_signature_after,
     )
 
-    state.turn_count += 1
     state.transition_reason = "function_call_output"
     return True
 

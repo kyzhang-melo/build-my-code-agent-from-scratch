@@ -48,7 +48,7 @@ def test_run_one_turn_full_iteration(load_module, monkeypatch) -> None:
     should_continue = main_module.run_one_turn(state)
 
     assert should_continue is True
-    assert state.turn_count == 2
+    assert state.api_call_count == 1
     assert state.transition_reason == "function_call_output"
     assert captured["input"][0]["role"] == "user"
     assert captured["input"][0]["content"] == "task part 1\ntask part 2"
@@ -79,7 +79,7 @@ def test_run_one_turn_contract_nudge_when_unresolved_todo(load_module, monkeypat
     assert "Before ending, either complete all todo items" in state.messages[-1]["content"]
 
 
-def test_run_one_turn_contract_allows_finish_after_rewrite_ack(load_module, monkeypatch) -> None:
+def test_run_one_turn_contract_does_not_finish_after_rewrite_ack(load_module, monkeypatch) -> None:
     main_module = load_module("main", "main.py")
     main_module.TODO.update(_todo_params([{"content": "unfinished", "status": "pending"}]))
 
@@ -96,9 +96,10 @@ def test_run_one_turn_contract_allows_finish_after_rewrite_ack(load_module, monk
     )
     should_continue = main_module.run_one_turn(state)
 
-    assert should_continue is False
-    assert state.transition_reason is None
-    assert state.todo_rewrite_ack_pending is False
+    assert should_continue is True
+    assert state.transition_reason == "todo_contract_nudge"
+    assert state.todo_rewrite_ack_pending is True
+    assert "Before ending, either complete all todo items" in state.messages[-1]["content"]
 
 
 def test_run_one_turn_does_not_finish_after_initial_todo_rewrite(load_module, monkeypatch) -> None:
@@ -207,7 +208,7 @@ def test_run_one_turn_tool_calls_update_transition_and_turn(load_module, monkeyp
     should_continue = main_module.run_one_turn(state)
 
     assert should_continue is True
-    assert state.turn_count == 2
+    assert state.api_call_count == 1
     assert state.transition_reason == "function_call_output"
     assert state.messages[-1]["type"] == "function_call_output"
 

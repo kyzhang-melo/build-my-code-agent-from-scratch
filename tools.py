@@ -1,5 +1,4 @@
 import json
-import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -203,7 +202,7 @@ def run_bash(command: str) -> str:
         result = subprocess.run(
             command,
             shell=True,
-            cwd=os.getcwd(),
+            cwd=str(WORKDIR),
             capture_output=True,
             text=True,
             timeout=120,
