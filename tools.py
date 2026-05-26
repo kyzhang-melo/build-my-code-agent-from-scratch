@@ -4,11 +4,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 
 WORKDIR = Path.cwd()
 PLAN_REMINDER_INTERVAL = 3
+TOOL_OUTPUT_PREVIEW_CHARS = 500
 
 
 TOOLS = [
@@ -194,6 +195,34 @@ class TodoManager:
 TODO = TodoManager()
 
 
+class BashParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    command: str = Field(min_length=1)
+
+
+class ReadFileParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1)
+    limit: StrictInt | None = None
+
+
+class WriteFileParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1)
+    content: str
+
+
+class EditFileParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1)
+    old_text: str = Field(min_length=1)
+    new_text: str
+
+
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(item in command for item in dangerous):
@@ -258,12 +287,9 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 @dataclass
 class ToolRuntimeSpec:
     name: str
-    required_fields: set[str]
-    optional_fields: set[str]
-    string_fields: set[str]
-    int_fields: set[str]
+    params_model: type[BaseModel]
     sanitize_args: Callable[[dict], dict]
-    execute: Callable[[dict], str]
+    execute: Callable[[BaseModel], str]
 
 
 def sanitize_common_string(value: str) -> str:
@@ -293,80 +319,37 @@ def sanitize_passthrough(args: dict) -> dict:
     return dict(args)
 
 
-def run_todo(args: dict) -> str:
-    return TODO.update(TodoParams.model_validate(args))
-
-
-def validate_tool_args(spec: ToolRuntimeSpec, args: dict) -> list[str]:
-    errors = []
-    allowed = spec.required_fields | spec.optional_fields
-
-    missing = spec.required_fields - set(args.keys())
-    if missing:
-        errors.append(f"missing required fields: {sorted(missing)}")
-
-    unknown = set(args.keys()) - allowed
-    if unknown:
-        errors.append(f"unknown fields: {sorted(unknown)}")
-
-    for field in spec.string_fields:
-        if field in args and not isinstance(args[field], str):
-            errors.append(f"field '{field}' must be a string")
-
-    for field in spec.int_fields:
-        value = args.get(field)
-        if field in args and value is not None and (not isinstance(value, int) or isinstance(value, bool)):
-            errors.append(f"field '{field}' must be an integer")
-
-    return errors
-
-
 def build_tool_registry() -> dict[str, ToolRuntimeSpec]:
     return {
         "bash": ToolRuntimeSpec(
             name="bash",
-            required_fields={"command"},
-            optional_fields=set(),
-            string_fields={"command"},
-            int_fields=set(),
+            params_model=BashParams,
             sanitize_args=sanitize_bash_args,
-            execute=lambda args: run_bash(args["command"]),
+            execute=lambda params: run_bash(params.command),
         ),
         "read_file": ToolRuntimeSpec(
             name="read_file",
-            required_fields={"path"},
-            optional_fields={"limit"},
-            string_fields={"path"},
-            int_fields={"limit"},
+            params_model=ReadFileParams,
             sanitize_args=sanitize_file_args,
-            execute=lambda args: run_read(args["path"], args.get("limit")),
+            execute=lambda params: run_read(params.path, params.limit),
         ),
         "write_file": ToolRuntimeSpec(
             name="write_file",
-            required_fields={"path", "content"},
-            optional_fields=set(),
-            string_fields={"path", "content"},
-            int_fields=set(),
+            params_model=WriteFileParams,
             sanitize_args=sanitize_file_args,
-            execute=lambda args: run_write(args["path"], args["content"]),
+            execute=lambda params: run_write(params.path, params.content),
         ),
         "edit_file": ToolRuntimeSpec(
             name="edit_file",
-            required_fields={"path", "old_text", "new_text"},
-            optional_fields=set(),
-            string_fields={"path", "old_text", "new_text"},
-            int_fields=set(),
+            params_model=EditFileParams,
             sanitize_args=sanitize_file_args,
-            execute=lambda args: run_edit(args["path"], args["old_text"], args["new_text"]),
+            execute=lambda params: run_edit(params.path, params.old_text, params.new_text),
         ),
         "todo": ToolRuntimeSpec(
             name="todo",
-            required_fields={"items"},
-            optional_fields=set(),
-            string_fields=set(),
-            int_fields=set(),
+            params_model=TodoParams,
             sanitize_args=sanitize_passthrough,
-            execute=run_todo,
+            execute=lambda params: TODO.update(params),
         ),
     }
 
@@ -401,19 +384,20 @@ def run_tool_call(item) -> tuple[dict, bool]:
         output = f"Error: unknown tool '{item.name}'"
     else:
         clean_args = spec.sanitize_args(args)
-        errors = validate_tool_args(spec, clean_args)
-        if errors:
-            output = f"Error: invalid arguments for tool '{item.name}': {'; '.join(errors)}"
+        try:
+            params = spec.params_model.model_validate(clean_args)
+        except Exception as e:
+            output = f"Error: invalid arguments for tool '{item.name}': {e}"
         else:
             try:
-                output = spec.execute(clean_args)
+                output = spec.execute(params)
             except Exception as e:
                 output = f"Error: tool '{item.name}' failed: {e}"
 
     if item.name == "todo":
         print(output)
     else:
-        print(output[0:200])
+        print(output[:TOOL_OUTPUT_PREVIEW_CHARS])
 
     return {
         "type": "function_call_output",

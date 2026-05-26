@@ -34,7 +34,7 @@ def test_execute_tool_calls_failure_paths(load_module, item, expected_substring)
 def test_execute_tool_calls_known_tools(load_module) -> None:
     tools = load_module("tools", "tools.py")
     tools.run_bash = lambda command: f"ran:{command}"
-    tools.TOOL_REGISTRY["bash"].execute = lambda args: tools.run_bash(args["command"])
+    tools.TOOL_REGISTRY["bash"].execute = lambda params: tools.run_bash(params.command)
 
     out, used_todo = tools.execute_tool_calls([
         _fc("bash", "c1", '{"command":"echo hi"}'),
@@ -53,7 +53,7 @@ def test_execute_tool_calls_known_tools(load_module) -> None:
 def test_execute_tool_calls_sanitizes_prompt_prefix_for_bash(load_module) -> None:
     tools = load_module("tools", "tools.py")
     tools.run_bash = lambda command: f"ran:{command}"
-    tools.TOOL_REGISTRY["bash"].execute = lambda args: tools.run_bash(args["command"])
+    tools.TOOL_REGISTRY["bash"].execute = lambda params: tools.run_bash(params.command)
 
     out, used_todo = tools.execute_tool_calls([
         _fc("bash", "c1", '{"command":"   >$#   echo hi"}'),
@@ -104,5 +104,28 @@ def test_execute_tool_calls_todo_validates_with_pydantic(
     out, used_todo = tools.execute_tool_calls([_fc("todo", "t1", arguments)])
 
     assert used_todo is True
-    assert "Error: tool 'todo' failed:" in out[0]["output"]
+    assert "Error: invalid arguments for tool 'todo':" in out[0]["output"]
+    assert expected_substring in out[0]["output"]
+
+
+@pytest.mark.parametrize(
+    "item, expected_substring",
+    [
+        (_fc("bash", "b1", '{"command":""}'), "String should have at least 1 character"),
+        (_fc("read_file", "r1", '{"path":"README.md","limit":true}'), "Input should be a valid integer"),
+        (_fc("read_file", "r2", '{"path":"README.md","limit":"1"}'), "Input should be a valid integer"),
+        (_fc("write_file", "w1", '{"path":"tmp/x.txt","content":"","extra":1}'), "Extra inputs are not permitted"),
+        (_fc("edit_file", "e1", '{"path":"tmp/x.txt","new_text":"new"}'), "Field required"),
+    ],
+)
+def test_execute_tool_calls_basic_tools_validate_with_pydantic(
+    load_module,
+    item,
+    expected_substring,
+) -> None:
+    tools = load_module("tools", "tools.py")
+    out, used_todo = tools.execute_tool_calls([item])
+
+    assert used_todo is False
+    assert f"Error: invalid arguments for tool '{item.name}':" in out[0]["output"]
     assert expected_substring in out[0]["output"]

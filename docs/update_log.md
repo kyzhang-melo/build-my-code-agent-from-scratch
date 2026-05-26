@@ -75,3 +75,19 @@
 - `turn_count` is not a true turn count. Better naming: `api_call_count`, and increment it once per `client.responses.create(...)` call
 - no `MAX_API_CALLS_PER_USER_TURN`, so the agent can loop forever
 - `todo_rewrite_ack_pending` can let the agent stop with unfinished todo items
+
+## May 26
+
+### What I've done
+
+- Upgrade the parameter validation for the bash, read, write, edit tools to Pydantic Params.
+- Add dispatcher tests for Pydantic validation failures on basic tools.
+- Add `TOOL_OUTPUT_PREVIEW_CHARS = 500` to make tool output previews more useful during prompt-case testing.
+- Add prompt cases for manually testing single-tool, multi-tool, and todowrite behavior.
+
+### Why
+
+- Leveraging Pydantic models for parameter validation eliminates the complexity of writing validation logic manually.
+- Enhance the extensibility of parameter validation logic.
+- Preparing to integrate the grep tool.
+- Improve manual prompt-case testing by showing more useful command/test output in the terminal preview.
