@@ -1,4 +1,5 @@
 import json
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,6 +65,94 @@ TOOLS = [
                 "new_text": {"type": "string"},
             },
             "required": ["path", "old_text", "new_text"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "glob",
+        "description": (
+            "Find files or directories in the workspace by glob pattern. "
+            "When the user names a search directory, pass it as directory instead of "
+            "prefixing it into pattern."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": (
+                        "Glob pattern relative to directory, e.g. '*.py' or '**/*.py'. "
+                        "Do not include the directory prefix here."
+                    ),
+                },
+                "directory": {
+                    "type": "string",
+                    "description": (
+                        "Directory to search within, relative to the workspace or absolute "
+                        "inside the workspace. Defaults to the workspace."
+                    ),
+                },
+                "include_dirs": {
+                    "type": "boolean",
+                    "description": "Whether directory matches should be included in results.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of matches to return. Defaults to 1000.",
+                },
+            },
+            "required": ["pattern"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "grep",
+        "description": (
+            "Search workspace file contents with ripgrep. "
+            "Put the search location in path, and use glob only to filter file names."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Regular expression pattern to search for in file contents.",
+                },
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "File or directory to search, relative to the workspace or absolute "
+                        "inside the workspace. Defaults to the workspace."
+                    ),
+                },
+                "glob": {
+                    "type": "string",
+                    "description": "Optional file filter such as '*.py' or 'tests/*.py'.",
+                },
+                "output_mode": {
+                    "type": "string",
+                    "enum": ["content", "files_with_matches", "count_matches"],
+                    "description": (
+                        "files_with_matches returns paths, content returns matching lines, "
+                        "count_matches returns per-file match counts."
+                    ),
+                },
+                "ignore_case": {
+                    "type": "boolean",
+                    "description": "Whether matching should ignore case.",
+                },
+                "line_number": {
+                    "type": "boolean",
+                    "description": "Whether content mode should include line numbers.",
+                },
+                "head_limit": {
+                    "type": "integer",
+                    "description": "Maximum number of output lines to return. Defaults to 250.",
+                },
+            },
+            "required": ["pattern"],
             "additionalProperties": False,
         },
     },
@@ -223,6 +312,27 @@ class EditFileParams(BaseModel):
     new_text: str
 
 
+class GlobParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    pattern: str = Field(min_length=1)
+    directory: str | None = None
+    include_dirs: bool = True
+    limit: StrictInt = Field(default=1000, ge=1)
+
+
+class GrepParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    pattern: str = Field(min_length=1)
+    path: str = "."
+    glob: str | None = None
+    output_mode: Literal["content", "files_with_matches", "count_matches"] = "files_with_matches"
+    ignore_case: bool = False
+    line_number: bool = True
+    head_limit: StrictInt = Field(default=250, ge=0)
+
+
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(item in command for item in dangerous):
@@ -284,6 +394,130 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+def _limit_lines(lines: list[str], limit: int) -> tuple[list[str], str]:
+    if limit and len(lines) > limit:
+        return lines[:limit], f"\n... ({len(lines) - limit} more lines)"
+    return lines, ""
+
+
+def run_glob(
+    pattern: str,
+    directory: str | None = None,
+    include_dirs: bool = True,
+    limit: int = 1000,
+) -> str:
+    try:
+        base = safe_path(directory or ".")
+        if pattern.startswith("**") and base == WORKDIR:
+            return (
+                "Error: unsafe glob pattern from workspace root. "
+                "Pass a more specific directory when using '**'."
+            )
+        if not base.exists():
+            return f"Error: Directory not found: {directory or '.'}"
+        if not base.is_dir():
+            return f"Error: Not a directory: {directory or '.'}"
+
+        matches = list(base.glob(pattern))
+        if not include_dirs:
+            matches = [path for path in matches if path.is_file()]
+        matches.sort()
+
+        total = len(matches)
+        returned = matches[:limit]
+        lines = [str(path.relative_to(base)) for path in returned]
+        if total == 0:
+            return f"No matches found for pattern `{pattern}`."
+
+        message = f"Found {total} matches for pattern `{pattern}`."
+        if total > limit:
+            message += f" Showing first {limit}."
+        return "\n".join([message, *lines])[:50000]
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def _strip_workdir_prefix(output: str) -> str:
+    prefix = str(WORKDIR) + "/"
+    return "\n".join(
+        line[len(prefix) :] if line.startswith(prefix) else line
+        for line in output.splitlines()
+    )
+
+
+def run_grep(
+    pattern: str,
+    path: str = ".",
+    glob: str | None = None,
+    output_mode: str = "files_with_matches",
+    ignore_case: bool = False,
+    line_number: bool = True,
+    head_limit: int = 250,
+) -> str:
+    rg_path = shutil.which("rg")
+    if not rg_path:
+        return "Error: ripgrep (`rg`) is not installed. Install it with `brew install ripgrep`."
+
+    try:
+        search_path = safe_path(path)
+        if not search_path.exists():
+            return f"Error: Path not found: {path}"
+
+        args = [
+            rg_path,
+            "--hidden",
+            "--max-columns",
+            "500",
+            "--glob",
+            "!.git",
+            "--glob",
+            "!.svn",
+            "--glob",
+            "!.hg",
+            "--glob",
+            "!.env",
+            "--glob",
+            "!.env.*",
+        ]
+        if ignore_case:
+            args.append("--ignore-case")
+        if glob:
+            args.extend(["--glob", glob])
+        if output_mode == "files_with_matches":
+            args.append("--files-with-matches")
+        elif output_mode == "count_matches":
+            args.append("--count-matches")
+        elif output_mode == "content" and line_number:
+            args.append("--line-number")
+
+        args.extend(["--", pattern, str(search_path)])
+
+        result = subprocess.run(
+            args,
+            shell=False,
+            cwd=str(WORKDIR),
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except subprocess.TimeoutExpired:
+        return "Error: grep timed out after 20s. Try a more specific path or pattern."
+    except Exception as e:
+        return f"Error: {e}"
+
+    output = _strip_workdir_prefix(result.stdout.strip())
+    stderr = result.stderr.strip()
+    if result.returncode == 1:
+        return "No matches found."
+    if result.returncode not in (0, 1):
+        return f"Error: grep failed. {stderr}".strip()
+
+    lines = output.splitlines()
+    lines, suffix = _limit_lines(lines, head_limit)
+    output = "\n".join(lines) + suffix
+    return output[:50000] if output else "No matches found."
+
+
 @dataclass
 class ToolRuntimeSpec:
     name: str
@@ -312,6 +546,15 @@ def sanitize_file_args(args: dict) -> dict:
     path = clean.get("path")
     if isinstance(path, str):
         clean["path"] = sanitize_common_string(path)
+    return clean
+
+
+def sanitize_search_args(args: dict) -> dict:
+    clean = dict(args)
+    for key in ("pattern", "path", "directory"):
+        value = clean.get(key)
+        if isinstance(value, str):
+            clean[key] = sanitize_common_string(value)
     return clean
 
 
@@ -344,6 +587,31 @@ def build_tool_registry() -> dict[str, ToolRuntimeSpec]:
             params_model=EditFileParams,
             sanitize_args=sanitize_file_args,
             execute=lambda params: run_edit(params.path, params.old_text, params.new_text),
+        ),
+        "glob": ToolRuntimeSpec(
+            name="glob",
+            params_model=GlobParams,
+            sanitize_args=sanitize_search_args,
+            execute=lambda params: run_glob(
+                params.pattern,
+                params.directory,
+                params.include_dirs,
+                params.limit,
+            ),
+        ),
+        "grep": ToolRuntimeSpec(
+            name="grep",
+            params_model=GrepParams,
+            sanitize_args=sanitize_search_args,
+            execute=lambda params: run_grep(
+                params.pattern,
+                params.path,
+                params.glob,
+                params.output_mode,
+                params.ignore_case,
+                params.line_number,
+                params.head_limit,
+            ),
         ),
         "todo": ToolRuntimeSpec(
             name="todo",

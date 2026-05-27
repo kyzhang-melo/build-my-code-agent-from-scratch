@@ -4,6 +4,12 @@ import sys
 import types
 
 
+def test_input_prompt_marks_ansi_sequences_as_nonprinting(load_module) -> None:
+    main_module = load_module("main", "main.py")
+
+    assert main_module.INPUT_PROMPT == "\001\033[36m\002s01 >> \001\033[0m\002"
+
+
 def _todo_params(items: list[dict]):
     return sys.modules["tools"].TodoParams.model_validate({"items": items})
 
