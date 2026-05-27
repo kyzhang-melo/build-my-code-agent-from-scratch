@@ -91,3 +91,22 @@
 - Enhance the extensibility of parameter validation logic.
 - Preparing to integrate the grep tool.
 - Improve manual prompt-case testing by showing more useful command/test output in the terminal preview.
+
+## May 27
+
+### What I've done
+
+- Add `grep` and `glob` tools as structured retrieval tools.
+- Keep the integration style consistent with existing tools: OpenAI tool schema, Pydantic Params, `run_*` functions, and `TOOL_REGISTRY` dispatch.
+- Add workspace path checks for `glob` and `grep`; `grep` uses ripgrep with `shell=False`.
+- Tune `glob` safety: block unsafe recursive search from workspace root, but allow `**/*.py` inside an explicit subdirectory.
+- Add schema and system prompt guidance so search locations go into `directory` / `path` instead of being embedded in patterns.
+- Add `tests/test_search_tools.py` and prompt cases for manual grep/glob testing.
+- Fix the colored input prompt so long input deletion works correctly in the terminal.
+
+### Why
+
+- Structured retrieval tools make codebase exploration safer and more predictable than relying on raw `bash`.
+- `grep` and `glob` prepare the project for explore-mode subagents, where retrieval and reading can be separated from editing.
+- Runtime validation and workspace checks are necessary because model tool inputs are untrusted.
+- The prompt UI fix improves manual evaluation during long prompt-case testing.

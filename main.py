@@ -40,6 +40,7 @@ client = OpenAI(
 print("[init] OpenAI client initialized")
 TODO_CONTRACT_MAX_NUDGES = 2
 MAX_API_CALLS_PER_USER_TURN = 30
+INPUT_PROMPT = "\001\033[36m\002s01 >> \001\033[0m\002"
 
 
 @dataclass
@@ -191,7 +192,7 @@ if __name__ == "__main__":
     history = []
     while True:
         try:
-            query = input("\033[36ms01 >> \033[0m")
+            query = input(INPUT_PROMPT)
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
