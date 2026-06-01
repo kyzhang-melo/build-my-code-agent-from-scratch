@@ -110,3 +110,23 @@
 - `grep` and `glob` prepare the project for explore-mode subagents, where retrieval and reading can be separated from editing.
 - Runtime validation and workspace checks are necessary because model tool inputs are untrusted.
 - The prompt UI fix improves manual evaluation during long prompt-case testing.
+
+## June 01
+
+### What I've done
+
+- Add explore-only subagent feature, when the code agent need to explore/read many files, the parent-agent can use the `task` tool to create explore-only subagent to explore and read files. 
+- Add the `task` tool for parent-agent delegation.
+- Add `AgentConfig` to separate parent-agent and explore-subagent runtime configuration.
+- Add read-only explore subagent config with only `glob`, `grep`, and `read_file`.
+- Split prompts into `PARENT_SYSTEM` and `EXPLORE_SUBAGENT_SYSTEM`, while keeping `SYSTEM = PARENT_SYSTEM` for compatibility.
+- Adjust the parent/subagent contract: the subagent returns a natural-language exploration report, and the parent agent judges whether the task goal was completed.
+- Add debug scaffold to print the user query, normalized message count, and the last 3 messages sent to the LLM.
+- Validate the feature with prompt-case logs covering missing files, read-only write attempts, serial subagent delegation, and broad architecture exploration.
+- Find a bug, which caused by the <reminder> mechanism. 
+
+### Why
+- The code agent can benefit from the subagent feature, since the subagent has its own independent context.
+- Keeping subagents explore-only avoids write/edit concurrency problems while still giving the parent agent fresh-context codebase exploration.
+- The agent will always inject the <reminder> prompt, after the todo list has been completed totally. This bug will be fixed in the future.
+- The reminder bug is now understood as a todo lifecycle issue, not a subagent contract issue, so it can be fixed in a separate branch.

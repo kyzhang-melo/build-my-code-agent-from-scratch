@@ -37,7 +37,7 @@ Create a `.env` file in this directory:
 ```env
 OPENROUTER_API_KEY="your_key"
 OPENROUTER_BASE_URL="https://openrouter.ai/api/v1"
-MODEL_ID="minimax/minimax-m2.5"
+MODEL_ID="moonshotai/kimi-k2.5"
 ```
 
 ## Run

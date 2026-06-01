@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, m
 WORKDIR = Path.cwd()
 PLAN_REMINDER_INTERVAL = 3
 TOOL_OUTPUT_PREVIEW_CHARS = 500
+READ_ONLY_TOOL_NAMES = {"read_file", "glob", "grep"}
 
 
 TOOLS = [
@@ -189,6 +190,39 @@ TOOLS = [
     },
 ]
 
+TASK_TOOL = {
+    "type": "function",
+    "name": "task",
+    "description": (
+        "Spawn a read-only exploration subagent with fresh context. It can inspect "
+        "the workspace with glob, grep, and read_file, then returns a summary of findings.\n\n"
+        "When to use:\n"
+        "- Your task will clearly require more than 3 search queries\n"
+        "- You need to understand how a module, feature, or code path works\n"
+        "- You need to investigate multiple files and patterns\n"
+        "- You want to gather context before planning or making changes\n\n"
+        "When NOT to use:\n"
+        "- Reading a known file path\n"
+        "- Searching a small number of known files\n"
+        "- Tasks completable in 1-2 direct tool calls\n"
+        "- You already have the information you need"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "prompt": {"type": "string"},
+            "description": {
+                "type": "string",
+                "description": "Short description of the delegated exploration task.",
+            },
+        },
+        "required": ["prompt"],
+        "additionalProperties": False,
+    },
+}
+
+TOOLS.append(TASK_TOOL)
+
 
 class PlanItem(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
@@ -331,6 +365,13 @@ class GrepParams(BaseModel):
     ignore_case: bool = False
     line_number: bool = True
     head_limit: StrictInt = Field(default=250, ge=0)
+
+
+class TaskParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    prompt: str = Field(min_length=1)
+    description: str = "exploration"
 
 
 def run_bash(command: str) -> str:
@@ -562,8 +603,26 @@ def sanitize_passthrough(args: dict) -> dict:
     return dict(args)
 
 
-def build_tool_registry() -> dict[str, ToolRuntimeSpec]:
-    return {
+def sanitize_task_args(args: dict) -> dict:
+    clean = dict(args)
+    for key in ("prompt", "description"):
+        value = clean.get(key)
+        if isinstance(value, str):
+            clean[key] = sanitize_common_string(value)
+    return clean
+
+
+def unavailable_task_runner(prompt: str, description: str) -> str:
+    return "Error: task runner is not configured."
+
+
+def build_tool_registry(
+    tool_names: set[str] | None = None,
+    *,
+    task_runner: Callable[[str, str], str] | None = None,
+) -> dict[str, ToolRuntimeSpec]:
+    runner = task_runner or unavailable_task_runner
+    registry = {
         "bash": ToolRuntimeSpec(
             name="bash",
             params_model=BashParams,
@@ -619,10 +678,25 @@ def build_tool_registry() -> dict[str, ToolRuntimeSpec]:
             sanitize_args=sanitize_passthrough,
             execute=lambda params: TODO.update(params),
         ),
+        "task": ToolRuntimeSpec(
+            name="task",
+            params_model=TaskParams,
+            sanitize_args=sanitize_task_args,
+            execute=lambda params: runner(params.prompt, params.description),
+        ),
     }
+    if tool_names is not None:
+        return {name: spec for name, spec in registry.items() if name in tool_names}
+    return registry
 
 
 TOOL_REGISTRY = build_tool_registry()
+EXPLORE_TOOL_REGISTRY = build_tool_registry(READ_ONLY_TOOL_NAMES)
+EXPLORE_TOOLS = [tool for tool in TOOLS if tool["name"] in READ_ONLY_TOOL_NAMES]
+
+
+def configure_task_runner(task_runner: Callable[[str, str], str]) -> None:
+    TOOL_REGISTRY["task"] = build_tool_registry(task_runner=task_runner)["task"]
 
 
 def parse_tool_args(raw_arguments) -> tuple[dict, str | None]:
@@ -635,10 +709,14 @@ def parse_tool_args(raw_arguments) -> tuple[dict, str | None]:
     return parsed, None
 
 
-def run_tool_call(item) -> tuple[dict, bool]:
+def run_tool_call(
+    item,
+    registry: dict[str, ToolRuntimeSpec] | None = None,
+) -> tuple[dict, bool]:
     used_todo = item.name == "todo"
     args, parse_error = parse_tool_args(item.arguments)
-    spec = TOOL_REGISTRY.get(item.name)
+    active_registry = registry or TOOL_REGISTRY
+    spec = active_registry.get(item.name)
 
     if item.name == "bash":
         preview = args.get("command", "") if isinstance(args, dict) else ""
@@ -674,13 +752,16 @@ def run_tool_call(item) -> tuple[dict, bool]:
     }, used_todo
 
 
-def execute_tool_calls(tool_calls) -> tuple[list[dict], bool]:
+def execute_tool_calls(
+    tool_calls,
+    registry: dict[str, ToolRuntimeSpec] | None = None,
+) -> tuple[list[dict], bool]:
     results = []
     used_todo = False
     for item in tool_calls:
         if item.type != "function_call":
             continue
-        tool_result, called_todo = run_tool_call(item)
+        tool_result, called_todo = run_tool_call(item, registry)
         if called_todo:
             used_todo = True
         results.append(tool_result)

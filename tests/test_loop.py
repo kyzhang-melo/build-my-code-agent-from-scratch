@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 import types
 
+import pytest
+
 
 def test_input_prompt_marks_ansi_sequences_as_nonprinting(load_module) -> None:
     main_module = load_module("main", "main.py")
@@ -239,3 +241,65 @@ def test_after_tool_calls_sets_rewrite_ack_only_after_contract_nudge(load_module
 
     assert state.todo_rewrite_ack_pending is True
     assert state.contract_nudges == 0
+
+
+def test_explore_subagent_tools_are_read_only(load_module) -> None:
+    main_module = load_module("main", "main.py")
+
+    tool_names = {tool["name"] for tool in main_module.EXPLORE_SUBAGENT_CONFIG.tools}
+
+    assert tool_names == {"read_file", "glob", "grep"}
+    assert set(main_module.EXPLORE_SUBAGENT_CONFIG.registry) == {"read_file", "glob", "grep"}
+
+
+def test_parent_tools_include_task(load_module) -> None:
+    main_module = load_module("main", "main.py")
+
+    tool_names = {tool["name"] for tool in main_module.PARENT_CONFIG.tools}
+
+    assert "task" in tool_names
+
+
+def test_subagent_no_tool_calls_short_summary_nudge(load_module) -> None:
+    main_module = load_module("main", "main.py")
+    state = main_module.LoopState(messages=[{"role": "assistant", "content": "Short."}])
+
+    should_continue = main_module.handle_subagent_no_tool_calls(
+        state,
+        main_module.EXPLORE_SUBAGENT_CONFIG,
+    )
+
+    assert should_continue is True
+    assert state.transition_reason == "completion_contract_nudge"
+    assert state.completion_contract_nudges == 1
+    assert "too brief" in state.messages[-1]["content"]
+
+
+def test_subagent_no_tool_calls_accepts_after_max_attempts(load_module) -> None:
+    main_module = load_module("main", "main.py")
+    state = main_module.LoopState(
+        messages=[{"role": "assistant", "content": "Short."}],
+        completion_contract_nudges=main_module.SUMMARY_CONTINUATION_ATTEMPTS,
+    )
+
+    should_continue = main_module.handle_subagent_no_tool_calls(
+        state,
+        main_module.EXPLORE_SUBAGENT_CONFIG,
+    )
+
+    assert should_continue is False
+    assert state.messages[-1]["content"] == "Short."
+
+
+def test_subagent_no_tool_calls_accepts_long_summary(load_module) -> None:
+    main_module = load_module("main", "main.py")
+    long_text = "x" * 200
+    state = main_module.LoopState(messages=[{"role": "assistant", "content": long_text}])
+
+    should_continue = main_module.handle_subagent_no_tool_calls(
+        state,
+        main_module.EXPLORE_SUBAGENT_CONFIG,
+    )
+
+    assert should_continue is False
+    assert state.completion_contract_nudges == 0

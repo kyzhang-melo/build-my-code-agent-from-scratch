@@ -6,13 +6,20 @@ Split version of the code-agent loop.
 
 import os
 from dataclasses import dataclass
+from typing import Literal
 
 from dotenv import load_dotenv
 from openai import OpenAI
-
 from message_utils import extract_text, normalize_messages
-from prompts import SYSTEM
-from tools import TODO, TOOLS, execute_tool_calls
+from prompts import EXPLORE_SUBAGENT_SYSTEM, PARENT_SYSTEM
+from tools import (
+    EXPLORE_TOOL_REGISTRY,
+    EXPLORE_TOOLS,
+    TODO,
+    TOOLS,
+    configure_task_runner,
+    execute_tool_calls,
+)
 
 
 load_dotenv(override=True)
@@ -39,7 +46,15 @@ client = OpenAI(
 )
 print("[init] OpenAI client initialized")
 TODO_CONTRACT_MAX_NUDGES = 2
+SUMMARY_MIN_LENGTH = 200
+SUMMARY_CONTINUATION_ATTEMPTS = 1
+SUMMARY_CONTINUATION_PROMPT = (
+    "Your previous response was too brief. Please provide a more comprehensive "
+    "summary that includes specific technical details, findings, and all "
+    "important information that the parent agent should know."
+)
 MAX_API_CALLS_PER_USER_TURN = 30
+MAX_SUBAGENT_API_CALLS = 30
 INPUT_PROMPT = "\001\033[36m\002s01 >> \001\033[0m\002"
 
 
@@ -50,7 +65,19 @@ class LoopState:
     api_call_count: int = 0
     transition_reason: str | None = None
     contract_nudges: int = 0
+    completion_contract_nudges: int = 0
     todo_rewrite_ack_pending: bool = False
+
+
+@dataclass(frozen=True)
+class AgentConfig:
+    name: str
+    system: str
+    tools: list[dict]
+    max_api_calls: int
+    registry: dict | None = None
+    todo_policy: object | None = None
+    mode: Literal["explore"] | None = None
 
 
 class TodoPlanningPolicy:
@@ -122,24 +149,89 @@ class TodoPlanningPolicy:
 TODO_POLICY = TodoPlanningPolicy(TODO, TODO_CONTRACT_MAX_NUDGES)
 
 
-def run_one_turn(state: LoopState) -> bool:
-    if state.api_call_count >= MAX_API_CALLS_PER_USER_TURN:
+PARENT_CONFIG = AgentConfig(
+    name="parent",
+    system=PARENT_SYSTEM,
+    tools=TOOLS,
+    max_api_calls=MAX_API_CALLS_PER_USER_TURN,
+    todo_policy=TODO_POLICY,
+)
+
+EXPLORE_SUBAGENT_CONFIG = AgentConfig(
+    name="subagent:explore",
+    system=EXPLORE_SUBAGENT_SYSTEM,
+    tools=EXPLORE_TOOLS,
+    registry=EXPLORE_TOOL_REGISTRY,
+    max_api_calls=MAX_SUBAGENT_API_CALLS,
+    mode="explore",
+)
+
+
+def build_subagent_prompt(prompt: str) -> str:
+    return (
+        "Mode: explore. Inspect and analyze only. Do not modify files.\n\n"
+        f"Task:\n{prompt}"
+    )
+
+
+def handle_subagent_no_tool_calls(state: LoopState, config: AgentConfig) -> bool:
+    final_text = extract_text(state.messages)
+
+    if len(final_text) >= SUMMARY_MIN_LENGTH:
+        state.completion_contract_nudges = 0
+        state.transition_reason = None
+        return False
+
+    if state.completion_contract_nudges >= SUMMARY_CONTINUATION_ATTEMPTS:
+        state.completion_contract_nudges = 0
+        state.transition_reason = None
+        return False
+
+    state.completion_contract_nudges += 1
+    state.messages.append({
+        "role": "user",
+        "content": SUMMARY_CONTINUATION_PROMPT,
+    })
+    state.transition_reason = "completion_contract_nudge"
+    return True
+
+
+def execute_configured_tool_calls(tool_calls, config: AgentConfig) -> tuple[list[dict], bool]:
+    if config.registry is None:
+        return execute_tool_calls(tool_calls)
+    return execute_tool_calls(tool_calls, config.registry)
+
+
+def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> bool:
+    if state.api_call_count >= config.max_api_calls:
         state.messages.append({
             "role": "assistant",
             "content": (
                 "Warning: stopped after "
-                f"MAX_API_CALLS_PER_USER_TURN={MAX_API_CALLS_PER_USER_TURN}."
+                f"max_api_calls={config.max_api_calls}."
             ),
         })
         state.transition_reason = None
         return False
 
     state.api_call_count += 1
+    input_messages = normalize_messages(state.messages)
+    print(f"[debug] sending {len(input_messages)} messages to LLM")
+    for i, msg in enumerate(input_messages[-3:], start=max(0, len(input_messages) - 3)):
+        role = msg.get("role") or msg.get("type", "unknown")
+        content = msg.get("content") or msg.get("output") or msg.get("arguments") or ""
+        if isinstance(content, str):
+            preview = content.replace("\n", " ")[:120]
+            if len(content) > 120:
+                preview += "..."
+        else:
+            preview = str(content).replace("\n", " ")[:120]
+        print(f"[debug]  [{i}] {role}: {preview}")
     response = client.responses.create(
         model=MODEL_ID,
-        instructions=SYSTEM,
-        input=normalize_messages(state.messages),
-        tools=TOOLS,
+        instructions=config.system,
+        input=input_messages,
+        tools=config.tools,
         max_output_tokens=8000,
     )
 
@@ -162,30 +254,58 @@ def run_one_turn(state: LoopState) -> bool:
             tool_calls.append(item)
 
     if not tool_calls:
-        return TODO_POLICY.handle_no_tool_calls(state)
+        if config.todo_policy is None:
+            return handle_subagent_no_tool_calls(state, config)
+        return config.todo_policy.handle_no_tool_calls(state)
 
-    todo_signature_before = TODO_POLICY.before_tool_calls()
-    results, used_todo = execute_tool_calls(tool_calls)
+    if config.todo_policy is not None:
+        todo_signature_before = config.todo_policy.before_tool_calls()
+    else:
+        todo_signature_before = tuple()
+
+    results, used_todo = execute_configured_tool_calls(tool_calls, config)
     if not results:
         state.transition_reason = None
         return False
 
-    todo_signature_after = TODO.snapshot_signature()
+    if config.todo_policy is not None:
+        todo_signature_after = TODO.snapshot_signature()
+    else:
+        todo_signature_after = tuple()
     state.messages.extend(results)
-    TODO_POLICY.after_tool_calls(
-        state,
-        used_todo=used_todo,
-        signature_before=todo_signature_before,
-        signature_after=todo_signature_after,
-    )
+    if config.todo_policy is not None:
+        config.todo_policy.after_tool_calls(
+            state,
+            used_todo=used_todo,
+            signature_before=todo_signature_before,
+            signature_after=todo_signature_after,
+        )
+    state.completion_contract_nudges = 0
 
     state.transition_reason = "function_call_output"
     return True
 
 
-def agent_loop(state: LoopState) -> None:
-    while run_one_turn(state):
+def agent_loop(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> None:
+    while run_one_turn(state, config):
         pass
+
+
+def run_subagent(prompt: str, description: str = "exploration") -> str:
+    print(f"\033[35m> task (explore/{description}): {prompt[:120]}\033[0m")
+    state = LoopState(messages=[{
+        "role": "user",
+        "content": build_subagent_prompt(prompt),
+    }])
+    agent_loop(state, EXPLORE_SUBAGENT_CONFIG)
+    final_text = extract_text(state.messages)
+
+    if final_text:
+        return final_text
+    return f"[subagent produced no output after {state.api_call_count} turns]"
+
+
+configure_task_runner(run_subagent)
 
 
 if __name__ == "__main__":
@@ -193,6 +313,7 @@ if __name__ == "__main__":
     while True:
         try:
             query = input(INPUT_PROMPT)
+            print(f"[debug] query: {query!r}")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
@@ -203,7 +324,7 @@ if __name__ == "__main__":
         })
 
         state = LoopState(history)
-        agent_loop(state)
+        agent_loop(state, PARENT_CONFIG)
 
         final_text = extract_text(state.messages)
         if final_text:

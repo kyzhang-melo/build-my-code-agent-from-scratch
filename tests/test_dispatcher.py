@@ -86,6 +86,18 @@ def test_execute_tool_calls_todo_sets_used_flag(load_module) -> None:
     assert "[>] step 1" in out[0]["output"]
 
 
+def test_task_tool_uses_configured_runner(load_module) -> None:
+    tools = load_module("tools", "tools.py")
+    tools.configure_task_runner(lambda prompt, description: f"{description}:{prompt}")
+
+    out, used_todo = tools.execute_tool_calls([
+        _fc("task", "task1", '{"prompt":"inspect auth","description":"auth scan"}'),
+    ])
+
+    assert used_todo is False
+    assert out[0]["output"] == "auth scan:inspect auth"
+
+
 @pytest.mark.parametrize(
     "arguments, expected_substring",
     [
