@@ -10,7 +10,7 @@ from typing import Literal
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from message_utils import extract_text, normalize_messages
+from message_utils import normalize_messages
 from prompts import EXPLORE_SUBAGENT_SYSTEM, PARENT_SYSTEM
 from tools import (
     EXPLORE_TOOL_REGISTRY,
@@ -67,6 +67,10 @@ class LoopState:
     contract_nudges: int = 0
     completion_contract_nudges: int = 0
     todo_rewrite_ack_pending: bool = False
+    # The current turn's answer; None unless the turn ended on a model message
+    # with no tool calls. Carried through the loop so we never reconstruct the
+    # answer by scanning shared history (which can return a stale prior turn).
+    final_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -128,18 +132,8 @@ class TodoPlanningPolicy:
     ) -> None:
         was_contract_nudge_response = state.transition_reason == "todo_contract_nudge"
 
-        if used_todo:
-            self.todo.state.rounds_since_update = 0
-            if was_contract_nudge_response and signature_before != signature_after:
-                state.todo_rewrite_ack_pending = True
-        else:
-            self.todo.note_round_without_update()
-            reminder = self.todo.reminder()
-            if reminder:
-                state.messages.append({
-                    "role": "user",
-                    "content": reminder,
-                })
+        if used_todo and was_contract_nudge_response and signature_before != signature_after:
+            state.todo_rewrite_ack_pending = True
 
         if not self.todo.has_active_plan() or self.todo.all_items_completed():
             state.todo_rewrite_ack_pending = False
@@ -174,9 +168,9 @@ def build_subagent_prompt(prompt: str) -> str:
     )
 
 
-def handle_subagent_no_tool_calls(state: LoopState, config: AgentConfig) -> bool:
-    final_text = extract_text(state.messages)
-
+def handle_subagent_no_tool_calls(
+    state: LoopState, config: AgentConfig, final_text: str
+) -> bool:
     if len(final_text) >= SUMMARY_MIN_LENGTH:
         state.completion_contract_nudges = 0
         state.transition_reason = None
@@ -204,13 +198,12 @@ def execute_configured_tool_calls(tool_calls, config: AgentConfig) -> tuple[list
 
 def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> bool:
     if state.api_call_count >= config.max_api_calls:
+        warning = f"Warning: stopped after max_api_calls={config.max_api_calls}."
         state.messages.append({
             "role": "assistant",
-            "content": (
-                "Warning: stopped after "
-                f"max_api_calls={config.max_api_calls}."
-            ),
+            "content": warning,
         })
+        state.final_text = warning
         state.transition_reason = None
         return False
 
@@ -254,9 +247,17 @@ def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> bool:
             tool_calls.append(item)
 
     if not tool_calls:
+        # The current turn's text, evaluated directly -- never scanned from
+        # history, so a prior turn's message can't leak in.
+        response_text = (response.output_text or "").strip()
         if config.todo_policy is None:
-            return handle_subagent_no_tool_calls(state, config)
-        return config.todo_policy.handle_no_tool_calls(state)
+            should_continue = handle_subagent_no_tool_calls(state, config, response_text)
+        else:
+            should_continue = config.todo_policy.handle_no_tool_calls(state)
+        if not should_continue:
+            # Turn ends on a model message with no tool calls: this is the answer.
+            state.final_text = response_text
+        return should_continue
 
     if config.todo_policy is not None:
         todo_signature_before = config.todo_policy.before_tool_calls()
@@ -298,10 +299,9 @@ def run_subagent(prompt: str, description: str = "exploration") -> str:
         "content": build_subagent_prompt(prompt),
     }])
     agent_loop(state, EXPLORE_SUBAGENT_CONFIG)
-    final_text = extract_text(state.messages)
 
-    if final_text:
-        return final_text
+    if state.final_text:
+        return state.final_text
     return f"[subagent produced no output after {state.api_call_count} turns]"
 
 
@@ -326,7 +326,6 @@ if __name__ == "__main__":
         state = LoopState(history)
         agent_loop(state, PARENT_CONFIG)
 
-        final_text = extract_text(state.messages)
-        if final_text:
-            print(final_text)
+        if state.final_text:
+            print(state.final_text)
         print()

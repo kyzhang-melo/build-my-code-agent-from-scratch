@@ -66,6 +66,53 @@ def test_run_one_turn_full_iteration(load_module, monkeypatch) -> None:
     assert state.messages[-1]["output"] == "ok"
 
 
+def _no_tool_response(output_text: str):
+    return types.SimpleNamespace(output=[], output_text=output_text)
+
+
+def test_run_one_turn_sets_final_text_from_current_turn(load_module, monkeypatch) -> None:
+    main_module = load_module("main", "main.py")
+    main_module.TODO.update(_todo_params([]))
+
+    monkeypatch.setattr(
+        main_module,
+        "client",
+        types.SimpleNamespace(
+            responses=types.SimpleNamespace(create=lambda **_: _no_tool_response("Fresh answer."))
+        ),
+    )
+
+    state = main_module.LoopState(messages=[{"role": "user", "content": "new query"}])
+    should_continue = main_module.run_one_turn(state)
+
+    assert should_continue is False
+    assert state.final_text == "Fresh answer."
+
+
+def test_run_one_turn_does_not_surface_stale_assistant_text(load_module, monkeypatch) -> None:
+    main_module = load_module("main", "main.py")
+    main_module.TODO.update(_todo_params([]))
+
+    monkeypatch.setattr(
+        main_module,
+        "client",
+        types.SimpleNamespace(
+            responses=types.SimpleNamespace(create=lambda **_: _no_tool_response(""))
+        ),
+    )
+
+    # History carries a previous turn's answer; the current turn produces no text.
+    state = main_module.LoopState(messages=[
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "STALE ANSWER"},
+        {"role": "user", "content": "new query"},
+    ])
+    should_continue = main_module.run_one_turn(state)
+
+    assert should_continue is False
+    assert state.final_text == ""
+
+
 def test_run_one_turn_contract_nudge_when_unresolved_todo(load_module, monkeypatch) -> None:
     main_module = load_module("main", "main.py")
     main_module.TODO.update(_todo_params([{"content": "unfinished", "status": "in_progress"}]))
@@ -152,35 +199,23 @@ def test_run_one_turn_contract_warns_after_max_nudges(load_module, monkeypatch) 
     assert "Ending with unresolved todo items" in state.messages[-1]["content"]
 
 
-def test_run_one_turn_adds_todo_reminder_after_interval(load_module, monkeypatch) -> None:
+def test_todo_update_echoes_system_reminder(load_module) -> None:
     main_module = load_module("main", "main.py")
-    main_module.TODO.update(_todo_params([{"content": "one", "status": "pending"}]))
-    main_module.TODO.state.rounds_since_update = 2
 
-    function_call = types.SimpleNamespace(
-        type="function_call",
-        call_id="c1",
-        name="bash",
-        arguments='{"command":"echo hi"}',
-    )
-    fake_response = types.SimpleNamespace(output=[function_call], output_text="")
-    monkeypatch.setattr(
-        main_module,
-        "client",
-        types.SimpleNamespace(responses=types.SimpleNamespace(create=lambda **_: fake_response)),
-    )
-    monkeypatch.setattr(
-        main_module,
-        "execute_tool_calls",
-        lambda _output: ([{"type": "function_call_output", "call_id": "c1", "output": "ok"}], False),
-    )
+    output = main_module.TODO.update(_todo_params([{"content": "one", "status": "in_progress"}]))
 
-    state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
-    should_continue = main_module.run_one_turn(state)
+    assert "<system-reminder>" in output
+    assert "Your todo list has changed" in output
+    assert "[>] one" in output
 
-    assert should_continue is True
-    assert state.messages[-1]["role"] == "user"
-    assert "Refresh your current plan before continuing." in state.messages[-1]["content"]
+
+def test_todo_update_empty_echoes_cleared_reminder(load_module) -> None:
+    main_module = load_module("main", "main.py")
+
+    output = main_module.TODO.update(_todo_params([]))
+
+    assert "<system-reminder>" in output
+    assert "Your todo list is now empty." in output
 
 
 def test_handle_no_tool_calls_unresolved_todo_nudges(load_module) -> None:
@@ -262,11 +297,12 @@ def test_parent_tools_include_task(load_module) -> None:
 
 def test_subagent_no_tool_calls_short_summary_nudge(load_module) -> None:
     main_module = load_module("main", "main.py")
-    state = main_module.LoopState(messages=[{"role": "assistant", "content": "Short."}])
+    state = main_module.LoopState(messages=[])
 
     should_continue = main_module.handle_subagent_no_tool_calls(
         state,
         main_module.EXPLORE_SUBAGENT_CONFIG,
+        "Short.",
     )
 
     assert should_continue is True
@@ -278,28 +314,45 @@ def test_subagent_no_tool_calls_short_summary_nudge(load_module) -> None:
 def test_subagent_no_tool_calls_accepts_after_max_attempts(load_module) -> None:
     main_module = load_module("main", "main.py")
     state = main_module.LoopState(
-        messages=[{"role": "assistant", "content": "Short."}],
+        messages=[],
         completion_contract_nudges=main_module.SUMMARY_CONTINUATION_ATTEMPTS,
     )
 
     should_continue = main_module.handle_subagent_no_tool_calls(
         state,
         main_module.EXPLORE_SUBAGENT_CONFIG,
+        "Short.",
     )
 
     assert should_continue is False
-    assert state.messages[-1]["content"] == "Short."
+    assert state.messages == []
 
 
-def test_subagent_no_tool_calls_accepts_long_summary(load_module) -> None:
+def test_subagent_no_tool_calls_evaluates_only_current_text(load_module) -> None:
     main_module = load_module("main", "main.py")
-    long_text = "x" * 200
-    state = main_module.LoopState(messages=[{"role": "assistant", "content": long_text}])
+    # A long prior assistant message must NOT be mistaken for this turn's summary.
+    state = main_module.LoopState(
+        messages=[{"role": "assistant", "content": "x" * 200}],
+    )
 
     should_continue = main_module.handle_subagent_no_tool_calls(
         state,
         main_module.EXPLORE_SUBAGENT_CONFIG,
+        "",
+    )
+
+    assert should_continue is True
+    assert state.completion_contract_nudges == 1
+    assert "too brief" in state.messages[-1]["content"]
+
+
+def test_subagent_no_tool_calls_accepts_long_summary(load_module) -> None:
+    main_module = load_module("main", "main.py")
+
+    should_continue = main_module.handle_subagent_no_tool_calls(
+        main_module.LoopState(messages=[]),
+        main_module.EXPLORE_SUBAGENT_CONFIG,
+        "x" * 200,
     )
 
     assert should_continue is False
-    assert state.completion_contract_nudges == 0

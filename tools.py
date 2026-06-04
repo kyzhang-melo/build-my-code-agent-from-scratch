@@ -9,7 +9,6 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, m
 
 
 WORKDIR = Path.cwd()
-PLAN_REMINDER_INTERVAL = 3
 TOOL_OUTPUT_PREVIEW_CHARS = 500
 READ_ONLY_TOOL_NAMES = {"read_file", "glob", "grep"}
 
@@ -264,7 +263,6 @@ class PlanningState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     items: list[PlanItem] = Field(default_factory=list)
-    rounds_since_update: int = 0
 
 
 class TodoManager:
@@ -272,18 +270,27 @@ class TodoManager:
         self.state = PlanningState()
 
     def update(self, params: TodoParams) -> str:
-        self.state = PlanningState(items=params.items, rounds_since_update=0)
-        return self.render()
+        self.state = PlanningState(items=params.items)
+        return self.render_with_reminder()
 
-    def note_round_without_update(self) -> None:
-        self.state.rounds_since_update += 1
-
-    def reminder(self) -> str | None:
+    def render_with_reminder(self) -> str:
+        # Event-driven echo: every write returns the latest list to the model,
+        # so it stays aware of its plan without a round-based nudge.
         if not self.state.items:
-            return None
-        if self.state.rounds_since_update < PLAN_REMINDER_INTERVAL:
-            return None
-        return "<reminder>Refresh your current plan before continuing.</reminder>"
+            return (
+                "Todo list cleared.\n\n"
+                "<system-reminder>\n"
+                "Your todo list is now empty. You have no tracked tasks.\n"
+                "</system-reminder>"
+            )
+        return (
+            "Todos updated. Keep using the todo tool to track your progress.\n\n"
+            "<system-reminder>\n"
+            "Your todo list has changed. Here are the latest contents of your todo list:\n\n"
+            f"{self.render()}\n\n"
+            "Continue on with the tasks at hand if applicable.\n"
+            "</system-reminder>"
+        )
 
     def has_active_plan(self) -> bool:
         return len(self.state.items) > 0

@@ -130,3 +130,27 @@
 - Keeping subagents explore-only avoids write/edit concurrency problems while still giving the parent agent fresh-context codebase exploration.
 - The agent will always inject the <reminder> prompt, after the todo list has been completed totally. This bug will be fixed in the future.
 - The reminder bug is now understood as a todo lifecycle issue, not a subagent contract issue, so it can be fixed in a separate branch.
+
+## June 04
+
+### What I've done
+
+- Fix the reminder mechanism bug by making the todo reminder from counter-driven to event-driven.
+- Remove the round-counter variables and methods: `PLAN_REMINDER_INTERVAL`, `PlanningState.rounds_since_update`, `TodoManager.note_round_without_update()`, and `TodoManager.reminder()`.
+- Add `TodoManager.render_with_reminder()`: every `todo` write now returns the latest list wrapped in a `<system-reminder>` block (with a separate empty-list message), so the model stays aware of its plan only when the plan actually changes.
+- Simplify `TodoPlanningPolicy.after_tool_calls()` to drop the counter reset and the periodic reminder injection; keep the contract early-stop gate (`handle_no_tool_calls`) unchanged.
+- Replace the obsolete interval-reminder test with tests for the new write-time echo (non-empty and cleared cases).
+
+- Fix "stale answers from a previous turn", carry the turn's answer on `LoopState.final_text` instead of recovering it via `extract_text()` over shared history.
+- Set `final_text` only when a turn ends on a model message with no tool calls; also set it for the `max_api_calls` warning. Leave it `None` when a turn ends right after a tool call.
+- Read `state.final_text` in the REPL loop and in `run_subagent` instead of `extract_text(state.messages)`.
+- Pass the current turn's text into `handle_subagent_no_tool_calls()` (as a `final_text` argument) so the subagent completion check evaluates only this turn's no-tool response, never a stale history scan.
+- Add a regression test ensuring a new turn that produces no text does not surface a prior turn's assistant message, a positive test for capturing the current turn's text, and a test that a long prior assistant message is not mistaken for the current (empty) subagent summary.
+
+### Why
+
+- Counter-driven `reminder()` only guarded against "no plan" and never checked `all_items_completed()`, so the counter kept injecting `<reminder>Refresh your current plan...>` even after every todo was done.
+- Keeping the contract gate preserves our runtime protection against ending with unfinished todos, which the product agents do not enforce.
+
+- `extract_text()` scanned the entire accumulated history in reverse and returned the most recent assistant text. When a user turn ended on a tool call without a closing reply, it surfaced an unrelated previous turn's answer.
+- This was pre-existing but masked by the old reminder bug, whose spurious nudge forced an extra model turn that usually produced text; removing the bogus reminder exposed it.
