@@ -298,9 +298,6 @@ class TodoManager:
     def all_items_completed(self) -> bool:
         return self.has_active_plan() and all(item.status == "completed" for item in self.state.items)
 
-    def snapshot_signature(self) -> tuple[tuple[str, str, str], ...]:
-        return tuple((item.content, item.status, item.active_form) for item in self.state.items)
-
     def render(self) -> str:
         if not self.state.items:
             return "No session plan yet."

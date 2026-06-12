@@ -6,7 +6,6 @@ Split version of the code-agent loop.
 
 import os
 from dataclasses import dataclass
-from typing import Literal
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -60,13 +59,11 @@ INPUT_PROMPT = "\001\033[36m\002s01 >> \001\033[0m\002"
 
 @dataclass
 class LoopState:
-    # The minimal loop state: history, API call count, and why we continue.
+    # The minimal loop state: history, API call count, and nudge budget.
     messages: list
     api_call_count: int = 0
-    transition_reason: str | None = None
     contract_nudges: int = 0
     completion_contract_nudges: int = 0
-    todo_rewrite_ack_pending: bool = False
     # The current turn's answer; None unless the turn ended on a model message
     # with no tool calls. Carried through the loop so we never reconstruct the
     # answer by scanning shared history (which can return a stale prior turn).
@@ -81,7 +78,6 @@ class AgentConfig:
     max_api_calls: int
     registry: dict | None = None
     todo_policy: object | None = None
-    mode: Literal["explore"] | None = None
 
 
 class TodoPlanningPolicy:
@@ -92,8 +88,6 @@ class TodoPlanningPolicy:
     def handle_no_tool_calls(self, state: LoopState) -> bool:
         if not self.todo.has_active_plan() or self.todo.all_items_completed():
             state.contract_nudges = 0
-            state.todo_rewrite_ack_pending = False
-            state.transition_reason = None
             return False
 
         if state.contract_nudges >= self.max_contract_nudges:
@@ -104,8 +98,6 @@ class TodoPlanningPolicy:
                     f"{self.todo.render()}"
                 ),
             })
-            state.todo_rewrite_ack_pending = False
-            state.transition_reason = None
             return False
 
         state.contract_nudges += 1
@@ -116,28 +108,7 @@ class TodoPlanningPolicy:
                 "or call todo to explicitly rewrite/remove items that are no longer needed.</contract>"
             ),
         })
-        state.transition_reason = "todo_contract_nudge"
         return True
-
-    def before_tool_calls(self) -> tuple[tuple[str, str, str], ...]:
-        return self.todo.snapshot_signature()
-
-    def after_tool_calls(
-        self,
-        state: LoopState,
-        *,
-        used_todo: bool,
-        signature_before: tuple[tuple[str, str, str], ...],
-        signature_after: tuple[tuple[str, str, str], ...],
-    ) -> None:
-        was_contract_nudge_response = state.transition_reason == "todo_contract_nudge"
-
-        if used_todo and was_contract_nudge_response and signature_before != signature_after:
-            state.todo_rewrite_ack_pending = True
-
-        if not self.todo.has_active_plan() or self.todo.all_items_completed():
-            state.todo_rewrite_ack_pending = False
-        state.contract_nudges = 0
 
 
 TODO_POLICY = TodoPlanningPolicy(TODO, TODO_CONTRACT_MAX_NUDGES)
@@ -157,7 +128,6 @@ EXPLORE_SUBAGENT_CONFIG = AgentConfig(
     tools=EXPLORE_TOOLS,
     registry=EXPLORE_TOOL_REGISTRY,
     max_api_calls=MAX_SUBAGENT_API_CALLS,
-    mode="explore",
 )
 
 
@@ -173,12 +143,10 @@ def handle_subagent_no_tool_calls(
 ) -> bool:
     if len(final_text) >= SUMMARY_MIN_LENGTH:
         state.completion_contract_nudges = 0
-        state.transition_reason = None
         return False
 
     if state.completion_contract_nudges >= SUMMARY_CONTINUATION_ATTEMPTS:
         state.completion_contract_nudges = 0
-        state.transition_reason = None
         return False
 
     state.completion_contract_nudges += 1
@@ -186,7 +154,6 @@ def handle_subagent_no_tool_calls(
         "role": "user",
         "content": SUMMARY_CONTINUATION_PROMPT,
     })
-    state.transition_reason = "completion_contract_nudge"
     return True
 
 
@@ -204,7 +171,6 @@ def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> bool:
             "content": warning,
         })
         state.final_text = warning
-        state.transition_reason = None
         return False
 
     state.api_call_count += 1
@@ -259,31 +225,13 @@ def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> bool:
             state.final_text = response_text
         return should_continue
 
-    if config.todo_policy is not None:
-        todo_signature_before = config.todo_policy.before_tool_calls()
-    else:
-        todo_signature_before = tuple()
-
-    results, used_todo = execute_configured_tool_calls(tool_calls, config)
+    results, _ = execute_configured_tool_calls(tool_calls, config)
     if not results:
-        state.transition_reason = None
         return False
 
-    if config.todo_policy is not None:
-        todo_signature_after = TODO.snapshot_signature()
-    else:
-        todo_signature_after = tuple()
     state.messages.extend(results)
-    if config.todo_policy is not None:
-        config.todo_policy.after_tool_calls(
-            state,
-            used_todo=used_todo,
-            signature_before=todo_signature_before,
-            signature_after=todo_signature_after,
-        )
+    state.contract_nudges = 0
     state.completion_contract_nudges = 0
-
-    state.transition_reason = "function_call_output"
     return True
 
 
