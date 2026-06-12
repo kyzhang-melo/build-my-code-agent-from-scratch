@@ -6,6 +6,7 @@ Split version of the code-agent loop.
 
 import os
 from dataclasses import dataclass
+from typing import Protocol
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -62,12 +63,24 @@ class LoopState:
     # The minimal loop state: history, API call count, and nudge budget.
     messages: list
     api_call_count: int = 0
-    contract_nudges: int = 0
-    completion_contract_nudges: int = 0
+    nudges: int = 0
     # The current turn's answer; None unless the turn ended on a model message
     # with no tool calls. Carried through the loop so we never reconstruct the
     # answer by scanning shared history (which can return a stale prior turn).
     final_text: str | None = None
+
+
+class StopGate(Protocol):
+    # Decides whether a turn may end when the model stops calling tools.
+    max_nudges: int
+
+    def check(self, final_text: str) -> str | None:
+        """Return None to accept the stop, or a nudge message to push back."""
+        ...
+
+    def give_up_note(self) -> str | None:
+        """Optional message to append when the nudge budget is exhausted."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -76,42 +89,42 @@ class AgentConfig:
     system: str
     tools: list[dict]
     max_api_calls: int
+    stop_gate: StopGate
     registry: dict | None = None
-    todo_policy: object | None = None
 
 
-class TodoPlanningPolicy:
-    def __init__(self, todo, max_contract_nudges: int):
+class TodoStopGate:
+    def __init__(self, todo, max_nudges: int):
         self.todo = todo
-        self.max_contract_nudges = max_contract_nudges
+        self.max_nudges = max_nudges
 
-    def handle_no_tool_calls(self, state: LoopState) -> bool:
+    def check(self, final_text: str) -> str | None:
         if not self.todo.has_active_plan() or self.todo.all_items_completed():
-            state.contract_nudges = 0
-            return False
+            return None
+        return (
+            "<contract>Before ending, either complete all todo items, "
+            "or call todo to explicitly rewrite/remove items that are no longer needed.</contract>"
+        )
 
-        if state.contract_nudges >= self.max_contract_nudges:
-            state.messages.append({
-                "role": "assistant",
-                "content": (
-                    "Warning: Ending with unresolved todo items after repeated contract reminders.\n"
-                    f"{self.todo.render()}"
-                ),
-            })
-            return False
-
-        state.contract_nudges += 1
-        state.messages.append({
-            "role": "user",
-            "content": (
-                "<contract>Before ending, either complete all todo items, "
-                "or call todo to explicitly rewrite/remove items that are no longer needed.</contract>"
-            ),
-        })
-        return True
+    def give_up_note(self) -> str | None:
+        return (
+            "Warning: Ending with unresolved todo items after repeated contract reminders.\n"
+            f"{self.todo.render()}"
+        )
 
 
-TODO_POLICY = TodoPlanningPolicy(TODO, TODO_CONTRACT_MAX_NUDGES)
+class SummaryStopGate:
+    def __init__(self, min_length: int, max_nudges: int):
+        self.min_length = min_length
+        self.max_nudges = max_nudges
+
+    def check(self, final_text: str) -> str | None:
+        if len(final_text) >= self.min_length:
+            return None
+        return SUMMARY_CONTINUATION_PROMPT
+
+    def give_up_note(self) -> str | None:
+        return None
 
 
 PARENT_CONFIG = AgentConfig(
@@ -119,7 +132,7 @@ PARENT_CONFIG = AgentConfig(
     system=PARENT_SYSTEM,
     tools=TOOLS,
     max_api_calls=MAX_API_CALLS_PER_USER_TURN,
-    todo_policy=TODO_POLICY,
+    stop_gate=TodoStopGate(TODO, TODO_CONTRACT_MAX_NUDGES),
 )
 
 EXPLORE_SUBAGENT_CONFIG = AgentConfig(
@@ -128,6 +141,7 @@ EXPLORE_SUBAGENT_CONFIG = AgentConfig(
     tools=EXPLORE_TOOLS,
     registry=EXPLORE_TOOL_REGISTRY,
     max_api_calls=MAX_SUBAGENT_API_CALLS,
+    stop_gate=SummaryStopGate(SUMMARY_MIN_LENGTH, SUMMARY_CONTINUATION_ATTEMPTS),
 )
 
 
@@ -136,25 +150,6 @@ def build_subagent_prompt(prompt: str) -> str:
         "Mode: explore. Inspect and analyze only. Do not modify files.\n\n"
         f"Task:\n{prompt}"
     )
-
-
-def handle_subagent_no_tool_calls(
-    state: LoopState, config: AgentConfig, final_text: str
-) -> bool:
-    if len(final_text) >= SUMMARY_MIN_LENGTH:
-        state.completion_contract_nudges = 0
-        return False
-
-    if state.completion_contract_nudges >= SUMMARY_CONTINUATION_ATTEMPTS:
-        state.completion_contract_nudges = 0
-        return False
-
-    state.completion_contract_nudges += 1
-    state.messages.append({
-        "role": "user",
-        "content": SUMMARY_CONTINUATION_PROMPT,
-    })
-    return True
 
 
 def execute_configured_tool_calls(tool_calls, config: AgentConfig) -> tuple[list[dict], bool]:
@@ -216,22 +211,28 @@ def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> bool:
         # The current turn's text, evaluated directly -- never scanned from
         # history, so a prior turn's message can't leak in.
         response_text = (response.output_text or "").strip()
-        if config.todo_policy is None:
-            should_continue = handle_subagent_no_tool_calls(state, config, response_text)
-        else:
-            should_continue = config.todo_policy.handle_no_tool_calls(state)
-        if not should_continue:
-            # Turn ends on a model message with no tool calls: this is the answer.
-            state.final_text = response_text
-        return should_continue
+        nudge = config.stop_gate.check(response_text)
+        if nudge is not None and state.nudges < config.stop_gate.max_nudges:
+            state.nudges += 1
+            state.messages.append({"role": "user", "content": nudge})
+            return True
+
+        if nudge is not None:
+            # Nudge budget exhausted: accept the stop anyway.
+            note = config.stop_gate.give_up_note()
+            if note is not None:
+                state.messages.append({"role": "assistant", "content": note})
+        state.nudges = 0
+        # Turn ends on a model message with no tool calls: this is the answer.
+        state.final_text = response_text
+        return False
 
     results, _ = execute_configured_tool_calls(tool_calls, config)
     if not results:
         return False
 
     state.messages.extend(results)
-    state.contract_nudges = 0
-    state.completion_contract_nudges = 0
+    state.nudges = 0
     return True
 
 

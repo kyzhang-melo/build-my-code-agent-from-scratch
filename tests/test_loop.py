@@ -127,7 +127,7 @@ def test_run_one_turn_contract_nudge_when_unresolved_todo(load_module, monkeypat
     should_continue = main_module.run_one_turn(state)
 
     assert should_continue is True
-    assert state.contract_nudges == 1
+    assert state.nudges == 1
     assert state.messages[-1]["role"] == "user"
     assert "Before ending, either complete all todo items" in state.messages[-1]["content"]
 
@@ -145,7 +145,7 @@ def test_run_one_turn_contract_warns_after_max_nudges(load_module, monkeypatch) 
 
     state = main_module.LoopState(
         messages=[{"role": "user", "content": "task"}],
-        contract_nudges=main_module.TODO_CONTRACT_MAX_NUDGES,
+        nudges=main_module.TODO_CONTRACT_MAX_NUDGES,
     )
     should_continue = main_module.run_one_turn(state)
 
@@ -173,16 +173,21 @@ def test_todo_update_empty_echoes_cleared_reminder(load_module) -> None:
     assert "Your todo list is now empty." in output
 
 
-def test_handle_no_tool_calls_unresolved_todo_nudges(load_module) -> None:
+def test_todo_stop_gate_nudges_on_unresolved_todo(load_module) -> None:
     main_module = load_module("main", "main.py")
     main_module.TODO.update(_todo_params([{"content": "unfinished", "status": "in_progress"}]))
-    state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
 
-    should_continue = main_module.TODO_POLICY.handle_no_tool_calls(state)
+    nudge = main_module.PARENT_CONFIG.stop_gate.check("All done.")
 
-    assert should_continue is True
-    assert state.messages[-1]["role"] == "user"
-    assert "Before ending, either complete all todo items" in state.messages[-1]["content"]
+    assert nudge is not None
+    assert "Before ending, either complete all todo items" in nudge
+
+
+def test_todo_stop_gate_accepts_when_plan_completed(load_module) -> None:
+    main_module = load_module("main", "main.py")
+    main_module.TODO.update(_todo_params([{"content": "done", "status": "completed"}]))
+
+    assert main_module.PARENT_CONFIG.stop_gate.check("All done.") is None
 
 
 def test_run_one_turn_tool_calls_extend_messages(load_module, monkeypatch) -> None:
@@ -226,63 +231,78 @@ def test_parent_tools_include_task(load_module) -> None:
     assert "task" in tool_names
 
 
-def test_subagent_no_tool_calls_short_summary_nudge(load_module) -> None:
+def test_summary_stop_gate_nudges_short_summary(load_module) -> None:
     main_module = load_module("main", "main.py")
-    state = main_module.LoopState(messages=[])
 
-    should_continue = main_module.handle_subagent_no_tool_calls(
-        state,
-        main_module.EXPLORE_SUBAGENT_CONFIG,
-        "Short.",
+    nudge = main_module.EXPLORE_SUBAGENT_CONFIG.stop_gate.check("Short.")
+
+    assert nudge is not None
+    assert "too brief" in nudge
+
+
+def test_summary_stop_gate_accepts_long_summary(load_module) -> None:
+    main_module = load_module("main", "main.py")
+
+    assert main_module.EXPLORE_SUBAGENT_CONFIG.stop_gate.check("x" * 200) is None
+
+
+def test_run_one_turn_subagent_nudges_short_summary(load_module, monkeypatch) -> None:
+    main_module = load_module("main", "main.py")
+    monkeypatch.setattr(
+        main_module,
+        "client",
+        types.SimpleNamespace(
+            responses=types.SimpleNamespace(create=lambda **_: _no_tool_response("Short."))
+        ),
     )
+    state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
+
+    should_continue = main_module.run_one_turn(state, main_module.EXPLORE_SUBAGENT_CONFIG)
 
     assert should_continue is True
-    assert state.completion_contract_nudges == 1
+    assert state.nudges == 1
+    assert state.messages[-1]["role"] == "user"
     assert "too brief" in state.messages[-1]["content"]
 
 
-def test_subagent_no_tool_calls_accepts_after_max_attempts(load_module) -> None:
+def test_run_one_turn_subagent_accepts_after_max_attempts(load_module, monkeypatch) -> None:
     main_module = load_module("main", "main.py")
+    monkeypatch.setattr(
+        main_module,
+        "client",
+        types.SimpleNamespace(
+            responses=types.SimpleNamespace(create=lambda **_: _no_tool_response("Short."))
+        ),
+    )
     state = main_module.LoopState(
-        messages=[],
-        completion_contract_nudges=main_module.SUMMARY_CONTINUATION_ATTEMPTS,
+        messages=[{"role": "user", "content": "task"}],
+        nudges=main_module.SUMMARY_CONTINUATION_ATTEMPTS,
     )
 
-    should_continue = main_module.handle_subagent_no_tool_calls(
-        state,
-        main_module.EXPLORE_SUBAGENT_CONFIG,
-        "Short.",
-    )
+    should_continue = main_module.run_one_turn(state, main_module.EXPLORE_SUBAGENT_CONFIG)
 
     assert should_continue is False
-    assert state.messages == []
+    assert state.final_text == "Short."
+    # SummaryStopGate has no give-up note: no nudge or warning is appended.
+    assert state.messages[-1] == {"role": "assistant", "content": "Short."}
 
 
-def test_subagent_no_tool_calls_evaluates_only_current_text(load_module) -> None:
+def test_run_one_turn_subagent_evaluates_only_current_text(load_module, monkeypatch) -> None:
     main_module = load_module("main", "main.py")
+    monkeypatch.setattr(
+        main_module,
+        "client",
+        types.SimpleNamespace(
+            responses=types.SimpleNamespace(create=lambda **_: _no_tool_response(""))
+        ),
+    )
     # A long prior assistant message must NOT be mistaken for this turn's summary.
     state = main_module.LoopState(
         messages=[{"role": "assistant", "content": "x" * 200}],
     )
 
-    should_continue = main_module.handle_subagent_no_tool_calls(
-        state,
-        main_module.EXPLORE_SUBAGENT_CONFIG,
-        "",
-    )
+    should_continue = main_module.run_one_turn(state, main_module.EXPLORE_SUBAGENT_CONFIG)
 
     assert should_continue is True
-    assert state.completion_contract_nudges == 1
+    assert state.nudges == 1
     assert "too brief" in state.messages[-1]["content"]
-
-
-def test_subagent_no_tool_calls_accepts_long_summary(load_module) -> None:
-    main_module = load_module("main", "main.py")
-
-    should_continue = main_module.handle_subagent_no_tool_calls(
-        main_module.LoopState(messages=[]),
-        main_module.EXPLORE_SUBAGENT_CONFIG,
-        "x" * 200,
-    )
-
-    assert should_continue is False
