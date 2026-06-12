@@ -6,7 +6,7 @@ Split version of the code-agent loop.
 
 import os
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -64,10 +64,24 @@ class LoopState:
     messages: list
     api_call_count: int = 0
     nudges: int = 0
-    # The current turn's answer; None unless the turn ended on a model message
-    # with no tool calls. Carried through the loop so we never reconstruct the
-    # answer by scanning shared history (which can return a stale prior turn).
-    final_text: str | None = None
+
+
+StopReason = Literal["completed", "max_api_calls"]
+
+
+@dataclass(frozen=True)
+class StepOutcome:
+    # The turn's answer, evaluated directly from the stopping response --
+    # never scanned from history, so a prior turn's message can't leak in.
+    stop_reason: StopReason
+    final_text: str
+
+
+@dataclass(frozen=True)
+class TurnOutcome:
+    stop_reason: StopReason
+    final_text: str
+    api_calls: int
 
 
 class StopGate(Protocol):
@@ -158,15 +172,15 @@ def execute_configured_tool_calls(tool_calls, config: AgentConfig) -> tuple[list
     return execute_tool_calls(tool_calls, config.registry)
 
 
-def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> bool:
+def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> StepOutcome | None:
+    # Returns None to keep looping, or a StepOutcome when the turn ends.
     if state.api_call_count >= config.max_api_calls:
         warning = f"Warning: stopped after max_api_calls={config.max_api_calls}."
         state.messages.append({
             "role": "assistant",
             "content": warning,
         })
-        state.final_text = warning
-        return False
+        return StepOutcome(stop_reason="max_api_calls", final_text=warning)
 
     state.api_call_count += 1
     input_messages = normalize_messages(state.messages)
@@ -208,14 +222,12 @@ def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> bool:
             tool_calls.append(item)
 
     if not tool_calls:
-        # The current turn's text, evaluated directly -- never scanned from
-        # history, so a prior turn's message can't leak in.
         response_text = (response.output_text or "").strip()
         nudge = config.stop_gate.check(response_text)
         if nudge is not None and state.nudges < config.stop_gate.max_nudges:
             state.nudges += 1
             state.messages.append({"role": "user", "content": nudge})
-            return True
+            return None
 
         if nudge is not None:
             # Nudge budget exhausted: accept the stop anyway.
@@ -224,21 +236,25 @@ def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> bool:
                 state.messages.append({"role": "assistant", "content": note})
         state.nudges = 0
         # Turn ends on a model message with no tool calls: this is the answer.
-        state.final_text = response_text
-        return False
+        return StepOutcome(stop_reason="completed", final_text=response_text)
 
     results, _ = execute_configured_tool_calls(tool_calls, config)
     if not results:
-        return False
+        return StepOutcome(stop_reason="completed", final_text="")
 
     state.messages.extend(results)
     state.nudges = 0
-    return True
+    return None
 
 
-def agent_loop(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> None:
-    while run_one_turn(state, config):
+def agent_loop(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> TurnOutcome:
+    while (outcome := run_one_turn(state, config)) is None:
         pass
+    return TurnOutcome(
+        stop_reason=outcome.stop_reason,
+        final_text=outcome.final_text,
+        api_calls=state.api_call_count,
+    )
 
 
 def run_subagent(prompt: str, description: str = "exploration") -> str:
@@ -247,11 +263,11 @@ def run_subagent(prompt: str, description: str = "exploration") -> str:
         "role": "user",
         "content": build_subagent_prompt(prompt),
     }])
-    agent_loop(state, EXPLORE_SUBAGENT_CONFIG)
+    outcome = agent_loop(state, EXPLORE_SUBAGENT_CONFIG)
 
-    if state.final_text:
-        return state.final_text
-    return f"[subagent produced no output after {state.api_call_count} turns]"
+    if outcome.final_text:
+        return outcome.final_text
+    return f"[subagent produced no output after {outcome.api_calls} turns]"
 
 
 configure_task_runner(run_subagent)
@@ -273,8 +289,8 @@ if __name__ == "__main__":
         })
 
         state = LoopState(history)
-        agent_loop(state, PARENT_CONFIG)
+        outcome = agent_loop(state, PARENT_CONFIG)
 
-        if state.final_text:
-            print(state.final_text)
+        if outcome.final_text:
+            print(outcome.final_text)
         print()

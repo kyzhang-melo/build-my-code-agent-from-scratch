@@ -53,9 +53,9 @@ def test_run_one_turn_full_iteration(load_module, monkeypatch) -> None:
         ]
     )
 
-    should_continue = main_module.run_one_turn(state)
+    outcome = main_module.run_one_turn(state)
 
-    assert should_continue is True
+    assert outcome is None
     assert state.api_call_count == 1
     assert captured["input"][0]["role"] == "user"
     assert captured["input"][0]["content"] == "task part 1\ntask part 2"
@@ -82,10 +82,11 @@ def test_run_one_turn_sets_final_text_from_current_turn(load_module, monkeypatch
     )
 
     state = main_module.LoopState(messages=[{"role": "user", "content": "new query"}])
-    should_continue = main_module.run_one_turn(state)
+    outcome = main_module.run_one_turn(state)
 
-    assert should_continue is False
-    assert state.final_text == "Fresh answer."
+    assert outcome is not None
+    assert outcome.stop_reason == "completed"
+    assert outcome.final_text == "Fresh answer."
 
 
 def test_run_one_turn_does_not_surface_stale_assistant_text(load_module, monkeypatch) -> None:
@@ -106,10 +107,10 @@ def test_run_one_turn_does_not_surface_stale_assistant_text(load_module, monkeyp
         {"role": "assistant", "content": "STALE ANSWER"},
         {"role": "user", "content": "new query"},
     ])
-    should_continue = main_module.run_one_turn(state)
+    outcome = main_module.run_one_turn(state)
 
-    assert should_continue is False
-    assert state.final_text == ""
+    assert outcome is not None
+    assert outcome.final_text == ""
 
 
 def test_run_one_turn_contract_nudge_when_unresolved_todo(load_module, monkeypatch) -> None:
@@ -124,9 +125,9 @@ def test_run_one_turn_contract_nudge_when_unresolved_todo(load_module, monkeypat
     )
 
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
-    should_continue = main_module.run_one_turn(state)
+    outcome = main_module.run_one_turn(state)
 
-    assert should_continue is True
+    assert outcome is None
     assert state.nudges == 1
     assert state.messages[-1]["role"] == "user"
     assert "Before ending, either complete all todo items" in state.messages[-1]["content"]
@@ -147,9 +148,10 @@ def test_run_one_turn_contract_warns_after_max_nudges(load_module, monkeypatch) 
         messages=[{"role": "user", "content": "task"}],
         nudges=main_module.TODO_CONTRACT_MAX_NUDGES,
     )
-    should_continue = main_module.run_one_turn(state)
+    outcome = main_module.run_one_turn(state)
 
-    assert should_continue is False
+    assert outcome is not None
+    assert outcome.stop_reason == "completed"
     assert state.messages[-1]["role"] == "assistant"
     assert "Ending with unresolved todo items" in state.messages[-1]["content"]
 
@@ -207,9 +209,9 @@ def test_run_one_turn_tool_calls_extend_messages(load_module, monkeypatch) -> No
     )
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
 
-    should_continue = main_module.run_one_turn(state)
+    outcome = main_module.run_one_turn(state)
 
-    assert should_continue is True
+    assert outcome is None
     assert state.api_call_count == 1
     assert state.messages[-1]["type"] == "function_call_output"
 
@@ -257,9 +259,9 @@ def test_run_one_turn_subagent_nudges_short_summary(load_module, monkeypatch) ->
     )
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
 
-    should_continue = main_module.run_one_turn(state, main_module.EXPLORE_SUBAGENT_CONFIG)
+    outcome = main_module.run_one_turn(state, main_module.EXPLORE_SUBAGENT_CONFIG)
 
-    assert should_continue is True
+    assert outcome is None
     assert state.nudges == 1
     assert state.messages[-1]["role"] == "user"
     assert "too brief" in state.messages[-1]["content"]
@@ -279,10 +281,10 @@ def test_run_one_turn_subagent_accepts_after_max_attempts(load_module, monkeypat
         nudges=main_module.SUMMARY_CONTINUATION_ATTEMPTS,
     )
 
-    should_continue = main_module.run_one_turn(state, main_module.EXPLORE_SUBAGENT_CONFIG)
+    outcome = main_module.run_one_turn(state, main_module.EXPLORE_SUBAGENT_CONFIG)
 
-    assert should_continue is False
-    assert state.final_text == "Short."
+    assert outcome is not None
+    assert outcome.final_text == "Short."
     # SummaryStopGate has no give-up note: no nudge or warning is appended.
     assert state.messages[-1] == {"role": "assistant", "content": "Short."}
 
@@ -301,8 +303,23 @@ def test_run_one_turn_subagent_evaluates_only_current_text(load_module, monkeypa
         messages=[{"role": "assistant", "content": "x" * 200}],
     )
 
-    should_continue = main_module.run_one_turn(state, main_module.EXPLORE_SUBAGENT_CONFIG)
+    outcome = main_module.run_one_turn(state, main_module.EXPLORE_SUBAGENT_CONFIG)
 
-    assert should_continue is True
+    assert outcome is None
     assert state.nudges == 1
     assert "too brief" in state.messages[-1]["content"]
+
+
+def test_run_one_turn_budget_exhausted_returns_max_api_calls_outcome(load_module) -> None:
+    main_module = load_module("main", "main.py")
+    state = main_module.LoopState(
+        messages=[{"role": "user", "content": "task"}],
+        api_call_count=main_module.PARENT_CONFIG.max_api_calls,
+    )
+
+    outcome = main_module.run_one_turn(state)
+
+    assert outcome is not None
+    assert outcome.stop_reason == "max_api_calls"
+    assert "stopped after max_api_calls" in outcome.final_text
+    assert state.messages[-1]["content"] == outcome.final_text
