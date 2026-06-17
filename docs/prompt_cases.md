@@ -6,7 +6,7 @@
 
 ### multi-tools cases
 1. `Read the file requirements.txt`
-2. `Create a file called greet.py with a greet(name) function`
+2. `Create a file called greet.py with a greet(name) function in the folder 'tmp'`
 3. `Edit greet.py to add a docstring to the function`
 4. `Read greet.py to verify the edit worked`
 
@@ -32,15 +32,15 @@
 7. `Find Python files under tests whose names include "manager", then read the most relevant one and summarize its purpose.`
 8. `Search for a string that should not exist, such as "__definitely_missing_search_token__", and report the result clearly.`
 9. `Use a subtask to find what testing framework this project uses.`
-10. `Use a task to inspect 'tmp_folder_for_test/subagent.py' and summarize how subagents work.`
-11. `Delegate: find the three largest Python files in 'tmp_folder_for_test' and summarize their main differences.`
+10. `Use a task to inspect 'tmp/codeAgent_subagent.py' and summarize how subagents work.`
+11. `Delegate: find the three largest Python files in 'tmp' and summarize their main differences.`
 12. `Use a task to do an impossible task: read no_such_dir/no_such_file.py and summarize it.`
-13. `Use todo to plan: first delegate a task to inspect 'tmp_folder_for_test/single_tool_agent.py', then delegate a task to inspect 'tmp_folder_for_test/multi_tools_agent.py', then summarize the evolution.`
+13. `Use todo to plan: first delegate a task to inspect 'tmp/codeAgent_loop.py', then delegate a task to inspect 'tmp/codeAgent_multitool.py', then summarize the evolution.`
 14. `Use a task to create subagent_should_not_write.txt, then report whether it succeeded.`
 15. `Use a task to check if the file config.json exists and what it contains.`
-16. `Delegate: analyze the full architecture of the tasklite package in 'tmp_folder_for_test' — describe every module, class, and function.`
+16. `Delegate: analyze the full architecture of the tasklite package in 'tmp' — describe every module, class, and function.`
 17. `Read the file prompts.py and tell me what system prompts are defined.`
 18. `What does the WORKDIR variable resolve to?`
 19. `How does the tool dispatch system work? Trace from tool definition to execution.`
-20. `What are all the Pydantic models used in 'tmp_folder_for_test/todolist_agent.py' and what do they validate?`
+20. `What are all the Pydantic models used in 'tmp/codeAgent_writeToDo.py' and what do they validate?`
 21. `Delegate: exhaustively catalog every function in every Python file under 'tmp_folder_for_test', with parameters and return types.`

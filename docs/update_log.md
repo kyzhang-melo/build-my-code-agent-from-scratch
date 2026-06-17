@@ -154,3 +154,14 @@
 
 - `extract_text()` scanned the entire accumulated history in reverse and returned the most recent assistant text. When a user turn ended on a tool call without a closing reply, it surfaced an unrelated previous turn's answer.
 - This was pre-existing but masked by the old reminder bug, whose spurious nudge forced an extra model turn that usually produced text; removing the bogus reminder exposed it.
+
+## June 17
+### What I've Done
+
+- Refactored this project, remove dead todo rewrite-ack machinery, unify stop policies, unify loop outcome.
+
+### Why
+
+- Since the reminder mechanism has been changed, the agent harness does not need the `transition_reason` field and the `todo_rewrite_ack_pending` field of the `LoopState` class.
+- Before the refactor, the todo tool and the subagent tool have two different stop policies, but they share the same `run_one_turn()` function. So the `StopGate` protocol has been introduced to unify the stop policies.
+- Before the refactor, `run_one_turn()` function returns a boolean type value, `agent_loop()` function returns nothing. When these two functions are used by different agents (parent agent or subagent), the boolean value is not enough. So the Literal `StopReason` and the class `StepOutcome` and `TurnOutcome` have been introduced to unify the loop outcome.
