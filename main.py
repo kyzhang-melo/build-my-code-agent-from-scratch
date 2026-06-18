@@ -5,6 +5,7 @@ Split version of the code-agent loop.
 """
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
@@ -105,6 +106,14 @@ class AgentConfig:
     max_api_calls: int
     stop_gate: StopGate
     registry: dict | None = None
+    # Sink for assistant text as it is produced; None means do not surface it.
+    # Display is intentionally decoupled from loop termination: text that rides
+    # along with tool calls is shown here, not only the final no-tool message.
+    on_text: Callable[[str], None] | None = None
+
+
+def emit_assistant_text(text: str) -> None:
+    print(text)
 
 
 class TodoStopGate:
@@ -147,6 +156,7 @@ PARENT_CONFIG = AgentConfig(
     tools=TOOLS,
     max_api_calls=MAX_API_CALLS_PER_USER_TURN,
     stop_gate=TodoStopGate(TODO, TODO_CONTRACT_MAX_NUDGES),
+    on_text=emit_assistant_text,
 )
 
 EXPLORE_SUBAGENT_CONFIG = AgentConfig(
@@ -225,6 +235,10 @@ def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> StepO
         response_text = (response.output_text or "").strip()
         nudge = config.stop_gate.check(response_text)
         if nudge is not None and state.nudges < config.stop_gate.max_nudges:
+            # The loop continues, so this text won't become final_text and would
+            # otherwise be lost. Surface the rejected answer before nudging.
+            if response_text and config.on_text is not None:
+                config.on_text(response_text)
             state.nudges += 1
             state.messages.append({"role": "user", "content": nudge})
             return None
@@ -237,6 +251,11 @@ def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> StepO
         state.nudges = 0
         # Turn ends on a model message with no tool calls: this is the answer.
         return StepOutcome(stop_reason="completed", final_text=response_text)
+
+    # Surface assistant text that accompanies tool calls; otherwise it would be
+    # retained in history but never shown, swallowing real deliverables.
+    if response.output_text and config.on_text is not None:
+        config.on_text(response.output_text)
 
     results, _ = execute_configured_tool_calls(tool_calls, config)
     if not results:

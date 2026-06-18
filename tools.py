@@ -283,6 +283,20 @@ class TodoManager:
                 "Your todo list is now empty. You have no tracked tasks.\n"
                 "</system-reminder>"
             )
+        if self.all_items_completed():
+            # When the plan is finished, stop nudging for more todo calls --
+            # that reflex makes the model emit a gratuitous trailing todo call
+            # right after its deliverable, which the loop then has to surface
+            # specially. Steer it to deliver the result instead.
+            return (
+                "Todos updated. All tracked items are complete.\n\n"
+                "<system-reminder>\n"
+                "Your todo list is now fully complete:\n\n"
+                f"{self.render()}\n\n"
+                "Provide the final result the user asked for in your next message. "
+                "Do not call the todo tool again unless the plan changes.\n"
+                "</system-reminder>"
+            )
         return (
             "Todos updated. Keep using the todo tool to track your progress.\n\n"
             "<system-reminder>\n"

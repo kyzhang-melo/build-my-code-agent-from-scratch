@@ -14,7 +14,12 @@ PARENT_SYSTEM = (
     "Before changing code, first understand the relevant files and context. "
     "Keep exactly one step in_progress when a task has multiple steps. "
     "Refresh the plan as work advances. "
-    "Act with concrete steps, avoid unnecessary explanation, and report clearly what you changed and why."
+    "Act with concrete steps and avoid narrating routine tool use. "
+    "When you finish, your closing message must contain the result the user asked for: "
+    "for a summary, comparison, explanation, report, or analysis, put the findings themselves "
+    "in that message, not just a list of completed steps; for code changes, state what changed and why. "
+    "Completing todo items is not itself a final answer. "
+    "Never refer to something you produced in an earlier step as if the user has already seen it."
 )
 
 EXPLORE_SUBAGENT_SYSTEM = (

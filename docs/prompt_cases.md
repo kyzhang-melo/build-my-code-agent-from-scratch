@@ -32,7 +32,7 @@
 7. `Find Python files under tests whose names include "manager", then read the most relevant one and summarize its purpose.`
 8. `Search for a string that should not exist, such as "__definitely_missing_search_token__", and report the result clearly.`
 9. `Use a subtask to find what testing framework this project uses.`
-10. `Use a task to inspect 'tmp/codeAgent_subagent.py' and summarize how subagents work.`
+10. `Use a task to inspect 'tmp/subagent.py' and summarize how subagents work.`
 11. `Delegate: find the three largest Python files in 'tmp' and summarize their main differences.`
 12. `Use a task to do an impossible task: read no_such_dir/no_such_file.py and summarize it.`
 13. `Use todo to plan: first delegate a task to inspect 'tmp/codeAgent_loop.py', then delegate a task to inspect 'tmp/codeAgent_multitool.py', then summarize the evolution.`
@@ -44,3 +44,4 @@
 19. `How does the tool dispatch system work? Trace from tool definition to execution.`
 20. `What are all the Pydantic models used in 'tmp/codeAgent_writeToDo.py' and what do they validate?`
 21. `Delegate: exhaustively catalog every function in every Python file under 'tmp_folder_for_test', with parameters and return types.`
+22."Start a todo plan to build `tmp/change_cash.py` with three steps: 1. Create the target directory and file. 2. Implement a small Python function `change_cash(amount, delta)` that returns `amount + delta`. 3. Add a separate CLI interface. After completing step 1, decide that step 3 is unnecessary for this task. Rewrite the todo plan so that step 3 is removed rather than marked as completed. Then finish the remaining step(s). At the end, report the final todo plan and confirm the file path and implemented function. "

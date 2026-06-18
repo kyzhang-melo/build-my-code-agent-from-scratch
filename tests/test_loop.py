@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import sys
 import types
 
@@ -67,6 +68,84 @@ def test_run_one_turn_full_iteration(load_module, monkeypatch) -> None:
 
 def _no_tool_response(output_text: str):
     return types.SimpleNamespace(output=[], output_text=output_text)
+
+
+def test_run_one_turn_surfaces_intermediate_text_with_tool_calls(load_module, monkeypatch) -> None:
+    main_module = load_module("main", "main.py")
+    main_module.TODO.update(_todo_params([]))
+
+    function_call = types.SimpleNamespace(type="function_call", call_id="c1", name="bash", arguments="{}")
+    fake_response = types.SimpleNamespace(output=[function_call], output_text="INTERIM SUMMARY")
+    monkeypatch.setattr(
+        main_module,
+        "client",
+        types.SimpleNamespace(responses=types.SimpleNamespace(create=lambda **_: fake_response)),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "execute_tool_calls",
+        lambda _output: ([{"type": "function_call_output", "call_id": "c1", "output": "ok"}], False),
+    )
+
+    surfaced: list[str] = []
+    config = dataclasses.replace(main_module.PARENT_CONFIG, on_text=surfaced.append)
+    state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
+
+    outcome = main_module.run_one_turn(state, config)
+
+    # Text that rides along with a tool call is shown, not swallowed.
+    assert outcome is None
+    assert surfaced == ["INTERIM SUMMARY"]
+
+
+def test_run_one_turn_no_tool_calls_does_not_surface_via_on_text(load_module, monkeypatch) -> None:
+    main_module = load_module("main", "main.py")
+    main_module.TODO.update(_todo_params([]))
+    monkeypatch.setattr(
+        main_module,
+        "client",
+        types.SimpleNamespace(
+            responses=types.SimpleNamespace(create=lambda **_: _no_tool_response("Final answer."))
+        ),
+    )
+
+    surfaced: list[str] = []
+    config = dataclasses.replace(main_module.PARENT_CONFIG, on_text=surfaced.append)
+    state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
+
+    outcome = main_module.run_one_turn(state, config)
+
+    # The final no-tool answer is delivered via the return value (and __main__),
+    # not on_text -- so it is not surfaced twice.
+    assert outcome is not None
+    assert outcome.final_text == "Final answer."
+    assert surfaced == []
+
+
+def test_run_one_turn_surfaces_text_when_nudged(load_module, monkeypatch) -> None:
+    main_module = load_module("main", "main.py")
+    # An unresolved todo makes TodoStopGate.check() reject the stop with a nudge,
+    # so the model's no-tool answer rides a *continuing* turn (Door 2).
+    main_module.TODO.update(_todo_params([{"content": "unfinished", "status": "in_progress"}]))
+    monkeypatch.setattr(
+        main_module,
+        "client",
+        types.SimpleNamespace(
+            responses=types.SimpleNamespace(create=lambda **_: _no_tool_response("MY SUMMARY"))
+        ),
+    )
+
+    surfaced: list[str] = []
+    config = dataclasses.replace(main_module.PARENT_CONFIG, on_text=surfaced.append)
+    state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
+
+    outcome = main_module.run_one_turn(state, config)
+
+    # The rejected answer is shown before the contract nudge, not swallowed.
+    assert outcome is None
+    assert surfaced == ["MY SUMMARY"]
+    assert state.messages[-1]["role"] == "user"
+    assert "Before ending, either complete all todo items" in state.messages[-1]["content"]
 
 
 def test_run_one_turn_sets_final_text_from_current_turn(load_module, monkeypatch) -> None:
@@ -144,16 +223,21 @@ def test_run_one_turn_contract_warns_after_max_nudges(load_module, monkeypatch) 
         types.SimpleNamespace(responses=types.SimpleNamespace(create=lambda **_: fake_response)),
     )
 
+    surfaced: list[str] = []
+    config = dataclasses.replace(main_module.PARENT_CONFIG, on_text=surfaced.append)
     state = main_module.LoopState(
         messages=[{"role": "user", "content": "task"}],
         nudges=main_module.TODO_CONTRACT_MAX_NUDGES,
     )
-    outcome = main_module.run_one_turn(state)
+    outcome = main_module.run_one_turn(state, config)
 
     assert outcome is not None
     assert outcome.stop_reason == "completed"
     assert state.messages[-1]["role"] == "assistant"
     assert "Ending with unresolved todo items" in state.messages[-1]["content"]
+    # Give-up path stops: the text is delivered as final_text, not surfaced twice.
+    assert outcome.final_text == "Done."
+    assert surfaced == []
 
 
 def test_todo_update_echoes_system_reminder(load_module) -> None:
@@ -173,6 +257,18 @@ def test_todo_update_empty_echoes_cleared_reminder(load_module) -> None:
 
     assert "<system-reminder>" in output
     assert "Your todo list is now empty." in output
+
+
+def test_todo_update_completed_reminder_steers_to_final_answer(load_module) -> None:
+    main_module = load_module("main", "main.py")
+
+    output = main_module.TODO.update(_todo_params([{"content": "done", "status": "completed"}]))
+
+    # A fully-complete plan should stop nudging for more todo calls and steer
+    # the model to deliver its result instead.
+    assert "Provide the final result" in output
+    assert "Do not call the todo tool again" in output
+    assert "Keep using the todo tool" not in output
 
 
 def test_todo_stop_gate_nudges_on_unresolved_todo(load_module) -> None:
