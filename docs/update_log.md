@@ -165,3 +165,19 @@
 - Since the reminder mechanism has been changed, the agent harness does not need the `transition_reason` field and the `todo_rewrite_ack_pending` field of the `LoopState` class.
 - Before the refactor, the todo tool and the subagent tool have two different stop policies, but they share the same `run_one_turn()` function. So the `StopGate` protocol has been introduced to unify the stop policies.
 - Before the refactor, `run_one_turn()` function returns a boolean type value, `agent_loop()` function returns nothing. When these two functions are used by different agents (parent agent or subagent), the boolean value is not enough. So the Literal `StopReason` and the class `StepOutcome` and `TurnOutcome` have been introduced to unify the loop outcome.
+
+## June 18
+
+### What I've done
+
+- Fix the swallowed-deliverable bug: the model's real answer (e.g. an evolution summary) was kept in history but never shown to the user when it appeared on a turn that continues the loop, so the user only saw a terse recap.
+- Add an `on_text` sink on `AgentConfig` and surface assistant text on every loop continuation in `run_one_turn()`: both when the text accompanies a tool call (Door 1), and when a stop-gate nudge rejects a no-tool answer (Door 2). The parent prints via `emit_assistant_text`; the explore subagent stays silent (`on_text=None`). Stop paths still deliver via `final_text`, so nothing prints twice.
+- Make the todo reminder state-aware: when the plan is fully complete, `render_with_reminder()` steers the model to deliver its result instead of nudging for more todo calls, removing the gratuitous trailing `todo` call that buried summaries.
+- Tighten `PARENT_SYSTEM`: the closing message must contain the actual result (the findings/report), not just a list of completed steps.
+- Add regression tests for surfacing on both continuation paths and the no-double-print boundary on the give-up path.
+
+### Why
+
+- `run_one_turn()` only displayed the final no-tool message (`final_text`), tying display to loop termination. Any assistant text on a continuing turn (riding a tool call, or rejected by the todo contract nudge because bookkeeping lagged) was retained in history but never printed.
+- The implementation streams all message parts regardless of tool calls, and separates streaming output from final-answer detection. This fix mirrors that approach: surface text on every continuation, while treating only tool-free text as the final answer.
+- Verified with prompt-case logs: deliverables now print in full across todo-driven summarize, build, and plan-rewrite tasks.
