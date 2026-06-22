@@ -181,3 +181,24 @@
 - `run_one_turn()` only displayed the final no-tool message (`final_text`), tying display to loop termination. Any assistant text on a continuing turn (riding a tool call, or rejected by the todo contract nudge because bookkeeping lagged) was retained in history but never printed.
 - The implementation streams all message parts regardless of tool calls, and separates streaming output from final-answer detection. This fix mirrors that approach: surface text on every continuation, while treating only tool-free text as the final answer.
 - Verified with prompt-case logs: deliverables now print in full across todo-driven summarize, build, and plan-rewrite tasks.
+
+## June 22
+
+### What I've done
+
+- Upgrade the `glob` tool to allow recursive searches from the workspace, such as `**/config.json`, `**/pyproject.toml`, and `**/README.md`.
+- Replace the old root-level `**` blanket block with a narrower broad-pattern guard for match-everything patterns like `**`, `**/`, and `**/*`.
+- Add a helpful broad-pattern error response that includes the top-level workspace listing and marks directories with a trailing `/`, so the model can choose a more specific search location on the next call.
+- Add noisy directory pruning for recursive glob walking, skipping directories such as `.git`, `.svn`, `.hg`, `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, and `.claude`.
+- Add shared glob formatting helpers so results are sorted, limited, and filtered consistently after traversal.
+- Update the `glob` tool description to explain that recursive filename searches are supported and noisy directories are skipped.
+- Extend `tests/test_search_tools.py` with coverage for broad-pattern guidance, precise recursive filename search, excluded-directory pruning, and the existing escape/limit behavior.
+- Validate the behavior with prompt-case logs in `/Users/xixi/myProject/tmp_folder_for_test`, including `**/config.json`, `**/pyproject.toml`, `**/README.md`, `**/__main__.py`, root-level `*.log`, and the broad `**/*` guidance path.
+
+### Why
+
+- The old guard treated every `pattern.startswith("**") and base == WORKDIR` call as unsafe. That blocked common, legitimate file discovery tasks like finding `config.json` anywhere in the workspace.
+- When `**/filename` was rejected, the model had to fall back to shallow patterns like `*` and `*/*`, which was token-expensive and could miss deeper files.
+- The real risk is broad, noisy traversal, not simply using `**` from the workspace root. The upgraded behavior separates precise recursive lookup from match-everything traversal.
+- Returning the top-level listing on broad-pattern rejection makes the error actionable instead of a dead end.
+- Directory pruning keeps recursive glob useful while avoiding common large or noisy folders.

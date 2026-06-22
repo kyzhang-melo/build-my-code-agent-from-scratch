@@ -66,11 +66,75 @@ def test_run_glob_can_exclude_directories(load_module) -> None:
         base.rmdir()
 
 
-def test_run_glob_rejects_escape_and_unsafe_pattern(load_module) -> None:
+def test_run_glob_rejects_escape(load_module) -> None:
     tools = load_module("tools", "tools.py")
 
     assert tools.run_glob("*.py", "../").startswith("Error: Path escapes workspace")
-    assert tools.run_glob("**/*").startswith("Error: unsafe glob pattern from workspace root")
+
+
+def test_run_glob_broad_pattern_returns_top_level_listing(load_module) -> None:
+    tools = load_module("tools", "tools.py")
+    base = Path(tools.WORKDIR / "tests" / "_tmp_glob_broad")
+    try:
+        (base / "pkg").mkdir(parents=True, exist_ok=True)
+        (base / "__pycache__").mkdir(parents=True, exist_ok=True)
+        (base / "root.py").write_text("root")
+
+        output = tools.run_glob("**/*", "tests/_tmp_glob_broad")
+
+        assert output.startswith("Error: pattern `**/*` matches everything")
+        assert "pkg/" in output  # directories marked with a trailing slash
+        assert "root.py" in output
+        assert "__pycache__" not in output  # noisy dir omitted from the listing
+    finally:
+        (base / "root.py").unlink()
+        (base / "pkg").rmdir()
+        (base / "__pycache__").rmdir()
+        base.rmdir()
+
+
+def test_run_glob_recursive_finds_nested_and_root_level(load_module) -> None:
+    tools = load_module("tools", "tools.py")
+    base = Path(tools.WORKDIR / "tests" / "_tmp_glob_deep")
+    try:
+        (base / "a" / "b").mkdir(parents=True, exist_ok=True)
+        (base / "config.json").write_text("root")  # depth 0
+        (base / "a" / "b" / "config.json").write_text("nested")  # depth 2
+
+        output = tools.run_glob("**/config.json", "tests/_tmp_glob_deep")
+
+        assert "Found 2 matches" in output
+        assert "config.json" in output
+        assert "a/b/config.json" in output
+    finally:
+        (base / "config.json").unlink()
+        (base / "a" / "b" / "config.json").unlink()
+        (base / "a" / "b").rmdir()
+        (base / "a").rmdir()
+        base.rmdir()
+
+
+def test_run_glob_recursive_prunes_excluded_dirs(load_module) -> None:
+    tools = load_module("tools", "tools.py")
+    base = Path(tools.WORKDIR / "tests" / "_tmp_glob_prune")
+    try:
+        (base / "src").mkdir(parents=True, exist_ok=True)
+        (base / "node_modules" / "dep").mkdir(parents=True, exist_ok=True)
+        (base / "src" / "keep.py").write_text("keep")
+        (base / "node_modules" / "dep" / "skip.py").write_text("skip")
+
+        output = tools.run_glob("**/*.py", "tests/_tmp_glob_prune", include_dirs=False)
+
+        assert "Found 1 matches" in output
+        assert "src/keep.py" in output
+        assert "node_modules" not in output
+    finally:
+        (base / "src" / "keep.py").unlink()
+        (base / "node_modules" / "dep" / "skip.py").unlink()
+        (base / "node_modules" / "dep").rmdir()
+        (base / "node_modules").rmdir()
+        (base / "src").rmdir()
+        base.rmdir()
 
 
 def test_run_glob_allows_recursive_pattern_in_specific_directory(load_module) -> None:

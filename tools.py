@@ -1,4 +1,6 @@
+import fnmatch
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -11,6 +13,18 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, m
 WORKDIR = Path.cwd()
 TOOL_OUTPUT_PREVIEW_CHARS = 500
 READ_ONLY_TOOL_NAMES = {"read_file", "glob", "grep"}
+# Noisy/sensitive directories pruned from glob traversal and results, keeping
+# `glob` consistent with `run_grep`'s excludes (`.git/.svn/.hg`).
+EXCLUDE_DIRS = {
+    ".git",
+    ".svn",
+    ".hg",
+    ".venv",
+    "node_modules",
+    "__pycache__",
+    ".pytest_cache",
+    ".claude",
+}
 
 
 TOOLS = [
@@ -73,6 +87,9 @@ TOOLS = [
         "name": "glob",
         "description": (
             "Find files or directories in the workspace by glob pattern. "
+            "Recursive patterns like '**/config.json' are supported and search the "
+            "whole tree (noisy dirs such as .venv/node_modules are skipped); avoid "
+            "the bare '**/*' which is too broad. "
             "When the user names a search directory, pass it as directory instead of "
             "prefixing it into pattern."
         ),
@@ -459,6 +476,58 @@ def _limit_lines(lines: list[str], limit: int) -> tuple[list[str], str]:
     return lines, ""
 
 
+# Match-everything patterns: too broad to be useful, answered with a listing.
+BROAD_GLOB_PATTERNS = {"**", "**/", "**/*"}
+
+
+def _glob_excluded(rel: Path) -> bool:
+    return any(part in EXCLUDE_DIRS for part in rel.parts)
+
+
+def _glob_listing(pattern: str, base: Path) -> str:
+    entries = [
+        f"{child.name}/" if child.is_dir() else child.name
+        for child in sorted(base.iterdir())
+        if child.name not in EXCLUDE_DIRS
+    ]
+    body = "\n".join(entries) if entries else "(empty)"
+    return (
+        f"Error: pattern `{pattern}` matches everything and is too broad. "
+        "Anchor the search to a subdirectory (e.g. `subdir/**/name`). "
+        f"Top-level entries of `{base}` (directories marked with `/`):\n{body}"
+    )
+
+
+def _glob_walk(base: Path, tail: str, include_dirs: bool) -> list[Path]:
+    """Recursive `**/<tail>` search that prunes noisy dirs during traversal.
+
+    Matches the basename against `tail` (not the relative path) so `fnmatch`'s
+    `*`-spans-`/` behavior cannot leak, and depth-0 entries under `base` match.
+    """
+    matches: list[Path] = []
+    for root, dirs, files in os.walk(base):
+        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+        names = files + dirs if include_dirs else files
+        for name in names:
+            if fnmatch.fnmatch(name, tail):
+                matches.append(Path(root) / name)
+    return matches
+
+
+def _format_glob_matches(pattern: str, base: Path, matches: list[Path], limit: int) -> str:
+    matches = [path for path in matches if not _glob_excluded(path.relative_to(base))]
+    matches.sort()
+    total = len(matches)
+    if total == 0:
+        return f"No matches found for pattern `{pattern}`."
+
+    lines = [str(path.relative_to(base)) for path in matches[:limit]]
+    message = f"Found {total} matches for pattern `{pattern}`."
+    if total > limit:
+        message += f" Showing first {limit}."
+    return "\n".join([message, *lines])[:50000]
+
+
 def run_glob(
     pattern: str,
     directory: str | None = None,
@@ -467,31 +536,25 @@ def run_glob(
 ) -> str:
     try:
         base = safe_path(directory or ".")
-        if pattern.startswith("**") and base == WORKDIR:
-            return (
-                "Error: unsafe glob pattern from workspace root. "
-                "Pass a more specific directory when using '**'."
-            )
         if not base.exists():
             return f"Error: Directory not found: {directory or '.'}"
         if not base.is_dir():
             return f"Error: Not a directory: {directory or '.'}"
 
-        matches = list(base.glob(pattern))
-        if not include_dirs:
-            matches = [path for path in matches if path.is_file()]
-        matches.sort()
+        if pattern in BROAD_GLOB_PATTERNS:
+            return _glob_listing(pattern, base)
 
-        total = len(matches)
-        returned = matches[:limit]
-        lines = [str(path.relative_to(base)) for path in returned]
-        if total == 0:
-            return f"No matches found for pattern `{pattern}`."
+        if pattern.startswith("**/") and "/" not in pattern[3:]:
+            # Precise recursive search: fast, pruned os.walk over the tree.
+            matches = _glob_walk(base, pattern[3:], include_dirs)
+        else:
+            # Non-recursive or exotic `**` shapes: pathlib handles the pattern;
+            # noisy dirs are dropped from the results by the formatter.
+            matches = list(base.glob(pattern))
+            if not include_dirs:
+                matches = [path for path in matches if path.is_file()]
 
-        message = f"Found {total} matches for pattern `{pattern}`."
-        if total > limit:
-            message += f" Showing first {limit}."
-        return "\n".join([message, *lines])[:50000]
+        return _format_glob_matches(pattern, base, matches, limit)
     except Exception as e:
         return f"Error: {e}"
 
