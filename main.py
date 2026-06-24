@@ -22,7 +22,11 @@ from tools import (
     configure_task_runner,
     execute_tool_calls,
 )
-from context_compact import compact_history
+from context_compact import (
+    SUMMARY_PREFIX,
+    compact_history,
+    estimate_tokens,
+)
 
 
 load_dotenv(override=True)
@@ -310,9 +314,41 @@ def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> StepO
     return None
 
 
+def _drop_oldest_user_message(state: LoopState) -> bool:
+    """Drop the oldest non-summary user message (codex's remove_first_item).
+
+    Returns True if one was removed, False if none remain to drop.
+    """
+    for i, msg in enumerate(state.messages):
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "user"
+            and not str(msg.get("content", "")).startswith(SUMMARY_PREFIX)
+        ):
+            del state.messages[i]
+            return True
+    return False
+
+
 def agent_loop(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> TurnOutcome:
     while (outcome := run_one_turn(state, config)) is None:
-        pass
+        # Each `None` outcome is a clean turn boundary: the turn's tool outputs
+        # are already appended, so the history is well-formed (no orphaned tool
+        # call) -- a safe point to compact.
+        if AUTO_COMPACT_ENABLED and should_auto_compact(state):
+            result = compact_history(
+                state, source="auto", focus=None, client=client, model=MODEL_ID
+            )
+            if result is not None:
+                print(
+                    f"[compact] auto-compacted: ~{result.tokens_before} -> "
+                    f"~{result.tokens_after} tokens (backup: {result.transcript_path})"
+                )
+                # If even a fresh summary still doesn't fit, the surviving user
+                # messages are the bulk: drop the oldest until we fit, rather
+                # than re-summarizing on every subsequent turn.
+                while should_auto_compact(state) and _drop_oldest_user_message(state):
+                    state.last_input_tokens = estimate_tokens(state.messages)
     return TurnOutcome(
         stop_reason=outcome.stop_reason,
         final_text=outcome.final_text,
