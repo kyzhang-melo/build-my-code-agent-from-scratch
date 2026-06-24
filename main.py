@@ -22,6 +22,7 @@ from tools import (
     configure_task_runner,
     execute_tool_calls,
 )
+from context_compact import compact_history
 
 
 load_dotenv(override=True)
@@ -335,6 +336,46 @@ def run_subagent(prompt: str, description: str = "exploration") -> str:
 configure_task_runner(run_subagent)
 
 
+def cmd_compact(arg: str, history: list) -> None:
+    state = LoopState(history)
+    result = compact_history(
+        state, source="manual", focus=arg or None, client=client, model=MODEL_ID
+    )
+    if result is None:
+        print("[compact] nothing to compact yet.")
+        return
+    history[:] = state.messages
+    print(
+        f"[compact] context compacted: ~{result.tokens_before} -> "
+        f"~{result.tokens_after} tokens (backup: {result.transcript_path})"
+    )
+
+
+def cmd_help(arg: str, history: list) -> None:
+    print("commands: /compact [focus]  |  /help   (q or exit to quit)")
+
+
+COMMANDS = {
+    "compact": cmd_compact,
+    "help": cmd_help,
+}
+
+
+def handle_command(query: str, history: list) -> bool:
+    """Dispatch a `/slash` command. Returns True when the input was a command
+    (handled here, never forwarded to the model); False for ordinary input."""
+    stripped = query.strip()
+    if not stripped.startswith("/"):
+        return False
+    name, _, arg = stripped[1:].partition(" ")
+    handler = COMMANDS.get(name.lower())
+    if handler is None:
+        print(f"unknown command '/{name}' (try /help)")
+        return True
+    handler(arg.strip(), history)
+    return True
+
+
 if __name__ == "__main__":
     history = []
     while True:
@@ -345,6 +386,8 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+        if handle_command(query, history):
+            continue
         history.append({
             "role": "user",
             "content": query,
