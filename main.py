@@ -4,6 +4,7 @@
 Split version of the code-agent loop.
 """
 
+import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -58,6 +59,36 @@ MAX_API_CALLS_PER_USER_TURN = 30
 MAX_SUBAGENT_API_CALLS = 30
 INPUT_PROMPT = "\001\033[36m\002s01 >> \001\033[0m\002"
 
+# --- Context compaction config ---
+# Per-model context windows (OpenRouter ids). Unknown models fall back to a
+# conservative default so they compact early rather than overflow.
+MODEL_CONTEXT_WINDOW = {
+    "moonshotai/kimi-k2.5": 262144,
+    "deepseek/deepseek-v4-pro": 131072,
+}
+DEFAULT_CONTEXT_WINDOW = 32000
+RESERVED_OUTPUT_TOKENS = 8000      # mirrors max_output_tokens in run_one_turn
+RESERVED_OVERHEAD_TOKENS = 4000    # system prompt + tool schemas
+COMPACT_TRIGGER_RATIO = 0.85
+# On by default; AUTO_COMPACT=0 disables automatic compaction (manual /compact
+# still works). The destructive rewrite is backed by a .transcripts/ snapshot.
+AUTO_COMPACT_ENABLED = os.getenv("AUTO_COMPACT", "1") != "0"
+
+
+def context_window() -> int:
+    return MODEL_CONTEXT_WINDOW.get(MODEL_ID, DEFAULT_CONTEXT_WINDOW)
+
+
+def input_budget() -> int:
+    # Tokens available for input once the response reservation and fixed overhead
+    # are carved out. The trigger ratio applies to THIS, not the raw window, so
+    # the output reservation can't be eaten away on small-context models.
+    return context_window() - RESERVED_OUTPUT_TOKENS - RESERVED_OVERHEAD_TOKENS
+
+
+def should_auto_compact(state: "LoopState") -> bool:
+    return state.last_input_tokens >= COMPACT_TRIGGER_RATIO * input_budget()
+
 
 @dataclass
 class LoopState:
@@ -65,6 +96,9 @@ class LoopState:
     messages: list
     api_call_count: int = 0
     nudges: int = 0
+    # Input tokens the last API call consumed (from response.usage, or estimated).
+    # Drives the auto-compaction trigger.
+    last_input_tokens: int = 0
 
 
 StopReason = Literal["completed", "max_api_calls"]
@@ -211,6 +245,15 @@ def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> StepO
         input=input_messages,
         tools=config.tools,
         max_output_tokens=8000,
+    )
+
+    # Track input-token load for the auto-compaction trigger. Prefer the API's
+    # reported usage; fall back to a char-based estimate if it's absent.
+    usage = getattr(response, "usage", None)
+    reported = getattr(usage, "input_tokens", None) if usage is not None else None
+    state.last_input_tokens = (
+        reported if reported is not None
+        else len(json.dumps(input_messages, default=str)) // 4
     )
 
     if response.output_text:
