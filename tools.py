@@ -26,6 +26,54 @@ EXCLUDE_DIRS = {
     ".claude",
 }
 
+# Budget for a single tool output handed back to the model. Char-based (chars
+# ~= 4x tokens); a token-aware policy can replace it later without touching callers.
+TOOL_OUTPUT_MAX_CHARS = 48000
+TOOL_OUTPUT_MAX_LINE_CHARS = 2000
+
+
+def truncate_middle(
+    text: str,
+    *,
+    max_chars: int = TOOL_OUTPUT_MAX_CHARS,
+    max_line_chars: int = TOOL_OUTPUT_MAX_LINE_CHARS,
+) -> str:
+    """Bound a single tool output, preserving both ends.
+
+    Two defenses, applied in order:
+      1. Per-line cap: clip any line longer than `max_line_chars` so one minified
+         file or base64 blob can't eat the whole budget.
+      2. Middle-truncation: if still over `max_chars`, keep the head and the tail
+         and elide the middle. The tail is kept on purpose -- command errors
+         (stderr is appended last) and end-of-file content live there, which the
+         old head-only `[:50000]` cap silently dropped.
+
+    No-op when the text already fits.
+    """
+    if not text:
+        return text
+
+    if max_line_chars and max_line_chars > 0:
+        capped: list[str] = []
+        clipped_any = False
+        for line in text.split("\n"):
+            if len(line) > max_line_chars:
+                line = line[:max_line_chars] + " [...line truncated]"
+                clipped_any = True
+            capped.append(line)
+        if clipped_any:
+            text = "\n".join(capped)
+
+    if len(text) <= max_chars:
+        return text
+
+    total_lines = text.count("\n") + 1
+    head_chars = max_chars * 6 // 10
+    tail_chars = max_chars - head_chars
+    elided = len(text) - head_chars - tail_chars
+    marker = f"\n\n[... {elided} chars elided from the middle ...]\n\n"
+    return f"Total output lines: {total_lines}\n\n{text[:head_chars]}{marker}{text[-tail_chars:]}"
+
 
 TOOLS = [
     {
@@ -427,7 +475,7 @@ def run_bash(command: str) -> str:
     except (FileNotFoundError, OSError) as e:
         return f"Error: {e}."
     output = (result.stdout + result.stderr).strip()
-    return output[:50000] if output else "(no output)"
+    return output if output else "(no output)"
 
 
 def safe_path(path: str) -> Path:
@@ -443,7 +491,7 @@ def run_read(path: str, limit: int | None = None) -> str:
         lines = text.splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
-        return "\n".join(lines)[:50000]
+        return "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
 
@@ -525,7 +573,7 @@ def _format_glob_matches(pattern: str, base: Path, matches: list[Path], limit: i
     message = f"Found {total} matches for pattern `{pattern}`."
     if total > limit:
         message += f" Showing first {limit}."
-    return "\n".join([message, *lines])[:50000]
+    return "\n".join([message, *lines])
 
 
 def run_glob(
@@ -637,7 +685,7 @@ def run_grep(
     lines = output.splitlines()
     lines, suffix = _limit_lines(lines, head_limit)
     output = "\n".join(lines) + suffix
-    return output[:50000] if output else "No matches found."
+    return output if output else "No matches found."
 
 
 @dataclass
@@ -820,6 +868,12 @@ def run_tool_call(
                 output = spec.execute(params)
             except Exception as e:
                 output = f"Error: tool '{item.name}' failed: {e}"
+
+    # Bound the output for the model's context at the one chokepoint every tool
+    # flows through. `todo` is control-plane state (small, structured) -- leave it
+    # verbatim; everything else gets middle-truncated if it's oversized.
+    if item.name != "todo":
+        output = truncate_middle(output)
 
     if item.name == "todo":
         print(output)
