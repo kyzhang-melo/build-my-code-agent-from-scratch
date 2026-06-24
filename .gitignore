@@ -21,3 +21,6 @@ venv/
 build/
 dist/
 *.egg-info/
+
+# Pre-compaction transcript snapshots
+.transcripts/
