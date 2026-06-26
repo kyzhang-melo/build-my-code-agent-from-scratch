@@ -159,6 +159,35 @@ def test_summarize_omits_tools_and_raises_on_empty(load_module) -> None:
         cc.summarize([{"role": "user", "content": "hi"}], None, client=empty_client, model="m")
 
 
+def test_provider_extra_body_threads_to_side_call(load_module, tmp_path) -> None:
+    cc = load_module("context_compact", "context_compact.py")
+    cc.TRANSCRIPT_DIR = tmp_path
+    routing = {"provider": {"only": ["moonshotai"], "allow_fallbacks": False}}
+
+    # summarize forwards extra_body verbatim to responses.create
+    client = _FakeClient()
+    cc.summarize([{"role": "user", "content": "hi"}], None, client=client, model="m",
+                 extra_body=routing)
+    assert client.captured["extra_body"] == routing
+
+    # compact_history threads it down to the same side-call
+    client2 = _FakeClient()
+    state = types.SimpleNamespace(messages=list(_droppable_history(cc)), last_input_tokens=0)
+    cc.compact_history(state, source="auto", client=client2, model="m", extra_body=routing)
+    assert client2.captured["extra_body"] == routing
+
+    # default (no pinning) leaves routing unset -> SDK no-op
+    client3 = _FakeClient()
+    cc.summarize([{"role": "user", "content": "hi"}], None, client=client3, model="m")
+    assert client3.captured["extra_body"] is None
+
+
+def test_provider_extra_body_disabled_by_default(load_module) -> None:
+    main = load_module("main", "main.py")
+    # OPENROUTER_PROVIDER is unset in the test env -> no routing override.
+    assert main.PROVIDER_EXTRA_BODY is None
+
+
 def test_reinject_todo_gated_on_active_plan(load_module) -> None:
     cc = load_module("context_compact", "context_compact.py")
     cc.TODO = types.SimpleNamespace(has_active_plan=lambda: False, render=lambda: "X")
@@ -235,6 +264,7 @@ def test_compact_history_noop_when_nothing_to_compact(load_module) -> None:
 
 def test_input_budget_and_threshold(load_module) -> None:
     main = load_module("main", "main.py")
+    main.CONTEXT_WINDOW_OVERRIDE = 0
     main.MODEL_ID = "moonshotai/kimi-k2.5"
     assert main.context_window() == 262144
     assert main.input_budget() == 262144 - main.RESERVED_OUTPUT_TOKENS - main.RESERVED_OVERHEAD_TOKENS
@@ -253,11 +283,46 @@ def test_input_budget_and_threshold(load_module) -> None:
     assert main.should_auto_compact(state) is False
 
 
+def test_context_window_normalizes_routing_and_quant_suffixes(load_module) -> None:
+    main = load_module("main", "main.py")
+    main.CONTEXT_WINDOW_OVERRIDE = 0
+
+    assert main.normalize_model_id("moonshotai/kimi-k2.5:exacto") == "kimi-k2.5"
+    assert main.normalize_model_id("moonshotai/kimi-k2.5") == "kimi-k2.5"
+    assert main.normalize_model_id("kimi-k2.5") == "kimi-k2.5"
+
+    # The routing/quant suffix must NOT defeat the lookup (the original bug:
+    # an exact-key dict missed "...:exacto" and fell back to 32000).
+    for model in (
+        "moonshotai/kimi-k2.5:exacto",
+        "moonshotai/kimi-k2.5:nitro",
+        "kimi-k2-0905",
+    ):
+        main.MODEL_ID = model
+        assert main.context_window() == 262144, model
+
+    main.MODEL_ID = "deepseek/deepseek-v4-pro:floor"
+    assert main.context_window() == 131072
+
+    main.MODEL_ID = "nope/unknown:exacto"
+    assert main.context_window() == main.DEFAULT_CONTEXT_WINDOW
+
+
+def test_context_window_override_wins(load_module) -> None:
+    main = load_module("main", "main.py")
+    main.MODEL_ID = "moonshotai/kimi-k2.5"  # would resolve to 262144
+    main.CONTEXT_WINDOW_OVERRIDE = 20000
+    try:
+        assert main.context_window() == 20000
+    finally:
+        main.CONTEXT_WINDOW_OVERRIDE = 0
+
+
 def test_handle_command_dispatch(load_module) -> None:
     main = load_module("main", "main.py")
     calls: list = []
 
-    def fake_compact(state, *, source, focus=None, client, model):
+    def fake_compact(state, *, source, focus=None, client, model, extra_body=None):
         calls.append((source, focus))
         state.messages[:] = [{"role": "user", "content": main.SUMMARY_PREFIX + "\ns"}]
         return types.SimpleNamespace(tokens_before=1, tokens_after=0, transcript_path="x.jsonl")
@@ -297,7 +362,7 @@ def test_auto_compaction_fires_and_kill_switch(load_module) -> None:
     main.MODEL_ID = "nope/unknown"  # budget 20000, threshold 17000
     compact_calls: list = []
 
-    def fake_compact(state, *, source, focus=None, client, model):
+    def fake_compact(state, *, source, focus=None, client, model, extra_body=None):
         compact_calls.append(source)
         state.messages[:] = [{"role": "user", "content": main.SUMMARY_PREFIX + "\ns"}]
         state.last_input_tokens = 50

@@ -114,8 +114,14 @@ def build_compacted_history(user_messages: list[str], summary: str) -> list[dict
     return history
 
 
-def summarize(messages: list, focus: str | None, *, client, model: str) -> str:
-    """Side-call the model for a handoff summary. No tools. Raises on empty output."""
+def summarize(
+    messages: list, focus: str | None, *, client, model: str, extra_body: dict | None = None
+) -> str:
+    """Side-call the model for a handoff summary. No tools. Raises on empty output.
+
+    ``extra_body`` carries OpenRouter routing (e.g. provider pinning) so the
+    side-call lands on the same upstream host as the main agent turns.
+    """
     api_input = normalize_messages(
         messages + [{"role": "user", "content": render_prompt(focus)}]
     )
@@ -124,6 +130,7 @@ def summarize(messages: list, focus: str | None, *, client, model: str) -> str:
         instructions=_COMPACTION_DIRECTIVE,
         input=api_input,
         max_output_tokens=SUMMARY_MAX_OUTPUT_TOKENS,
+        extra_body=extra_body,
     )
     summary = (getattr(response, "output_text", "") or "").strip()
     if not summary:
@@ -168,6 +175,7 @@ def compact_history(
     focus: str | None = None,
     client,
     model: str,
+    extra_body: dict | None = None,
 ) -> CompactionResult | None:
     """Summarize and start-fresh-rebuild ``state.messages``.
 
@@ -183,7 +191,7 @@ def compact_history(
     transcript_path = write_transcript(messages)
 
     try:
-        summary = summarize(messages, focus, client=client, model=model)
+        summary = summarize(messages, focus, client=client, model=model, extra_body=extra_body)
     except Exception as exc:  # any failure -> keep the original history
         print(f"[compact] summarization failed ({exc}); history left unchanged")
         return None

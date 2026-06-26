@@ -6,6 +6,7 @@ Split version of the code-agent loop.
 
 import json
 import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
@@ -35,10 +36,12 @@ print("[init] .env loaded")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL")
 MODEL_ID = os.getenv("MODEL_ID")
+OPENROUTER_PROVIDER = os.getenv("OPENROUTER_PROVIDER")  # e.g. "moonshotai" to pin one host
 
 print(f"[init] MODEL_ID={MODEL_ID!r}")
 print(f"[init] OPENROUTER_BASE_URL={OPENROUTER_BASE_URL!r}")
 print(f"[init] OPENROUTER_API_KEY present={bool(OPENROUTER_API_KEY)}")
+print(f"[init] OPENROUTER_PROVIDER={OPENROUTER_PROVIDER!r}")
 
 if not OPENROUTER_API_KEY:
     raise RuntimeError("OPENROUTER_API_KEY is not set. Please set it in .env")
@@ -52,6 +55,17 @@ client = OpenAI(
     base_url=OPENROUTER_BASE_URL,
 )
 print("[init] OpenAI client initialized")
+
+# OpenRouter provider pinning. When OPENROUTER_PROVIDER is set, every
+# responses.create restricts routing to that single upstream host with
+# fallbacks off (fail loud rather than silently rerouting), so token
+# accounting and the effective context window stay consistent across turns
+# and the summarizer side-call. Unset -> None -> OpenRouter's default routing.
+PROVIDER_EXTRA_BODY = (
+    {"provider": {"only": [OPENROUTER_PROVIDER], "allow_fallbacks": False}}
+    if OPENROUTER_PROVIDER
+    else None
+)
 TODO_CONTRACT_MAX_NUDGES = 2
 SUMMARY_MIN_LENGTH = 200
 SUMMARY_CONTINUATION_ATTEMPTS = 1
@@ -65,13 +79,21 @@ MAX_SUBAGENT_API_CALLS = 30
 INPUT_PROMPT = "\001\033[36m\002s01 >> \001\033[0m\002"
 
 # --- Context compaction config ---
-# Per-model context windows (OpenRouter ids). Unknown models fall back to a
-# conservative default so they compact early rather than overflow.
-MODEL_CONTEXT_WINDOW = {
-    "moonshotai/kimi-k2.5": 262144,
-    "deepseek/deepseek-v4-pro": 131072,
-}
+# Per-model context windows, resolved by PREFIX match against a normalized
+# model id (most-specific pattern first, first match wins). Normalizing first
+# (drop the "vendor/" prefix and any ":route" suffix like ":exacto"/":nitro")
+# means routing/quant tags can't defeat the lookup the way an exact-key dict
+# does — e.g. "moonshotai/kimi-k2.5:exacto" still resolves to kimi's 262144
+# instead of silently falling through to DEFAULT_CONTEXT_WINDOW. Unknown models
+# fall back to a conservative default so they compact early rather than overflow.
+CONTEXT_WINDOW_PATTERNS: list[tuple[re.Pattern[str], int]] = [
+    (re.compile(r"^kimi-"), 262144),
+    (re.compile(r"^deepseek-v4"), 131072),
+]
 DEFAULT_CONTEXT_WINDOW = 32000
+# Deliberate override, e.g. shrink the window in tests so auto-compaction is
+# easy to trigger. 0/unset -> resolve from MODEL_ID via the patterns above.
+CONTEXT_WINDOW_OVERRIDE = int(os.getenv("CONTEXT_WINDOW_OVERRIDE", "0"))
 RESERVED_OUTPUT_TOKENS = 8000      # mirrors max_output_tokens in run_one_turn
 RESERVED_OVERHEAD_TOKENS = 4000    # system prompt + tool schemas
 COMPACT_TRIGGER_RATIO = 0.85
@@ -80,8 +102,22 @@ COMPACT_TRIGGER_RATIO = 0.85
 AUTO_COMPACT_ENABLED = os.getenv("AUTO_COMPACT", "1") != "0"
 
 
+def normalize_model_id(model_id: str) -> str:
+    """vendor/model:route -> model  (moonshotai/kimi-k2.5:exacto -> kimi-k2.5)."""
+    s = model_id.lower().strip()
+    s = s.rsplit("/", 1)[-1]   # drop "vendor/" prefix
+    s = s.split(":", 1)[0]     # drop ":route"/":quant" suffix
+    return s
+
+
 def context_window() -> int:
-    return MODEL_CONTEXT_WINDOW.get(MODEL_ID, DEFAULT_CONTEXT_WINDOW)
+    if CONTEXT_WINDOW_OVERRIDE > 0:
+        return CONTEXT_WINDOW_OVERRIDE
+    norm = normalize_model_id(MODEL_ID)
+    for pattern, window in CONTEXT_WINDOW_PATTERNS:
+        if pattern.match(norm):
+            return window
+    return DEFAULT_CONTEXT_WINDOW
 
 
 def input_budget() -> int:
@@ -250,6 +286,7 @@ def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> StepO
         input=input_messages,
         tools=config.tools,
         max_output_tokens=8000,
+        extra_body=PROVIDER_EXTRA_BODY,
     )
 
     # Track input-token load for the auto-compaction trigger. Prefer the API's
@@ -337,7 +374,8 @@ def agent_loop(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> TurnOut
         # call) -- a safe point to compact.
         if AUTO_COMPACT_ENABLED and should_auto_compact(state):
             result = compact_history(
-                state, source="auto", focus=None, client=client, model=MODEL_ID
+                state, source="auto", focus=None, client=client, model=MODEL_ID,
+                extra_body=PROVIDER_EXTRA_BODY,
             )
             if result is not None:
                 print(
@@ -375,7 +413,8 @@ configure_task_runner(run_subagent)
 def cmd_compact(arg: str, history: list) -> None:
     state = LoopState(history)
     result = compact_history(
-        state, source="manual", focus=arg or None, client=client, model=MODEL_ID
+        state, source="manual", focus=arg or None, client=client, model=MODEL_ID,
+        extra_body=PROVIDER_EXTRA_BODY,
     )
     if result is None:
         print("[compact] nothing to compact yet.")
