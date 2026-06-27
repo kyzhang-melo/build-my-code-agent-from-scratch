@@ -44,7 +44,7 @@
 19. `How does the tool dispatch system work? Trace from tool definition to execution.`
 20. `What are all the Pydantic models used in 'tmp/codeAgent_writeToDo.py' and what do they validate?`
 21. `Delegate: exhaustively catalog every function in every Python file under 'tmp', with parameters and return types.`
-22."Start a todo plan to build `tmp/change_cash.py` with three steps: 1. Create the target directory and file. 2. Implement a small Python function `change_cash(amount, delta)` that returns `amount + delta`. 3. Add a separate CLI interface. After completing step 1, decide that step 3 is unnecessary for this task. Rewrite the todo plan so that step 3 is removed rather than marked as completed. Then finish the remaining step(s). At the end, report the final todo plan and confirm the file path and implemented function. "
+22. `Start a todo plan to build "tmp/change_cash.py" with three steps: 1. Create the target directory and file. 2. Implement a small Python function "change_cash(amount, delta)" that returns "amount + delta". 3. Add a separate CLI interface. After completing step 1, decide that step 3 is unnecessary for this task. Rewrite the todo plan so that step 3 is removed rather than marked as completed. Then finish the remaining step(s). At the end, report the final todo plan and confirm the file path and implemented function. `
 
 ### persisted output cases (Tier 1 — middle-truncation of one oversized tool output)
 > `sample1.log`–`sample5.log` and `src/` (below) are placeholders — substitute your own large log files (~100–150 KB each) and a directory containing many source files.

@@ -202,3 +202,22 @@
 - The real risk is broad, noisy traversal, not simply using `**` from the workspace root. The upgraded behavior separates precise recursive lookup from match-everything traversal.
 - Returning the top-level listing on broad-pattern rejection makes the error actionable instead of a dead end.
 - Directory pruning keeps recursive glob useful while avoiding common large or noisy folders.
+
+## June 26
+
+### What I've done
+
+- Added token tracking and context window budget management to track model `input_tokens` usage in `LoopState`.
+- Implemented `compact_history()` core functionality to summarize and compress old conversation history (tool calls, model responses) while preserving user messages.
+- Added a JSONL snapshot backup mechanism before any history mutation to ensure failure-safe ordering.
+- Added a `templates/compact.md` prompt template specifically designed for the compaction task.
+- Added a minimal slash-command dispatcher to the REPL, including `/compact [focus]` for manual context compaction and `/help`.
+- Integrated an auto-compaction trigger in the `agent_loop` that fires at clean turn boundaries when the token load reaches 85% of the input budget.
+- Introduced a thrash guard that drops the oldest non-summary user messages if a fresh summary still exceeds the context budget, preventing infinite re-summarization loops.
+
+### Why
+
+- The code agent needs a context compaction mechanism to keep going past the context-window limit during long-running tasks.
+- Using a side-call summarization ensures we only keep the work that would otherwise be lost and don't orphan tool calls.
+- Auto-compaction prevents context-length API errors transparently, while the manual `/compact` command gives users explicit control over when and how the context is summarized.
+- The thrash guard protects the agent from wasting API calls on repeated summarizations when user messages take up too much space.
