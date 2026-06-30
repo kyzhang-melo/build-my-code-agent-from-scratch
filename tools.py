@@ -31,6 +31,14 @@ EXCLUDE_DIRS = {
 TOOL_OUTPUT_MAX_CHARS = 48000
 TOOL_OUTPUT_MAX_LINE_CHARS = 2000
 
+# read_file bounds. The reader self-bounds and is exempt from truncate_middle
+# (see run_tool_call), so these are the sole authority over read output size.
+MAX_READ_LINES = 1000              # max lines returned; also the `limit` default and hard max
+MAX_LINE_CHARS = TOOL_OUTPUT_MAX_LINE_CHARS  # per-line cap (reuse the existing constant)
+MAX_READ_BYTES = 40_000            # cap on returned content bytes; stays under TOOL_OUTPUT_MAX_CHARS
+MAX_READ_FILE_BYTES = 5 * 1024 * 1024  # st_size pre-check: stream to EOF for an exact total
+                                        # only below this; larger files skip the full scan
+
 
 def truncate_middle(
     text: str,
@@ -90,12 +98,28 @@ TOOLS = [
     {
         "type": "function",
         "name": "read_file",
-        "description": "Read file contents from workspace.",
+        "description": (
+            "Read text file contents from the workspace. Output is line-numbered "
+            "(line_number<TAB>content) and ends with a summary (total lines, and a "
+            "'use offset=N to continue' hint when the file is longer than what was "
+            "returned). To page through a large file, pass offset/limit instead of "
+            "re-reading from the top."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "limit": {"type": "integer"},
+                "offset": {
+                    "type": "integer",
+                    "description": "1-based line number to start reading from. Defaults to 1.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Number of lines to read (max 1000). Defaults to 1000. Pair with "
+                        "offset to page through large files."
+                    ),
+                },
             },
             "required": ["path"],
             "additionalProperties": False,
@@ -411,7 +435,8 @@ class ReadFileParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     path: str = Field(min_length=1)
-    limit: StrictInt | None = None
+    offset: StrictInt = Field(default=1, ge=1)
+    limit: StrictInt = Field(default=MAX_READ_LINES, ge=1, le=MAX_READ_LINES)
 
 
 class WriteFileParams(BaseModel):
@@ -485,15 +510,118 @@ def safe_path(path: str) -> Path:
     return resolved
 
 
-def run_read(path: str, limit: int | None = None) -> str:
+def run_read(path: str, offset: int = 1, limit: int = MAX_READ_LINES) -> str:
+    """Read a slice of a text file, streaming and bounded.
+
+    Returns `cat -n`-style numbered lines for the window [offset, offset+limit)
+    plus a trailing summary (total lines, end-of-file/cap notes, and a forward
+    `offset=` hint when more remains) so the model can page instead of re-reading.
+    """
     try:
-        text = safe_path(path).read_text()
-        lines = text.splitlines()
-        if limit and limit < len(lines):
-            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
-        return "\n".join(lines)
+        fp = safe_path(path)
     except Exception as e:
         return f"Error: {e}"
+    if not fp.exists():
+        return f"Error: File not found: {path}"
+    if not fp.is_file():
+        return f"Error: Not a file: {path}"
+
+    try:
+        # st_size pre-check: only stream all the way to EOF (for an exact total
+        # line count) when the file is small enough that the scan is cheap.
+        count_to_eof = fp.stat().st_size <= MAX_READ_FILE_BYTES
+
+        rendered: list[str] = []
+        rendered_bytes = 0
+        truncated_lines: list[int] = []
+        total_lines = 0
+        last_line = offset - 1
+        max_lines_reached = False
+        max_bytes_reached = False
+        reached_eof = True
+
+        with open(fp, encoding="utf-8", errors="replace") as handle:
+            for i, raw in enumerate(handle, start=1):
+                total_lines = i
+                if i < offset:
+                    continue
+                if len(rendered) >= limit:
+                    max_lines_reached = True
+                    if count_to_eof:
+                        continue  # window full; keep counting only
+                    reached_eof = False
+                    break
+                if rendered_bytes >= MAX_READ_BYTES:
+                    max_bytes_reached = True
+                    if count_to_eof:
+                        continue
+                    reached_eof = False
+                    break
+                content = raw.rstrip("\n")
+                if len(content) > MAX_LINE_CHARS:
+                    content = content[:MAX_LINE_CHARS] + " [...line truncated]"
+                    truncated_lines.append(i)
+                line = f"{i}\t{content}"
+                rendered.append(line)
+                rendered_bytes += len(line)
+                last_line = i
+    except Exception as e:
+        return f"Error: {e}"
+
+    body = "\n".join(rendered)
+    footer = _read_footer(
+        offset=offset,
+        last_line=last_line,
+        n=len(rendered),
+        limit=limit,
+        total_lines=total_lines,
+        reached_eof=reached_eof,
+        count_to_eof=count_to_eof,
+        max_lines_reached=max_lines_reached,
+        max_bytes_reached=max_bytes_reached,
+        truncated_lines=truncated_lines,
+    )
+    return f"{body}\n\n{footer}" if body else footer
+
+
+def _read_footer(
+    *,
+    offset: int,
+    last_line: int,
+    n: int,
+    limit: int,
+    total_lines: int,
+    reached_eof: bool,
+    count_to_eof: bool,
+    max_lines_reached: bool,
+    max_bytes_reached: bool,
+    truncated_lines: list[int],
+) -> str:
+    if n == 0:
+        head = f"Read 0 lines from line {offset}."
+    else:
+        head = f"Read {n} lines (lines {offset}-{last_line})."
+
+    if reached_eof:
+        total_part = f" Total lines: {total_lines}."
+    else:
+        total_part = f" Total lines: {total_lines}+ (large file; not fully counted)."
+
+    notes: list[str] = []
+    if max_lines_reached:
+        notes.append(f"Stopped at the {limit}-line limit")
+    elif max_bytes_reached:
+        notes.append(f"Stopped at the {MAX_READ_BYTES}-byte limit")
+    elif reached_eof and 0 < n < limit:
+        notes.append("End of file")
+    if truncated_lines:
+        notes.append(f"lines {truncated_lines} truncated to {MAX_LINE_CHARS} chars")
+    note_part = (" " + "; ".join(notes) + ".") if notes else ""
+
+    more_remains = max_lines_reached or max_bytes_reached or not reached_eof
+    hint = f" Use offset={last_line + 1} to continue." if more_remains and n > 0 else ""
+
+    return f"[{head}{total_part}{note_part}{hint}]"
 
 
 def run_write(path: str, content: str) -> str:
@@ -762,7 +890,7 @@ def build_tool_registry(
             name="read_file",
             params_model=ReadFileParams,
             sanitize_args=sanitize_file_args,
-            execute=lambda params: run_read(params.path, params.limit),
+            execute=lambda params: run_read(params.path, params.offset, params.limit),
         ),
         "write_file": ToolRuntimeSpec(
             name="write_file",
@@ -870,9 +998,10 @@ def run_tool_call(
                 output = f"Error: tool '{item.name}' failed: {e}"
 
     # Bound the output for the model's context at the one chokepoint every tool
-    # flows through. `todo` is control-plane state (small, structured) -- leave it
-    # verbatim; everything else gets middle-truncated if it's oversized.
-    if item.name != "todo":
+    # flows through. `todo` is control-plane state (small, structured); `read_file`
+    # self-bounds (line caps + a footer) and middle-truncation would break its line
+    # numbering -- leave both verbatim; everything else gets middle-truncated if oversized.
+    if item.name not in ("todo", "read_file"):
         output = truncate_middle(output)
 
     if item.name == "todo":
