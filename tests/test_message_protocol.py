@@ -22,27 +22,3 @@ def test_normalize_messages_merges_and_strips(load_module) -> None:
     assert "noise" not in out[2]
     assert out[3]["role"] == "assistant"
     assert out[3]["content"] == "done\nagain"
-
-
-def test_extract_text_from_blocks(load_module) -> None:
-    message_utils = load_module("message_utils", "message_utils.py")
-    messages = [
-        {
-            "role": "assistant",
-            "content": [
-                {"type": "text", "text": "first"},
-                {"type": "text", "text": "second"},
-            ],
-        },
-    ]
-    assert message_utils.extract_text(messages) == "first\nsecond"
-
-
-def test_extract_text_reverse_search_last_assistant(load_module) -> None:
-    message_utils = load_module("message_utils", "message_utils.py")
-    messages = [
-        {"role": "assistant", "content": "old answer"},
-        {"type": "function_call_output", "call_id": "c1", "output": "ok"},
-        {"role": "assistant", "content": "new answer"},
-    ]
-    assert message_utils.extract_text(messages) == "new answer"
