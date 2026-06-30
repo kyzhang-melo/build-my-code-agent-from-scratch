@@ -510,6 +510,29 @@ def safe_path(path: str) -> Path:
     return resolved
 
 
+# Common non-text extensions, rejected early with a clear message. The null-byte
+# sniff below catches the rest; this list just avoids opening obvious binaries.
+BINARY_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico", ".tiff", ".pdf",
+    ".zip", ".gz", ".bz2", ".xz", ".tar", ".7z", ".rar",
+    ".exe", ".dll", ".so", ".dylib", ".bin", ".o", ".a", ".class", ".jar",
+    ".pyc", ".pyo", ".wasm", ".node",
+    ".mp3", ".wav", ".flac", ".ogg", ".mp4", ".mov", ".avi", ".mkv", ".webm",
+    ".sqlite", ".sqlite3", ".db", ".woff", ".woff2", ".ttf", ".otf",
+}
+
+
+def _looks_binary(fp: Path) -> bool:
+    """True for obvious non-text files: known binary extension or a NUL byte in the head."""
+    if fp.suffix.lower() in BINARY_EXTENSIONS:
+        return True
+    try:
+        with open(fp, "rb") as handle:
+            return b"\x00" in handle.read(4096)
+    except OSError:
+        return False
+
+
 def run_read(path: str, offset: int = 1, limit: int = MAX_READ_LINES) -> str:
     """Read a slice of a text file, streaming and bounded.
 
@@ -525,6 +548,11 @@ def run_read(path: str, offset: int = 1, limit: int = MAX_READ_LINES) -> str:
         return f"Error: File not found: {path}"
     if not fp.is_file():
         return f"Error: Not a file: {path}"
+    if _looks_binary(fp):
+        return (
+            f"Error: '{path}' appears to be a binary or non-text file. "
+            "Use appropriate tools to inspect it."
+        )
 
     try:
         # st_size pre-check: only stream all the way to EOF (for an exact total
@@ -568,6 +596,14 @@ def run_read(path: str, offset: int = 1, limit: int = MAX_READ_LINES) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+    if not rendered:
+        if total_lines == 0:
+            return "<system-reminder>File exists but is empty.</system-reminder>"
+        return (
+            f"<system-reminder>File has {total_lines} lines; offset {offset} "
+            "is past the end of the file.</system-reminder>"
+        )
+
     body = "\n".join(rendered)
     footer = _read_footer(
         offset=offset,
@@ -576,12 +612,12 @@ def run_read(path: str, offset: int = 1, limit: int = MAX_READ_LINES) -> str:
         limit=limit,
         total_lines=total_lines,
         reached_eof=reached_eof,
-        count_to_eof=count_to_eof,
+        is_large=not count_to_eof,
         max_lines_reached=max_lines_reached,
         max_bytes_reached=max_bytes_reached,
         truncated_lines=truncated_lines,
     )
-    return f"{body}\n\n{footer}" if body else footer
+    return f"{body}\n\n{footer}"
 
 
 def _read_footer(
@@ -592,20 +628,17 @@ def _read_footer(
     limit: int,
     total_lines: int,
     reached_eof: bool,
-    count_to_eof: bool,
+    is_large: bool,
     max_lines_reached: bool,
     max_bytes_reached: bool,
     truncated_lines: list[int],
 ) -> str:
-    if n == 0:
-        head = f"Read 0 lines from line {offset}."
-    else:
-        head = f"Read {n} lines (lines {offset}-{last_line})."
+    head = f"Read {n} lines (lines {offset}-{last_line})."
 
     if reached_eof:
         total_part = f" Total lines: {total_lines}."
     else:
-        total_part = f" Total lines: {total_lines}+ (large file; not fully counted)."
+        total_part = f" Total lines: {total_lines}+ (not fully counted)."
 
     notes: list[str] = []
     if max_lines_reached:
@@ -616,10 +649,12 @@ def _read_footer(
         notes.append("End of file")
     if truncated_lines:
         notes.append(f"lines {truncated_lines} truncated to {MAX_LINE_CHARS} chars")
+    if is_large:
+        notes.append("large file -- use grep or a targeted offset/limit to narrow the read")
     note_part = (" " + "; ".join(notes) + ".") if notes else ""
 
     more_remains = max_lines_reached or max_bytes_reached or not reached_eof
-    hint = f" Use offset={last_line + 1} to continue." if more_remains and n > 0 else ""
+    hint = f" Use offset={last_line + 1} to continue." if more_remains else ""
 
     return f"[{head}{total_part}{note_part}{hint}]"
 
@@ -822,6 +857,11 @@ class ToolRuntimeSpec:
     params_model: type[BaseModel]
     sanitize_args: Callable[[dict], dict]
     execute: Callable[[BaseModel], str]
+    # True when the tool only reads state and is safe to run concurrently with
+    # other tool calls in the same turn. Consumed by the threaded executor; the
+    # read-only tools and the explore-only `task` subagent qualify, while tools
+    # that mutate the workspace or the global TODO do not.
+    concurrency_safe: bool = False
 
 
 def sanitize_common_string(value: str) -> str:
@@ -891,6 +931,7 @@ def build_tool_registry(
             params_model=ReadFileParams,
             sanitize_args=sanitize_file_args,
             execute=lambda params: run_read(params.path, params.offset, params.limit),
+            concurrency_safe=True,
         ),
         "write_file": ToolRuntimeSpec(
             name="write_file",
@@ -914,6 +955,7 @@ def build_tool_registry(
                 params.include_dirs,
                 params.limit,
             ),
+            concurrency_safe=True,
         ),
         "grep": ToolRuntimeSpec(
             name="grep",
@@ -928,6 +970,7 @@ def build_tool_registry(
                 params.line_number,
                 params.head_limit,
             ),
+            concurrency_safe=True,
         ),
         "todo": ToolRuntimeSpec(
             name="todo",
@@ -940,6 +983,7 @@ def build_tool_registry(
             params_model=TaskParams,
             sanitize_args=sanitize_task_args,
             execute=lambda params: runner(params.prompt, params.description),
+            concurrency_safe=True,
         ),
     }
     if tool_names is not None:

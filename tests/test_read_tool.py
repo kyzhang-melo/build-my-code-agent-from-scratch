@@ -83,14 +83,6 @@ def test_per_line_truncation(load_module) -> None:
     assert len(body) < tools.MAX_LINE_CHARS + 100  # line was clipped
 
 
-def test_offset_beyond_eof_reads_nothing(load_module) -> None:
-    tools = load_module("tools", "tools.py")
-    with _tmp_file(tools, "_read_oob.txt", "a\nb\nc\n") as rel:
-        out = tools.run_read(rel, offset=100)
-    assert "Read 0 lines from line 100" in out
-    assert "Total lines: 3" in out
-
-
 def test_missing_and_nonfile_paths(load_module) -> None:
     tools = load_module("tools", "tools.py")
     assert tools.run_read("tests/_does_not_exist.txt").startswith("Error: File not found")
@@ -102,3 +94,58 @@ def test_backward_compat_small_file_no_args(load_module) -> None:
     with _tmp_file(tools, "_read_compat.txt", "hello world\n") as rel:
         out = tools.run_read(rel)
     assert "hello world" in out
+
+
+# --- Stage 2 ---
+
+
+def test_offset_beyond_eof_is_system_reminder(load_module) -> None:
+    tools = load_module("tools", "tools.py")
+    with _tmp_file(tools, "_read_oob.txt", "a\nb\nc\n") as rel:
+        out = tools.run_read(rel, offset=100)
+    assert "<system-reminder>" in out
+    assert "past the end of the file" in out
+    assert "3 lines" in out
+
+
+def test_empty_file_is_system_reminder(load_module) -> None:
+    tools = load_module("tools", "tools.py")
+    with _tmp_file(tools, "_read_empty.txt", "") as rel:
+        out = tools.run_read(rel)
+    assert out == "<system-reminder>File exists but is empty.</system-reminder>"
+
+
+def test_binary_file_rejected(load_module) -> None:
+    tools = load_module("tools", "tools.py")
+    rel = "tests/_read_binary.bin"
+    fp = Path(tools.WORKDIR / rel)
+    fp.write_bytes(b"\x89PNG\x00\x01\x02binary\x00data")
+    try:
+        out = tools.run_read(rel)
+    finally:
+        fp.unlink(missing_ok=True)
+    assert out.startswith("Error:")
+    assert "binary" in out.lower()
+
+
+def test_large_file_guidance(load_module) -> None:
+    tools = load_module("tools", "tools.py")
+    content = "\n".join(f"line{i}" for i in range(1, 21)) + "\n"
+    original = tools.MAX_READ_FILE_BYTES
+    tools.MAX_READ_FILE_BYTES = 1  # force the "large file" branch on a small file
+    try:
+        with _tmp_file(tools, "_read_large.txt", content) as rel:
+            out = tools.run_read(rel)
+    finally:
+        tools.MAX_READ_FILE_BYTES = original
+    assert "large file" in out.lower()
+    assert "grep" in out.lower()
+
+
+def test_concurrency_safe_flags(load_module) -> None:
+    tools = load_module("tools", "tools.py")
+    registry = tools.TOOL_REGISTRY
+    for name in ("read_file", "glob", "grep", "task"):
+        assert registry[name].concurrency_safe is True, name
+    for name in ("bash", "write_file", "edit_file", "todo"):
+        assert registry[name].concurrency_safe is False, name
