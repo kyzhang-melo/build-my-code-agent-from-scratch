@@ -138,6 +138,31 @@ def summarize(
     return summary
 
 
+async def summarize_async(
+    messages: list,
+    focus: str | None,
+    *,
+    client,
+    model: str,
+    extra_body: dict | None = None,
+) -> str:
+    """Async side-call for a handoff summary. No tools. Raises on empty output."""
+    api_input = normalize_messages(
+        messages + [{"role": "user", "content": render_prompt(focus)}]
+    )
+    response = await client.responses.create(
+        model=model,
+        instructions=_COMPACTION_DIRECTIVE,
+        input=api_input,
+        max_output_tokens=SUMMARY_MAX_OUTPUT_TOKENS,
+        extra_body=extra_body,
+    )
+    summary = (getattr(response, "output_text", "") or "").strip()
+    if not summary:
+        raise ValueError("compaction summary was empty")
+    return summary
+
+
 def reinject_todo(summary: str) -> str:
     """Append the live TODO list deterministically (not LLM-reconstructed)."""
     if not TODO.has_active_plan():
@@ -200,6 +225,49 @@ def compact_history(
     new_messages = build_compacted_history(collect_user_messages(messages), summary)
 
     # Mutate in place so any alias of this list (e.g. the REPL's `history`) sees it.
+    state.messages[:] = new_messages
+    tokens_after = estimate_tokens(new_messages)
+    state.last_input_tokens = tokens_after
+    return CompactionResult(
+        source=source,
+        tokens_before=tokens_before,
+        tokens_after=tokens_after,
+        transcript_path=str(transcript_path),
+    )
+
+
+async def compact_history_async(
+    state,
+    *,
+    source: str,
+    focus: str | None = None,
+    client,
+    model: str,
+    extra_body: dict | None = None,
+) -> CompactionResult | None:
+    """Async variant of ``compact_history`` for the async agent loop."""
+    messages = state.messages
+    if not _has_droppable(messages):
+        return None
+
+    tokens_before = state.last_input_tokens or estimate_tokens(messages)
+    transcript_path = write_transcript(messages)
+
+    try:
+        summary = await summarize_async(
+            messages,
+            focus,
+            client=client,
+            model=model,
+            extra_body=extra_body,
+        )
+    except Exception as exc:  # any failure -> keep the original history
+        print(f"[compact] summarization failed ({exc}); history left unchanged")
+        return None
+
+    summary = reinject_todo(summary)
+    new_messages = build_compacted_history(collect_user_messages(messages), summary)
+
     state.messages[:] = new_messages
     tokens_after = estimate_tokens(new_messages)
     state.last_input_tokens = tokens_after

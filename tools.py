@@ -1,8 +1,10 @@
+import asyncio
 import fnmatch
 import json
 import os
 import shutil
 import subprocess
+from collections.abc import Awaitable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal
@@ -30,6 +32,7 @@ EXCLUDE_DIRS = {
 # ~= 4x tokens); a token-aware policy can replace it later without touching callers.
 TOOL_OUTPUT_MAX_CHARS = 48000
 TOOL_OUTPUT_MAX_LINE_CHARS = 2000
+DEFAULT_MAX_PARALLEL_TOOL_CALLS = 4
 
 # read_file bounds. The reader self-bounds and is exempt from truncate_middle
 # (see run_tool_call), so these are the sole authority over read output size.
@@ -38,6 +41,18 @@ MAX_LINE_CHARS = TOOL_OUTPUT_MAX_LINE_CHARS  # per-line cap (reuse the existing 
 MAX_READ_BYTES = 40_000            # cap on returned content bytes; stays under TOOL_OUTPUT_MAX_CHARS
 MAX_READ_FILE_BYTES = 5 * 1024 * 1024  # st_size pre-check: stream to EOF for an exact total
                                         # only below this; larger files skip the full scan
+
+
+def _resolve_max_parallel_tool_calls() -> int:
+    raw = os.getenv("MAX_PARALLEL_TOOL_CALLS", str(DEFAULT_MAX_PARALLEL_TOOL_CALLS))
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_PARALLEL_TOOL_CALLS
+    return max(1, value)
+
+
+MAX_PARALLEL_TOOL_CALLS = _resolve_max_parallel_tool_calls()
 
 
 def truncate_middle(
@@ -853,12 +868,19 @@ class ToolRuntimeSpec:
     name: str
     params_model: type[BaseModel]
     sanitize_args: Callable[[dict], dict]
-    execute: Callable[[BaseModel], str]
+    execute: Callable[[BaseModel], Awaitable[str]]
     # True when the tool only reads state and is safe to run concurrently with
     # other tool calls in the same turn. Consumed by the threaded executor; the
     # read-only tools and the explore-only `task` subagent qualify, while tools
     # that mutate the workspace or the global TODO do not.
     concurrency_safe: bool = False
+
+
+def async_tool(fn: Callable[[BaseModel], str]) -> Callable[[BaseModel], Awaitable[str]]:
+    async def wrapper(params: BaseModel) -> str:
+        return await asyncio.to_thread(fn, params)
+
+    return wrapper
 
 
 def sanitize_common_string(value: str) -> str:
@@ -906,14 +928,14 @@ def sanitize_task_args(args: dict) -> dict:
     return clean
 
 
-def unavailable_task_runner(prompt: str, description: str) -> str:
+async def unavailable_task_runner(prompt: str, description: str) -> str:
     return "Error: task runner is not configured."
 
 
 def build_tool_registry(
     tool_names: set[str] | None = None,
     *,
-    task_runner: Callable[[str, str], str] | None = None,
+    task_runner: Callable[[str, str], Awaitable[str]] | None = None,
 ) -> dict[str, ToolRuntimeSpec]:
     runner = task_runner or unavailable_task_runner
     registry = {
@@ -921,44 +943,44 @@ def build_tool_registry(
             name="bash",
             params_model=BashParams,
             sanitize_args=sanitize_bash_args,
-            execute=lambda params: run_bash(params.command),
+            execute=async_tool(lambda params: run_bash(params.command)),
         ),
         "read_file": ToolRuntimeSpec(
             name="read_file",
             params_model=ReadFileParams,
             sanitize_args=sanitize_file_args,
-            execute=lambda params: run_read(params.path, params.offset, params.limit),
+            execute=async_tool(lambda params: run_read(params.path, params.offset, params.limit)),
             concurrency_safe=True,
         ),
         "write_file": ToolRuntimeSpec(
             name="write_file",
             params_model=WriteFileParams,
             sanitize_args=sanitize_file_args,
-            execute=lambda params: run_write(params.path, params.content),
+            execute=async_tool(lambda params: run_write(params.path, params.content)),
         ),
         "edit_file": ToolRuntimeSpec(
             name="edit_file",
             params_model=EditFileParams,
             sanitize_args=sanitize_file_args,
-            execute=lambda params: run_edit(params.path, params.old_text, params.new_text),
+            execute=async_tool(lambda params: run_edit(params.path, params.old_text, params.new_text)),
         ),
         "glob": ToolRuntimeSpec(
             name="glob",
             params_model=GlobParams,
             sanitize_args=sanitize_search_args,
-            execute=lambda params: run_glob(
+            execute=async_tool(lambda params: run_glob(
                 params.pattern,
                 params.directory,
                 params.include_dirs,
                 params.limit,
-            ),
+            )),
             concurrency_safe=True,
         ),
         "grep": ToolRuntimeSpec(
             name="grep",
             params_model=GrepParams,
             sanitize_args=sanitize_search_args,
-            execute=lambda params: run_grep(
+            execute=async_tool(lambda params: run_grep(
                 params.pattern,
                 params.path,
                 params.glob,
@@ -966,14 +988,14 @@ def build_tool_registry(
                 params.ignore_case,
                 params.line_number,
                 params.head_limit,
-            ),
+            )),
             concurrency_safe=True,
         ),
         "todo": ToolRuntimeSpec(
             name="todo",
             params_model=TodoParams,
             sanitize_args=sanitize_passthrough,
-            execute=lambda params: TODO.update(params),
+            execute=async_tool(lambda params: TODO.update(params)),
         ),
         "task": ToolRuntimeSpec(
             name="task",
@@ -993,7 +1015,7 @@ EXPLORE_TOOL_REGISTRY = build_tool_registry(READ_ONLY_TOOL_NAMES)
 EXPLORE_TOOLS = [tool for tool in TOOLS if tool["name"] in READ_ONLY_TOOL_NAMES]
 
 
-def configure_task_runner(task_runner: Callable[[str, str], str]) -> None:
+def configure_task_runner(task_runner: Callable[[str, str], Awaitable[str]]) -> None:
     TOOL_REGISTRY["task"] = build_tool_registry(task_runner=task_runner)["task"]
 
 
@@ -1007,7 +1029,7 @@ def parse_tool_args(raw_arguments) -> tuple[dict, str | None]:
     return parsed, None
 
 
-def run_tool_call(
+async def run_tool_call_async(
     item,
     registry: dict[str, ToolRuntimeSpec] | None = None,
 ) -> tuple[dict, bool]:
@@ -1034,7 +1056,7 @@ def run_tool_call(
             output = f"Error: invalid arguments for tool '{item.name}': {e}"
         else:
             try:
-                output = spec.execute(params)
+                output = await spec.execute(params)
             except Exception as e:
                 output = f"Error: tool '{item.name}' failed: {e}"
 
@@ -1057,17 +1079,70 @@ def run_tool_call(
     }, used_todo
 
 
+def run_tool_call(
+    item,
+    registry: dict[str, ToolRuntimeSpec] | None = None,
+) -> tuple[dict, bool]:
+    return _run_async_from_sync(run_tool_call_async(item, registry))
+
+
+def _run_async_from_sync(awaitable):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(awaitable)
+    if hasattr(awaitable, "close"):
+        awaitable.close()
+    raise RuntimeError("Use the async tool execution API inside a running event loop.")
+
+
+def _partition_tool_calls(
+    tool_calls,
+    registry: dict[str, ToolRuntimeSpec],
+) -> list[tuple[bool, list]]:
+    batches: list[tuple[bool, list]] = []
+    for item in tool_calls:
+        if item.type != "function_call":
+            continue
+        spec = registry.get(item.name)
+        is_safe = bool(spec and spec.concurrency_safe)
+        if is_safe and batches and batches[-1][0]:
+            batches[-1][1].append(item)
+        else:
+            batches.append((is_safe, [item]))
+    return batches
+
+
+async def execute_tool_calls_async(
+    tool_calls,
+    registry: dict[str, ToolRuntimeSpec] | None = None,
+) -> tuple[list[dict], bool]:
+    active_registry = registry or TOOL_REGISTRY
+    results = []
+    used_todo = False
+
+    for is_safe, batch in _partition_tool_calls(tool_calls, active_registry):
+        if is_safe and len(batch) > 1:
+            for start in range(0, len(batch), MAX_PARALLEL_TOOL_CALLS):
+                chunk = batch[start:start + MAX_PARALLEL_TOOL_CALLS]
+                chunk_results = await asyncio.gather(
+                    *(run_tool_call_async(item, active_registry) for item in chunk)
+                )
+                for tool_result, called_todo in chunk_results:
+                    if called_todo:
+                        used_todo = True
+                    results.append(tool_result)
+        else:
+            for item in batch:
+                tool_result, called_todo = await run_tool_call_async(item, active_registry)
+                if called_todo:
+                    used_todo = True
+                results.append(tool_result)
+    return results, used_todo
+
+
 def execute_tool_calls(
     tool_calls,
     registry: dict[str, ToolRuntimeSpec] | None = None,
 ) -> tuple[list[dict], bool]:
-    results = []
-    used_todo = False
-    for item in tool_calls:
-        if item.type != "function_call":
-            continue
-        tool_result, called_todo = run_tool_call(item, registry)
-        if called_todo:
-            used_todo = True
-        results.append(tool_result)
-    return results, used_todo
+    return _run_async_from_sync(execute_tool_calls_async(tool_calls, registry))

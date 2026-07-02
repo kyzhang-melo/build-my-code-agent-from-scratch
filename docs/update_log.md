@@ -231,3 +231,24 @@
 ### Why
 
 - The old `run_read` implementation loaded whole files at once, which could increase latency and memory usage for large files.
+
+## July 02
+
+### What I've done
+
+- Converted `main.py` to `AsyncOpenAI`, async `run_one_turn`, `agent_loop`, `run_subagent`, and CLI command handling.
+- Added async compaction helpers in `context_compact.py`.
+- Converted `tools.py` to awaitable `ToolRuntimeSpec.execute`, added `async_tool(...)`, and partitioned `execute_tool_calls_async(...)`.
+- Safe tools now run concurrently with `asyncio.gather`; unsafe tools stay sequential. `MAX_PARALLEL_TOOL_CALLS` defaults to `4`.
+- `task` is now async-native, so multiple subagents can run concurrently (currently only explore-subagent has been implemented).
+
+### Why
+
+- Although the synchronous mechanism is simple and intuitive, it introduces excessive latency when the agent needs to explore the code repository. Therefore, an asynchronous mechanism was introduced.
+
+### Items for improvement
+
+- The current implementation employs a chunking mechanism to control the execution of asynchronous tasks, not the semaphore mechanism.
+- The `glob` tool still needs to add more mechanism to discourage the LLM from emitting the broad pattern `**/*`.
+- In debug stage, the ID number for subagents could be introduced.
+- When the agent is asked about issues that occurred prior to the context compaction, its behavior comes across as quite stale.

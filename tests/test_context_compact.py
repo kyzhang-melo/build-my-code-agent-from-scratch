@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import types
 
 import pytest
@@ -28,6 +29,23 @@ class _FakeClient:
 
         self.responses = _Responses()
         self.captured = captured
+
+
+class _AsyncFakeClient:
+    def __init__(self, output_text: str = "SUMMARY: editing foo.py:10; next run tests."):
+        captured: dict = {}
+
+        class _Responses:
+            async def create(self, **kwargs):
+                captured.update(kwargs)
+                return types.SimpleNamespace(output_text=output_text)
+
+        self.responses = _Responses()
+        self.captured = captured
+
+
+def _run(awaitable):
+    return asyncio.run(awaitable)
 
 
 # --------------------------------------------------------------------------- #
@@ -71,7 +89,7 @@ def test_run_tool_call_truncates_large_output(load_module) -> None:
     spec = types.SimpleNamespace(
         sanitize_args=lambda args: args,
         params_model=_Model,
-        execute=lambda params: big,
+        execute=tools.async_tool(lambda params: big),
     )
     result, used_todo = tools.run_tool_call(_fc("fake", "c1", "{}"), {"fake": spec})
     out = result["output"]
@@ -93,7 +111,7 @@ def test_run_tool_call_leaves_todo_verbatim(load_module) -> None:
     spec = types.SimpleNamespace(
         sanitize_args=lambda args: args,
         params_model=_Model,
-        execute=lambda params: huge,
+        execute=tools.async_tool(lambda params: huge),
     )
     result, used_todo = tools.run_tool_call(_fc("todo", "c1", "{}"), {"todo": spec})
     assert used_todo is True
@@ -232,6 +250,28 @@ def test_compact_history_happy_path(load_module, tmp_path) -> None:
     assert result.transcript_path.endswith(".jsonl")
 
 
+def test_compact_history_async_happy_path(load_module, tmp_path) -> None:
+    cc = load_module("context_compact", "context_compact.py")
+    cc.TRANSCRIPT_DIR = tmp_path / "transcripts"
+    cc.TODO = types.SimpleNamespace(has_active_plan=lambda: False, render=lambda: "")
+
+    state = types.SimpleNamespace(messages=list(_droppable_history(cc)), last_input_tokens=5000)
+    client = _AsyncFakeClient()
+
+    result = _run(cc.compact_history_async(
+        state,
+        source="auto",
+        focus="async",
+        client=client,
+        model="m",
+    ))
+
+    assert result is not None and result.source == "auto"
+    assert state.messages[-1]["content"].startswith(cc.SUMMARY_PREFIX)
+    assert state.last_input_tokens == result.tokens_after
+    assert client.captured["max_output_tokens"] == cc.SUMMARY_MAX_OUTPUT_TOKENS
+
+
 def test_compact_history_aborts_on_summary_failure(load_module, tmp_path) -> None:
     cc = load_module("context_compact", "context_compact.py")
     cc.TRANSCRIPT_DIR = tmp_path / "transcripts"
@@ -322,24 +362,24 @@ def test_handle_command_dispatch(load_module) -> None:
     main = load_module("main", "main.py")
     calls: list = []
 
-    def fake_compact(state, *, source, focus=None, client, model, extra_body=None):
+    async def fake_compact(state, *, source, focus=None, client, model, extra_body=None):
         calls.append((source, focus))
         state.messages[:] = [{"role": "user", "content": main.SUMMARY_PREFIX + "\ns"}]
         return types.SimpleNamespace(tokens_before=1, tokens_after=0, transcript_path="x.jsonl")
 
-    main.compact_history = fake_compact
+    main.compact_history_async = fake_compact
 
-    assert main.handle_command("build a feature", []) is False, "ordinary input is forwarded"
-    assert main.handle_command("/help", []) is True
-    assert main.handle_command("/bogus", []) is True, "unknown command handled, not forwarded"
+    assert _run(main.handle_command("build a feature", [])) is False, "ordinary input is forwarded"
+    assert _run(main.handle_command("/help", [])) is True
+    assert _run(main.handle_command("/bogus", [])) is True, "unknown command handled, not forwarded"
 
     history = [{"type": "function_call_output", "call_id": "c", "output": "o"}]
-    assert main.handle_command("/compact keep auth", history) is True
+    assert _run(main.handle_command("/compact keep auth", history)) is True
     assert calls == [("manual", "keep auth")]
     assert history[-1]["content"].startswith(main.SUMMARY_PREFIX)
 
     calls.clear()
-    main.handle_command("/compact", [{"type": "function_call_output", "call_id": "c", "output": "o"}])
+    _run(main.handle_command("/compact", [{"type": "function_call_output", "call_id": "c", "output": "o"}]))
     assert calls[0] == ("manual", None), "no focus -> None"
 
 
@@ -362,17 +402,17 @@ def test_auto_compaction_fires_and_kill_switch(load_module) -> None:
     main.MODEL_ID = "nope/unknown"  # budget 20000, threshold 17000
     compact_calls: list = []
 
-    def fake_compact(state, *, source, focus=None, client, model, extra_body=None):
+    async def fake_compact(state, *, source, focus=None, client, model, extra_body=None):
         compact_calls.append(source)
         state.messages[:] = [{"role": "user", "content": main.SUMMARY_PREFIX + "\ns"}]
         state.last_input_tokens = 50
         return types.SimpleNamespace(tokens_before=18000, tokens_after=50, transcript_path=".t/x")
 
-    main.compact_history = fake_compact
+    main.compact_history_async = fake_compact
 
     turn_count = {"n": 0}
 
-    def fake_turn(state, config=None):
+    async def fake_turn(state, config=None):
         index = turn_count["n"]
         turn_count["n"] += 1
         if index == 0:
@@ -384,7 +424,7 @@ def test_auto_compaction_fires_and_kill_switch(load_module) -> None:
 
     main.AUTO_COMPACT_ENABLED = True
     state = main.LoopState(messages=[{"type": "function_call_output", "call_id": "c", "output": "o"}])
-    outcome = main.agent_loop(state)
+    outcome = _run(main.agent_loop(state))
     assert compact_calls == ["auto"]
     assert outcome.final_text == "done"
 
@@ -392,5 +432,5 @@ def test_auto_compaction_fires_and_kill_switch(load_module) -> None:
     compact_calls.clear()
     turn_count["n"] = 0
     main.AUTO_COMPACT_ENABLED = False
-    main.agent_loop(main.LoopState(messages=[{"type": "function_call_output", "call_id": "c", "output": "o"}]))
+    _run(main.agent_loop(main.LoopState(messages=[{"type": "function_call_output", "call_id": "c", "output": "o"}])))
     assert compact_calls == []

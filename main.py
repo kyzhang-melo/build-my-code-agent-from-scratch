@@ -4,6 +4,7 @@
 Split version of the code-agent loop.
 """
 
+import asyncio
 import json
 import os
 import re
@@ -14,7 +15,7 @@ from datetime import datetime
 from typing import Literal, Protocol
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import AsyncOpenAI
 from message_utils import normalize_messages
 from prompts import EXPLORE_SUBAGENT_SYSTEM, PARENT_SYSTEM
 from tools import (
@@ -23,11 +24,11 @@ from tools import (
     TODO,
     TOOLS,
     configure_task_runner,
-    execute_tool_calls,
+    execute_tool_calls_async,
 )
 from context_compact import (
     SUMMARY_PREFIX,
-    compact_history,
+    compact_history_async,
     estimate_tokens,
 )
 
@@ -52,11 +53,11 @@ if not OPENROUTER_BASE_URL:
 if not MODEL_ID:
     raise RuntimeError("MODEL_ID is not set. Please set it in .env")
 
-client = OpenAI(
+client = AsyncOpenAI(
     api_key=OPENROUTER_API_KEY,
     base_url=OPENROUTER_BASE_URL,
 )
-print("[init] OpenAI client initialized")
+print("[init] AsyncOpenAI client initialized")
 
 # OpenRouter provider pinning. When OPENROUTER_PROVIDER is set, every
 # responses.create restricts routing to that single upstream host with
@@ -253,13 +254,13 @@ def build_subagent_prompt(prompt: str) -> str:
     )
 
 
-def execute_configured_tool_calls(tool_calls, config: AgentConfig) -> tuple[list[dict], bool]:
+async def execute_configured_tool_calls(tool_calls, config: AgentConfig) -> tuple[list[dict], bool]:
     if config.registry is None:
-        return execute_tool_calls(tool_calls)
-    return execute_tool_calls(tool_calls, config.registry)
+        return await execute_tool_calls_async(tool_calls)
+    return await execute_tool_calls_async(tool_calls, config.registry)
 
 
-def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> StepOutcome | None:
+async def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> StepOutcome | None:
     # Returns None to keep looping, or a StepOutcome when the turn ends.
     if state.api_call_count >= config.max_api_calls:
         warning = f"Warning: stopped after max_api_calls={config.max_api_calls}."
@@ -282,7 +283,7 @@ def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> StepO
         else:
             preview = str(content).replace("\n", " ")[:120]
         print(f"[debug]  [{i}] {role}: {preview}")
-    response = client.responses.create(
+    response = await client.responses.create(
         model=MODEL_ID,
         instructions=config.system,
         input=input_messages,
@@ -344,7 +345,7 @@ def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> StepO
     if response.output_text and config.on_text is not None:
         config.on_text(response.output_text)
 
-    results, _ = execute_configured_tool_calls(tool_calls, config)
+    results, _ = await execute_configured_tool_calls(tool_calls, config)
     if not results:
         return StepOutcome(stop_reason="completed", final_text="")
 
@@ -369,13 +370,13 @@ def _drop_oldest_user_message(state: LoopState) -> bool:
     return False
 
 
-def agent_loop(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> TurnOutcome:
-    while (outcome := run_one_turn(state, config)) is None:
+async def agent_loop(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> TurnOutcome:
+    while (outcome := await run_one_turn(state, config)) is None:
         # Each `None` outcome is a clean turn boundary: the turn's tool outputs
         # are already appended, so the history is well-formed (no orphaned tool
         # call) -- a safe point to compact.
         if AUTO_COMPACT_ENABLED and should_auto_compact(state):
-            result = compact_history(
+            result = await compact_history_async(
                 state, source="auto", focus=None, client=client, model=MODEL_ID,
                 extra_body=PROVIDER_EXTRA_BODY,
             )
@@ -396,13 +397,13 @@ def agent_loop(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> TurnOut
     )
 
 
-def run_subagent(prompt: str, description: str = "exploration") -> str:
+async def run_subagent(prompt: str, description: str = "exploration") -> str:
     print(f"\033[35m> task (explore/{description}): {prompt[:120]}\033[0m")
     state = LoopState(messages=[{
         "role": "user",
         "content": build_subagent_prompt(prompt),
     }])
-    outcome = agent_loop(state, EXPLORE_SUBAGENT_CONFIG)
+    outcome = await agent_loop(state, EXPLORE_SUBAGENT_CONFIG)
 
     if outcome.final_text:
         return outcome.final_text
@@ -412,9 +413,9 @@ def run_subagent(prompt: str, description: str = "exploration") -> str:
 configure_task_runner(run_subagent)
 
 
-def cmd_compact(arg: str, history: list) -> None:
+async def cmd_compact(arg: str, history: list) -> None:
     state = LoopState(history)
-    result = compact_history(
+    result = await compact_history_async(
         state, source="manual", focus=arg or None, client=client, model=MODEL_ID,
         extra_body=PROVIDER_EXTRA_BODY,
     )
@@ -428,7 +429,7 @@ def cmd_compact(arg: str, history: list) -> None:
     )
 
 
-def cmd_help(arg: str, history: list) -> None:
+async def cmd_help(arg: str, history: list) -> None:
     print("commands: /compact [focus]  |  /help   (q or exit to quit)")
 
 
@@ -438,7 +439,7 @@ COMMANDS = {
 }
 
 
-def handle_command(query: str, history: list) -> bool:
+async def handle_command(query: str, history: list) -> bool:
     """Dispatch a `/slash` command. Returns True when the input was a command
     (handled here, never forwarded to the model); False for ordinary input."""
     stripped = query.strip()
@@ -449,11 +450,11 @@ def handle_command(query: str, history: list) -> bool:
     if handler is None:
         print(f"unknown command '/{name}' (try /help)")
         return True
-    handler(arg.strip(), history)
+    await handler(arg.strip(), history)
     return True
 
 
-if __name__ == "__main__":
+async def repl() -> None:
     history = []
     while True:
         try:
@@ -463,7 +464,7 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
-        if handle_command(query, history):
+        if await handle_command(query, history):
             continue
         user_prompt_received_at = datetime.now()
         user_prompt_started = time.perf_counter()
@@ -477,7 +478,7 @@ if __name__ == "__main__":
         })
 
         state = LoopState(history)
-        outcome = agent_loop(state, PARENT_CONFIG)
+        outcome = await agent_loop(state, PARENT_CONFIG)
         final_result_at = datetime.now()
         elapsed = time.perf_counter() - user_prompt_started
         print(
@@ -489,3 +490,7 @@ if __name__ == "__main__":
         if outcome.final_text:
             print(outcome.final_text)
         print()
+
+
+if __name__ == "__main__":
+    asyncio.run(repl())

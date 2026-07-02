@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import sys
 import types
@@ -17,6 +18,19 @@ def _todo_params(items: list[dict]):
     return sys.modules["tools"].TodoParams.model_validate({"items": items})
 
 
+def _run(awaitable):
+    return asyncio.run(awaitable)
+
+
+def _client_for_response(response, captured: dict | None = None):
+    async def fake_create(**kwargs):
+        if captured is not None:
+            captured.update(kwargs)
+        return response
+
+    return types.SimpleNamespace(responses=types.SimpleNamespace(create=fake_create))
+
+
 def test_run_one_turn_full_iteration(load_module, monkeypatch) -> None:
     main_module = load_module("main", "main.py")
     captured = {}
@@ -32,20 +46,12 @@ def test_run_one_turn_full_iteration(load_module, monkeypatch) -> None:
         output_text="Running command...",
     )
 
-    def fake_create(**kwargs):
-        captured.update(kwargs)
-        return fake_response
+    monkeypatch.setattr(main_module, "client", _client_for_response(fake_response, captured))
 
-    monkeypatch.setattr(
-        main_module,
-        "client",
-        types.SimpleNamespace(responses=types.SimpleNamespace(create=fake_create)),
-    )
-    monkeypatch.setattr(
-        main_module,
-        "execute_tool_calls",
-        lambda _output: ([{"type": "function_call_output", "call_id": "c1", "output": "ok"}], False),
-    )
+    async def fake_execute(_output):
+        return ([{"type": "function_call_output", "call_id": "c1", "output": "ok"}], False)
+
+    monkeypatch.setattr(main_module, "execute_tool_calls_async", fake_execute)
 
     state = main_module.LoopState(
         messages=[
@@ -54,7 +60,7 @@ def test_run_one_turn_full_iteration(load_module, monkeypatch) -> None:
         ]
     )
 
-    outcome = main_module.run_one_turn(state)
+    outcome = _run(main_module.run_one_turn(state))
 
     assert outcome is None
     assert state.api_call_count == 1
@@ -76,22 +82,18 @@ def test_run_one_turn_surfaces_intermediate_text_with_tool_calls(load_module, mo
 
     function_call = types.SimpleNamespace(type="function_call", call_id="c1", name="bash", arguments="{}")
     fake_response = types.SimpleNamespace(output=[function_call], output_text="INTERIM SUMMARY")
-    monkeypatch.setattr(
-        main_module,
-        "client",
-        types.SimpleNamespace(responses=types.SimpleNamespace(create=lambda **_: fake_response)),
-    )
-    monkeypatch.setattr(
-        main_module,
-        "execute_tool_calls",
-        lambda _output: ([{"type": "function_call_output", "call_id": "c1", "output": "ok"}], False),
-    )
+    monkeypatch.setattr(main_module, "client", _client_for_response(fake_response))
+
+    async def fake_execute(_output):
+        return ([{"type": "function_call_output", "call_id": "c1", "output": "ok"}], False)
+
+    monkeypatch.setattr(main_module, "execute_tool_calls_async", fake_execute)
 
     surfaced: list[str] = []
     config = dataclasses.replace(main_module.PARENT_CONFIG, on_text=surfaced.append)
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
 
-    outcome = main_module.run_one_turn(state, config)
+    outcome = _run(main_module.run_one_turn(state, config))
 
     # Text that rides along with a tool call is shown, not swallowed.
     assert outcome is None
@@ -101,19 +103,13 @@ def test_run_one_turn_surfaces_intermediate_text_with_tool_calls(load_module, mo
 def test_run_one_turn_no_tool_calls_does_not_surface_via_on_text(load_module, monkeypatch) -> None:
     main_module = load_module("main", "main.py")
     main_module.TODO.update(_todo_params([]))
-    monkeypatch.setattr(
-        main_module,
-        "client",
-        types.SimpleNamespace(
-            responses=types.SimpleNamespace(create=lambda **_: _no_tool_response("Final answer."))
-        ),
-    )
+    monkeypatch.setattr(main_module, "client", _client_for_response(_no_tool_response("Final answer.")))
 
     surfaced: list[str] = []
     config = dataclasses.replace(main_module.PARENT_CONFIG, on_text=surfaced.append)
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
 
-    outcome = main_module.run_one_turn(state, config)
+    outcome = _run(main_module.run_one_turn(state, config))
 
     # The final no-tool answer is delivered via the return value (and __main__),
     # not on_text -- so it is not surfaced twice.
@@ -127,19 +123,13 @@ def test_run_one_turn_surfaces_text_when_nudged(load_module, monkeypatch) -> Non
     # An unresolved todo makes TodoStopGate.check() reject the stop with a nudge,
     # so the model's no-tool answer rides a *continuing* turn (Door 2).
     main_module.TODO.update(_todo_params([{"content": "unfinished", "status": "in_progress"}]))
-    monkeypatch.setattr(
-        main_module,
-        "client",
-        types.SimpleNamespace(
-            responses=types.SimpleNamespace(create=lambda **_: _no_tool_response("MY SUMMARY"))
-        ),
-    )
+    monkeypatch.setattr(main_module, "client", _client_for_response(_no_tool_response("MY SUMMARY")))
 
     surfaced: list[str] = []
     config = dataclasses.replace(main_module.PARENT_CONFIG, on_text=surfaced.append)
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
 
-    outcome = main_module.run_one_turn(state, config)
+    outcome = _run(main_module.run_one_turn(state, config))
 
     # The rejected answer is shown before the contract nudge, not swallowed.
     assert outcome is None
@@ -152,16 +142,10 @@ def test_run_one_turn_sets_final_text_from_current_turn(load_module, monkeypatch
     main_module = load_module("main", "main.py")
     main_module.TODO.update(_todo_params([]))
 
-    monkeypatch.setattr(
-        main_module,
-        "client",
-        types.SimpleNamespace(
-            responses=types.SimpleNamespace(create=lambda **_: _no_tool_response("Fresh answer."))
-        ),
-    )
+    monkeypatch.setattr(main_module, "client", _client_for_response(_no_tool_response("Fresh answer.")))
 
     state = main_module.LoopState(messages=[{"role": "user", "content": "new query"}])
-    outcome = main_module.run_one_turn(state)
+    outcome = _run(main_module.run_one_turn(state))
 
     assert outcome is not None
     assert outcome.stop_reason == "completed"
@@ -172,13 +156,7 @@ def test_run_one_turn_does_not_surface_stale_assistant_text(load_module, monkeyp
     main_module = load_module("main", "main.py")
     main_module.TODO.update(_todo_params([]))
 
-    monkeypatch.setattr(
-        main_module,
-        "client",
-        types.SimpleNamespace(
-            responses=types.SimpleNamespace(create=lambda **_: _no_tool_response(""))
-        ),
-    )
+    monkeypatch.setattr(main_module, "client", _client_for_response(_no_tool_response("")))
 
     # History carries a previous turn's answer; the current turn produces no text.
     state = main_module.LoopState(messages=[
@@ -186,7 +164,7 @@ def test_run_one_turn_does_not_surface_stale_assistant_text(load_module, monkeyp
         {"role": "assistant", "content": "STALE ANSWER"},
         {"role": "user", "content": "new query"},
     ])
-    outcome = main_module.run_one_turn(state)
+    outcome = _run(main_module.run_one_turn(state))
 
     assert outcome is not None
     assert outcome.final_text == ""
@@ -197,14 +175,10 @@ def test_run_one_turn_contract_nudge_when_unresolved_todo(load_module, monkeypat
     main_module.TODO.update(_todo_params([{"content": "unfinished", "status": "in_progress"}]))
 
     fake_response = types.SimpleNamespace(output=[], output_text="All done.")
-    monkeypatch.setattr(
-        main_module,
-        "client",
-        types.SimpleNamespace(responses=types.SimpleNamespace(create=lambda **_: fake_response)),
-    )
+    monkeypatch.setattr(main_module, "client", _client_for_response(fake_response))
 
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
-    outcome = main_module.run_one_turn(state)
+    outcome = _run(main_module.run_one_turn(state))
 
     assert outcome is None
     assert state.nudges == 1
@@ -217,11 +191,7 @@ def test_run_one_turn_contract_warns_after_max_nudges(load_module, monkeypatch) 
     main_module.TODO.update(_todo_params([{"content": "unfinished", "status": "pending"}]))
 
     fake_response = types.SimpleNamespace(output=[], output_text="Done.")
-    monkeypatch.setattr(
-        main_module,
-        "client",
-        types.SimpleNamespace(responses=types.SimpleNamespace(create=lambda **_: fake_response)),
-    )
+    monkeypatch.setattr(main_module, "client", _client_for_response(fake_response))
 
     surfaced: list[str] = []
     config = dataclasses.replace(main_module.PARENT_CONFIG, on_text=surfaced.append)
@@ -229,7 +199,7 @@ def test_run_one_turn_contract_warns_after_max_nudges(load_module, monkeypatch) 
         messages=[{"role": "user", "content": "task"}],
         nudges=main_module.TODO_CONTRACT_MAX_NUDGES,
     )
-    outcome = main_module.run_one_turn(state, config)
+    outcome = _run(main_module.run_one_turn(state, config))
 
     assert outcome is not None
     assert outcome.stop_reason == "completed"
@@ -293,19 +263,15 @@ def test_run_one_turn_tool_calls_extend_messages(load_module, monkeypatch) -> No
     main_module.TODO.update(_todo_params([]))
     function_call = types.SimpleNamespace(type="function_call", call_id="c1", name="bash", arguments="{}")
     fake_response = types.SimpleNamespace(output=[function_call], output_text="")
-    monkeypatch.setattr(
-        main_module,
-        "client",
-        types.SimpleNamespace(responses=types.SimpleNamespace(create=lambda **_: fake_response)),
-    )
-    monkeypatch.setattr(
-        main_module,
-        "execute_tool_calls",
-        lambda _output: ([{"type": "function_call_output", "call_id": "c1", "output": "ok"}], False),
-    )
+    monkeypatch.setattr(main_module, "client", _client_for_response(fake_response))
+
+    async def fake_execute(_output):
+        return ([{"type": "function_call_output", "call_id": "c1", "output": "ok"}], False)
+
+    monkeypatch.setattr(main_module, "execute_tool_calls_async", fake_execute)
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
 
-    outcome = main_module.run_one_turn(state)
+    outcome = _run(main_module.run_one_turn(state))
 
     assert outcome is None
     assert state.api_call_count == 1
@@ -346,16 +312,10 @@ def test_summary_stop_gate_accepts_long_summary(load_module) -> None:
 
 def test_run_one_turn_subagent_nudges_short_summary(load_module, monkeypatch) -> None:
     main_module = load_module("main", "main.py")
-    monkeypatch.setattr(
-        main_module,
-        "client",
-        types.SimpleNamespace(
-            responses=types.SimpleNamespace(create=lambda **_: _no_tool_response("Short."))
-        ),
-    )
+    monkeypatch.setattr(main_module, "client", _client_for_response(_no_tool_response("Short.")))
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
 
-    outcome = main_module.run_one_turn(state, main_module.EXPLORE_SUBAGENT_CONFIG)
+    outcome = _run(main_module.run_one_turn(state, main_module.EXPLORE_SUBAGENT_CONFIG))
 
     assert outcome is None
     assert state.nudges == 1
@@ -365,19 +325,13 @@ def test_run_one_turn_subagent_nudges_short_summary(load_module, monkeypatch) ->
 
 def test_run_one_turn_subagent_accepts_after_max_attempts(load_module, monkeypatch) -> None:
     main_module = load_module("main", "main.py")
-    monkeypatch.setattr(
-        main_module,
-        "client",
-        types.SimpleNamespace(
-            responses=types.SimpleNamespace(create=lambda **_: _no_tool_response("Short."))
-        ),
-    )
+    monkeypatch.setattr(main_module, "client", _client_for_response(_no_tool_response("Short.")))
     state = main_module.LoopState(
         messages=[{"role": "user", "content": "task"}],
         nudges=main_module.SUMMARY_CONTINUATION_ATTEMPTS,
     )
 
-    outcome = main_module.run_one_turn(state, main_module.EXPLORE_SUBAGENT_CONFIG)
+    outcome = _run(main_module.run_one_turn(state, main_module.EXPLORE_SUBAGENT_CONFIG))
 
     assert outcome is not None
     assert outcome.final_text == "Short."
@@ -387,19 +341,13 @@ def test_run_one_turn_subagent_accepts_after_max_attempts(load_module, monkeypat
 
 def test_run_one_turn_subagent_evaluates_only_current_text(load_module, monkeypatch) -> None:
     main_module = load_module("main", "main.py")
-    monkeypatch.setattr(
-        main_module,
-        "client",
-        types.SimpleNamespace(
-            responses=types.SimpleNamespace(create=lambda **_: _no_tool_response(""))
-        ),
-    )
+    monkeypatch.setattr(main_module, "client", _client_for_response(_no_tool_response("")))
     # A long prior assistant message must NOT be mistaken for this turn's summary.
     state = main_module.LoopState(
         messages=[{"role": "assistant", "content": "x" * 200}],
     )
 
-    outcome = main_module.run_one_turn(state, main_module.EXPLORE_SUBAGENT_CONFIG)
+    outcome = _run(main_module.run_one_turn(state, main_module.EXPLORE_SUBAGENT_CONFIG))
 
     assert outcome is None
     assert state.nudges == 1
@@ -413,7 +361,7 @@ def test_run_one_turn_budget_exhausted_returns_max_api_calls_outcome(load_module
         api_call_count=main_module.PARENT_CONFIG.max_api_calls,
     )
 
-    outcome = main_module.run_one_turn(state)
+    outcome = _run(main_module.run_one_turn(state))
 
     assert outcome is not None
     assert outcome.stop_reason == "max_api_calls"

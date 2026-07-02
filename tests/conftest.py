@@ -21,11 +21,14 @@ def _install_import_stubs() -> None:
     if "openai" not in sys.modules:
         openai_stub = types.ModuleType("openai")
 
-        class DummyOpenAI:
+        class DummyAsyncOpenAI:
             def __init__(self, *args, **kwargs):
-                self.responses = types.SimpleNamespace(create=lambda **_: None)
+                async def _create(**_):
+                    return None
 
-        openai_stub.OpenAI = DummyOpenAI
+                self.responses = types.SimpleNamespace(create=_create)
+
+        openai_stub.AsyncOpenAI = DummyAsyncOpenAI
         sys.modules["openai"] = openai_stub
 
 

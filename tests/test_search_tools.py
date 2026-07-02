@@ -282,12 +282,12 @@ def test_search_tools_validate_with_pydantic(load_module, item, expected_substri
 def test_execute_tool_calls_sanitizes_search_arguments(load_module) -> None:
     tools = load_module("tools", "tools.py")
     tools.run_glob = lambda pattern, directory, include_dirs, limit: f"{pattern}:{directory}"
-    tools.TOOL_REGISTRY["glob"].execute = lambda params: tools.run_glob(
+    tools.TOOL_REGISTRY["glob"].execute = tools.async_tool(lambda params: tools.run_glob(
         params.pattern,
         params.directory,
         params.include_dirs,
         params.limit,
-    )
+    ))
 
     out, used_todo = tools.execute_tool_calls([
         _fc("glob", "gb1", '{"pattern":" >  *.py","directory":" $#  tests"}'),
