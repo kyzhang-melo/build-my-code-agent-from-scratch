@@ -17,7 +17,7 @@ from typing import Literal, Protocol
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from message_utils import normalize_messages
-from prompts import EXPLORE_SUBAGENT_SYSTEM, PARENT_SYSTEM
+from prompts import EXPLORE_SUBAGENT_SYSTEM, GLOB_DISCOVERY_RULES, PARENT_SYSTEM
 from tools import (
     EXPLORE_TOOL_REGISTRY,
     EXPLORE_TOOLS,
@@ -91,7 +91,7 @@ INPUT_PROMPT = "\001\033[36m\002s01 >> \001\033[0m\002"
 # fall back to a conservative default so they compact early rather than overflow.
 CONTEXT_WINDOW_PATTERNS: list[tuple[re.Pattern[str], int]] = [
     (re.compile(r"^kimi-"), 262144),
-    (re.compile(r"^deepseek-v4"), 131072),
+    (re.compile(r"^deepseek-v4"), 1_000_000),
 ]
 DEFAULT_CONTEXT_WINDOW = 32000
 # Deliberate override, e.g. shrink the window in tests so auto-compaction is
@@ -250,6 +250,7 @@ EXPLORE_SUBAGENT_CONFIG = AgentConfig(
 def build_subagent_prompt(prompt: str) -> str:
     return (
         "Mode: explore. Inspect and analyze only. Do not modify files.\n\n"
+        f"{GLOB_DISCOVERY_RULES}\n\n"
         f"Task:\n{prompt}"
     )
 

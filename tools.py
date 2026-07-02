@@ -175,10 +175,15 @@ TOOLS = [
         "description": (
             "Find files or directories in the workspace by glob pattern. "
             "Recursive patterns like '**/config.json' are supported and search the "
-            "whole tree (noisy dirs such as .venv/node_modules are skipped); avoid "
-            "the bare '**/*' which is too broad. "
+            "whole tree (noisy dirs such as .venv/node_modules are skipped). "
             "When the user names a search directory, pass it as directory instead of "
-            "prefixing it into pattern."
+            "prefixing it into pattern. "
+            "CRITICAL GLOB RULE: never use broad recursive patterns like '**/*', "
+            "'**', '**/', or '**/**'; they match too many irrelevant files and "
+            "produce truncated, low-value output. Prefer specific patterns like "
+            "'**/*.py', '**/*.md', 'src/**/*.ts', or 'tests/**/*_test.py'. "
+            "Use pattern='*' only for a shallow top-level listing in a specific "
+            "directory."
         ),
         "parameters": {
             "type": "object",
@@ -700,7 +705,7 @@ def _limit_lines(lines: list[str], limit: int) -> tuple[list[str], str]:
 
 
 # Match-everything patterns: too broad to be useful, answered with a listing.
-BROAD_GLOB_PATTERNS = {"**", "**/", "**/*"}
+BROAD_GLOB_PATTERNS = {"**", "**/", "**/*", "**/**"}
 
 
 def _glob_excluded(rel: Path) -> bool:
@@ -716,7 +721,9 @@ def _glob_listing(pattern: str, base: Path) -> str:
     body = "\n".join(entries) if entries else "(empty)"
     return (
         f"Error: pattern `{pattern}` matches everything and is too broad. "
-        "Anchor the search to a subdirectory (e.g. `subdir/**/name`). "
+        "Use a more specific recursive pattern such as `**/*.py`, `**/*.md`, "
+        "`src/**/*.ts`, or `tests/**/*_test.py`. If you need a shallow "
+        "directory overview, use pattern `*` with a specific directory. "
         f"Top-level entries of `{base}` (directories marked with `/`):\n{body}"
     )
 

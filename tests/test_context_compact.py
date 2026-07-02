@@ -342,7 +342,7 @@ def test_context_window_normalizes_routing_and_quant_suffixes(load_module) -> No
         assert main.context_window() == 262144, model
 
     main.MODEL_ID = "deepseek/deepseek-v4-pro:floor"
-    assert main.context_window() == 131072
+    assert main.context_window() == 1_000_000
 
     main.MODEL_ID = "nope/unknown:exacto"
     assert main.context_window() == main.DEFAULT_CONTEXT_WINDOW

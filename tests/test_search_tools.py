@@ -27,6 +27,8 @@ def test_search_tools_are_registered(load_module) -> None:
     glob_schema = next(tool for tool in tools.TOOLS if tool["name"] == "glob")
     grep_schema = next(tool for tool in tools.TOOLS if tool["name"] == "grep")
     assert "pass it as directory" in glob_schema["description"]
+    assert "CRITICAL GLOB RULE" in glob_schema["description"]
+    assert "never use broad recursive patterns" in glob_schema["description"]
     assert "Put the search location in path" in grep_schema["description"]
 
 
@@ -90,6 +92,43 @@ def test_run_glob_broad_pattern_returns_top_level_listing(load_module) -> None:
         (base / "root.py").unlink()
         (base / "pkg").rmdir()
         (base / "__pycache__").rmdir()
+        base.rmdir()
+
+
+@pytest.mark.parametrize("pattern", ["**", "**/", "**/**"])
+def test_run_glob_rejects_broad_recursive_variants(load_module, pattern) -> None:
+    tools = load_module("tools", "tools.py")
+    base = Path(tools.WORKDIR / "tests" / "_tmp_glob_broad_variants")
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        (base / "root.py").write_text("root")
+
+        output = tools.run_glob(pattern, "tests/_tmp_glob_broad_variants")
+
+        assert output.startswith(f"Error: pattern `{pattern}` matches everything")
+        assert "`**/*.py`" in output
+        assert "pattern `*`" in output
+        assert "root.py" in output
+    finally:
+        (base / "root.py").unlink()
+        base.rmdir()
+
+
+def test_run_glob_allows_shallow_star_listing(load_module) -> None:
+    tools = load_module("tools", "tools.py")
+    base = Path(tools.WORKDIR / "tests" / "_tmp_glob_star")
+    try:
+        (base / "pkg").mkdir(parents=True, exist_ok=True)
+        (base / "root.py").write_text("root")
+
+        output = tools.run_glob("*", "tests/_tmp_glob_star")
+
+        assert "Found 2 matches" in output
+        assert "pkg" in output
+        assert "root.py" in output
+    finally:
+        (base / "root.py").unlink()
+        (base / "pkg").rmdir()
         base.rmdir()
 
 

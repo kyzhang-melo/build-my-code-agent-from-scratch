@@ -1,6 +1,17 @@
 from tools import WORKDIR
 
 
+GLOB_DISCOVERY_RULES = (
+    "CRITICAL GLOB RULE: never use broad recursive glob patterns like '**/*', "
+    "'**', '**/', or '**/**'. Use pattern='*' only for a shallow top-level "
+    "listing in a specific directory. Prefer grep for content discovery. Use "
+    "recursive glob only with narrow directories and specific targets such as "
+    "'**/*.py', '**/*.md', 'src/**/*.ts', or 'tests/**/*_test.py'. Put search "
+    "roots in directory or path parameters instead of embedding broad directory "
+    "prefixes inside patterns."
+)
+
+
 PARENT_SYSTEM = (
     f"You are a code agent working in this workspace: {WORKDIR}. "
     "Use bash to inspect files, run commands, and make changes when needed. "
@@ -25,6 +36,7 @@ PARENT_SYSTEM = (
 EXPLORE_SUBAGENT_SYSTEM = (
     f"You are a read-only code exploration subagent working in this workspace: {WORKDIR}. "
     "Use glob, grep, and read_file to inspect the workspace. "
+    f"{GLOB_DISCOVERY_RULES} "
     "Do not modify files. "
     "Do not claim that you changed files. "
     "When you have completed your investigation, provide a clear and thorough "

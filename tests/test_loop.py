@@ -287,6 +287,28 @@ def test_explore_subagent_tools_are_read_only(load_module) -> None:
     assert set(main_module.EXPLORE_SUBAGENT_CONFIG.registry) == {"read_file", "glob", "grep"}
 
 
+def test_explore_subagent_system_includes_glob_rule(load_module) -> None:
+    main_module = load_module("main", "main.py")
+
+    system = main_module.EXPLORE_SUBAGENT_CONFIG.system
+
+    assert "CRITICAL GLOB RULE" in system
+    assert "**/*" in system
+    assert "Prefer grep for content discovery" in system
+
+
+def test_build_subagent_prompt_includes_glob_rule_and_task(load_module) -> None:
+    main_module = load_module("main", "main.py")
+    task = "Inspect src and report findings."
+
+    prompt = main_module.build_subagent_prompt(task)
+
+    assert "Mode: explore" in prompt
+    assert "CRITICAL GLOB RULE" in prompt
+    assert "Use pattern='*' only for a shallow top-level listing" in prompt
+    assert prompt.endswith(f"Task:\n{task}")
+
+
 def test_parent_tools_include_task(load_module) -> None:
     main_module = load_module("main", "main.py")
 
