@@ -7,8 +7,10 @@ Split version of the code-agent loop.
 import json
 import os
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Literal, Protocol
 
 from dotenv import load_dotenv
@@ -463,6 +465,12 @@ if __name__ == "__main__":
             break
         if handle_command(query, history):
             continue
+        user_prompt_received_at = datetime.now()
+        user_prompt_started = time.perf_counter()
+        print(
+            "[debug] user_prompt_received_at="
+            f"{user_prompt_received_at.isoformat(timespec='seconds')}"
+        )
         history.append({
             "role": "user",
             "content": query,
@@ -470,6 +478,13 @@ if __name__ == "__main__":
 
         state = LoopState(history)
         outcome = agent_loop(state, PARENT_CONFIG)
+        final_result_at = datetime.now()
+        elapsed = time.perf_counter() - user_prompt_started
+        print(
+            "[debug] final_result_at="
+            f"{final_result_at.isoformat(timespec='seconds')} "
+            f"elapsed={elapsed:.3f}s"
+        )
 
         if outcome.final_text:
             print(outcome.final_text)

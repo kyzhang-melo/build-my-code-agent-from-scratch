@@ -89,3 +89,5 @@ Before committing:
 - Introducing new frameworks
 - Rewriting architecture beyond this learning split
 - Expanding runtime policy into a heavy framework/plugin system
+
+DO NOT send optional commentary

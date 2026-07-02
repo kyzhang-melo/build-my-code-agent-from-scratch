@@ -573,16 +573,13 @@ def run_read(path: str, offset: int = 1, limit: int = MAX_READ_LINES) -> str:
                 total_lines = i
                 if i < offset:
                     continue
-                if len(rendered) >= limit:
-                    max_lines_reached = True
+                line_limit_reached = len(rendered) >= limit
+                byte_limit_reached = rendered_bytes >= MAX_READ_BYTES
+                if line_limit_reached or byte_limit_reached:
+                    max_lines_reached = max_lines_reached or line_limit_reached
+                    max_bytes_reached = max_bytes_reached or byte_limit_reached
                     if count_to_eof:
                         continue  # window full; keep counting only
-                    reached_eof = False
-                    break
-                if rendered_bytes >= MAX_READ_BYTES:
-                    max_bytes_reached = True
-                    if count_to_eof:
-                        continue
                     reached_eof = False
                     break
                 content = raw.rstrip("\n")
