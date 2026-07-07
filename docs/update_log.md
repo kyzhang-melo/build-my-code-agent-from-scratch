@@ -252,3 +252,26 @@
 - The `glob` tool still needs to add more mechanism to discourage the LLM from emitting the broad pattern `**/*`.
 - In debug stage, the ID number for subagents could be introduced.
 - When the agent is asked about issues that occurred prior to the context compaction, its behavior comes across as quite stale.
+
+## July 07
+
+### What I've done
+
+- Fixed the context compaction history rebuild: compacted history is now `[summary checkpoint] + [recent tail]`, instead of preserving every old user request before the summary.
+- Removed same-role message merging from `normalize_messages()`, so compact summaries and new user queries keep clear turn boundaries.
+- Added previous-summary fold-forward to the compaction flow, so repeated `/compact` calls update the existing checkpoint instead of letting summaries decay.
+- Reworked `templates/compact.md` into a checkpoint-style handoff prompt that tells the model not to answer, continue, or re-execute old tasks during summarization.
+- Updated the auto-compaction trimming path to protect summary messages and drop complete retained user turns rather than deleting isolated user messages.
+- Validated the compact fix manually with `kimi-k2.5`: after `/compact`, follow-up questions used the summary checkpoint instead of replaying old user requests.
+
+### Why
+
+- The old compact design kept all previous user requests as live user messages. After `/compact`, the model could treat those old imperatives as active tasks and do the pre-compaction work again.
+- Merging adjacent user messages made the bug worse: old requests, the compact summary, and the new user query could collapse into one large user message with unclear boundaries.
+- A checkpoint plus recent-tail design better matches how compaction should work: summarized history becomes historical context, while only the newest tail remains verbatim.
+- Fold-forward summaries are needed because long sessions may compact multiple times; each new compact must preserve the accumulated summary instead of summarizing only the latest slice.
+
+### Items for improvement
+
+- Sometimes, when the LLM responds with an empty message, the agent loop ends the turn without producing any output.
+- Some models with weaker agentic capabilities perform poorly with this agent harness when the user asks the model to read many files and summarize them.
