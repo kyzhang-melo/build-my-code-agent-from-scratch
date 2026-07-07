@@ -356,19 +356,37 @@ async def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) ->
 
 
 def _drop_oldest_user_message(state: LoopState) -> bool:
-    """Drop the oldest non-summary user message (codex's remove_first_item).
+    """Drop the oldest retained non-summary user turn.
 
-    Returns True if one was removed, False if none remain to drop.
+    Returns True if one turn was removed, False if none remain to drop. The
+    compaction summary is protected, and tool outputs stay attached to the turn
+    that produced them instead of being left orphaned.
     """
+    start = None
     for i, msg in enumerate(state.messages):
         if (
             isinstance(msg, dict)
             and msg.get("role") == "user"
             and not str(msg.get("content", "")).startswith(SUMMARY_PREFIX)
         ):
-            del state.messages[i]
-            return True
-    return False
+            start = i
+            break
+    if start is None:
+        return False
+
+    end = start + 1
+    while end < len(state.messages):
+        msg = state.messages[end]
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "user"
+            and not str(msg.get("content", "")).startswith(SUMMARY_PREFIX)
+        ):
+            break
+        end += 1
+
+    del state.messages[start:end]
+    return True
 
 
 async def agent_loop(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> TurnOutcome:

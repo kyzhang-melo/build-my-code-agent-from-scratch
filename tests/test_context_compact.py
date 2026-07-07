@@ -471,12 +471,17 @@ def test_handle_command_dispatch(load_module) -> None:
 def test_drop_oldest_user_message_protects_summary(load_module) -> None:
     main = load_module("main", "main.py")
     state = main.LoopState(messages=[
-        {"role": "user", "content": "first"},
-        {"role": "user", "content": "second"},
         {"role": "user", "content": main.SUMMARY_PREFIX + "\nsummary"},
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "first answer"},
+        {"type": "function_call_output", "call_id": "c", "output": "first output"},
+        {"role": "user", "content": "second"},
     ])
     assert main._drop_oldest_user_message(state) is True
-    assert [m["content"] for m in state.messages] == ["second", main.SUMMARY_PREFIX + "\nsummary"]
+    assert [m["content"] for m in state.messages if "content" in m] == [
+        main.SUMMARY_PREFIX + "\nsummary",
+        "second",
+    ]
     assert main._drop_oldest_user_message(state) is True
     assert main._drop_oldest_user_message(state) is False, "summary is never dropped"
     assert state.messages[0]["content"].startswith(main.SUMMARY_PREFIX)
