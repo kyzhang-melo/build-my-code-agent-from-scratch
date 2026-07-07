@@ -127,41 +127,61 @@ def test_render_prompt_fills_focus_slot(load_module) -> None:
     cc = load_module("context_compact", "context_compact.py")
     no_focus = cc.render_prompt(None)
     with_focus = cc.render_prompt("keep the auth refactor")
+    with_previous = cc.render_prompt(None, "old summary")
     assert "{{ focus }}" not in no_focus and "{{ focus }}" not in with_focus
+    assert "{{ previous_summary }}" not in with_previous
     assert "keep the auth refactor" in with_focus
+    assert "<previous-summary>\nold summary\n</previous-summary>" in with_previous
     assert "Focus for this compaction" in with_focus
     assert "Focus for this compaction" not in no_focus
 
 
-def test_collect_user_messages_skips_prior_summaries(load_module) -> None:
+def test_extract_previous_summary_unwraps_leading_summary(load_module) -> None:
+    cc = load_module("context_compact", "context_compact.py")
+    summary = cc.build_summary_message("old summary")
+    previous, start_index = cc.extract_previous_summary([summary, {"role": "user", "content": "new"}])
+
+    assert previous == "old summary"
+    assert start_index == 1
+
+
+def test_build_compacted_history_keeps_summary_then_tail(load_module) -> None:
+    cc = load_module("context_compact", "context_compact.py")
+    tail = [
+        {"role": "user", "content": "recent request"},
+        {"role": "assistant", "content": "recent answer"},
+    ]
+    history = cc.build_compacted_history("THE SUMMARY", tail)
+
+    assert history[0]["content"].startswith(cc.SUMMARY_PREFIX)
+    assert "THE SUMMARY" in history[0]["content"]
+    assert history[1:] == tail
+
+
+def test_find_cut_index_keeps_complete_recent_turn(load_module) -> None:
     cc = load_module("context_compact", "context_compact.py")
     messages = [
-        {"role": "user", "content": "first request"},
-        {"role": "assistant", "content": "working"},
+        {"role": "user", "content": "old request " + "x" * 200},
+        {"role": "assistant", "content": "old answer " + "x" * 200},
+        {"role": "user", "content": "recent request"},
         {"type": "function_call", "call_id": "c1", "name": "bash", "arguments": "{}"},
-        {"type": "function_call_output", "call_id": "c1", "output": "out"},
-        {"role": "user", "content": cc.SUMMARY_PREFIX + "\nold summary"},
-        {"role": "user", "content": "second request"},
+        {"type": "function_call_output", "call_id": "c1", "output": "recent output"},
+        {"role": "assistant", "content": "recent answer"},
     ]
-    assert cc.collect_user_messages(messages) == ["first request", "second request"]
+
+    cut = cc.find_cut_index(messages, keep_recent_tokens=20)
+    assert cut == 2
+    assert messages[cut]["role"] == "user"
 
 
-def test_build_compacted_history_is_start_fresh(load_module) -> None:
+def test_find_cut_index_summarizes_short_history(load_module) -> None:
     cc = load_module("context_compact", "context_compact.py")
-    history = cc.build_compacted_history(["first", "second"], "THE SUMMARY")
-    assert all(msg["role"] == "user" for msg in history), "no assistant/tool items survive"
-    assert [m["content"] for m in history[:2]] == ["first", "second"], "user order preserved"
-    assert history[-1]["content"].startswith(cc.SUMMARY_PREFIX)
-    assert "THE SUMMARY" in history[-1]["content"]
+    messages = [
+        {"role": "user", "content": "small"},
+        {"role": "assistant", "content": "done"},
+    ]
 
-
-def test_cap_user_messages_newest_first(load_module) -> None:
-    cc = load_module("context_compact", "context_compact.py")
-    budget = cc.USER_MESSAGE_MAX_CHARS
-    big = ["a" * (budget // 2 + 10), "b" * (budget // 2 + 10), "c" * (budget // 2 + 10)]
-    capped = cc._cap_user_messages(big)
-    assert capped[-1].startswith("c"), "newest message is kept"
-    assert "a" * (budget // 2 + 10) not in capped, "oldest dropped when over budget"
+    assert cc.find_cut_index(messages, keep_recent_tokens=1000) == len(messages)
 
 
 def test_summarize_omits_tools_and_raises_on_empty(load_module) -> None:
@@ -175,6 +195,23 @@ def test_summarize_omits_tools_and_raises_on_empty(load_module) -> None:
     empty_client = _FakeClient(output_text="   ")
     with pytest.raises(ValueError):
         cc.summarize([{"role": "user", "content": "hi"}], None, client=empty_client, model="m")
+
+
+def test_summarize_uses_previous_summary_fold_forward(load_module) -> None:
+    cc = load_module("context_compact", "context_compact.py")
+    client = _FakeClient(output_text="updated")
+
+    cc.summarize(
+        [{"role": "user", "content": "new work"}],
+        None,
+        client=client,
+        model="m",
+        previous_summary="old summary",
+    )
+
+    prompt = client.captured["input"][-1]["content"]
+    assert "<previous-summary>\nold summary\n</previous-summary>" in prompt
+    assert "update it" in prompt
 
 
 def test_provider_extra_body_threads_to_side_call(load_module, tmp_path) -> None:
@@ -243,8 +280,9 @@ def test_compact_history_happy_path(load_module, tmp_path) -> None:
     )
     assert result is not None and result.source == "manual"
     assert id(state.messages) == original_list_id, "history mutated in place (alias-safe)"
-    assert all(m.get("role") == "user" for m in state.messages), "assistant/tool dropped"
-    assert state.messages[-1]["content"].startswith(cc.SUMMARY_PREFIX)
+    assert len(state.messages) == 1, "short compacted history becomes summary-only"
+    assert state.messages[0]["content"].startswith(cc.SUMMARY_PREFIX)
+    assert "do the task" not in state.messages[0]["content"], "old request is not replayed verbatim"
     assert state.last_input_tokens == result.tokens_after
     assert (tmp_path / "transcripts").exists()
     assert result.transcript_path.endswith(".jsonl")
@@ -267,9 +305,56 @@ def test_compact_history_async_happy_path(load_module, tmp_path) -> None:
     ))
 
     assert result is not None and result.source == "auto"
-    assert state.messages[-1]["content"].startswith(cc.SUMMARY_PREFIX)
+    assert len(state.messages) == 1
+    assert state.messages[0]["content"].startswith(cc.SUMMARY_PREFIX)
     assert state.last_input_tokens == result.tokens_after
     assert client.captured["max_output_tokens"] == cc.SUMMARY_MAX_OUTPUT_TOKENS
+
+
+def test_compact_history_preserves_recent_tail(load_module, tmp_path) -> None:
+    cc = load_module("context_compact", "context_compact.py")
+    cc.TRANSCRIPT_DIR = tmp_path / "transcripts"
+    cc.TODO = types.SimpleNamespace(has_active_plan=lambda: False, render=lambda: "")
+    cc.KEEP_RECENT_TOKENS = 10
+
+    old_request = "please read old.py and summarize " + "x" * 400
+    recent_request = "answer this recent question"
+    state = types.SimpleNamespace(messages=[
+        {"role": "user", "content": old_request},
+        {"role": "assistant", "content": "old answer " + "x" * 400},
+        {"role": "user", "content": recent_request},
+        {"type": "function_call", "call_id": "c2", "name": "bash", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c2", "output": "recent output"},
+        {"role": "assistant", "content": "recent answer"},
+    ], last_input_tokens=5000)
+
+    result = cc.compact_history(state, source="manual", client=_FakeClient(), model="m")
+
+    assert result is not None
+    assert state.messages[0]["content"].startswith(cc.SUMMARY_PREFIX)
+    assert all(old_request not in str(msg.get("content", "")) for msg in state.messages[1:])
+    assert state.messages[1]["content"] == recent_request
+    assert state.messages[3]["type"] == "function_call_output"
+
+
+def test_compact_history_folds_forward_previous_summary(load_module, tmp_path) -> None:
+    cc = load_module("context_compact", "context_compact.py")
+    cc.TRANSCRIPT_DIR = tmp_path / "transcripts"
+    cc.TODO = types.SimpleNamespace(has_active_plan=lambda: False, render=lambda: "")
+    client = _FakeClient(output_text="updated summary")
+    state = types.SimpleNamespace(messages=[
+        cc.build_summary_message("old summary"),
+        {"role": "user", "content": "new completed request"},
+        {"role": "assistant", "content": "new completed answer"},
+    ], last_input_tokens=5000)
+
+    result = cc.compact_history(state, source="manual", client=client, model="m")
+
+    assert result is not None
+    assert len(state.messages) == 1
+    assert state.messages[0]["content"].count(cc.SUMMARY_PREFIX) == 1
+    assert "updated summary" in state.messages[0]["content"]
+    assert "<previous-summary>\nold summary\n</previous-summary>" in client.captured["input"][-1]["content"]
 
 
 def test_compact_history_aborts_on_summary_failure(load_module, tmp_path) -> None:
