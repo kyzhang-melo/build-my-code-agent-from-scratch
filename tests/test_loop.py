@@ -65,7 +65,9 @@ def test_run_one_turn_full_iteration(load_module, monkeypatch) -> None:
     assert outcome is None
     assert state.api_call_count == 1
     assert captured["input"][0]["role"] == "user"
-    assert captured["input"][0]["content"] == "task part 1\ntask part 2"
+    assert captured["input"][0]["content"] == "task part 1"
+    assert captured["input"][1]["role"] == "user"
+    assert captured["input"][1]["content"] == "task part 2"
     assert any(m.get("type") == "function_call" and m.get("call_id") == "c1" for m in state.messages)
     assert any(m.get("role") == "assistant" and m.get("content") == "Running command..." for m in state.messages)
     assert state.messages[-1]["type"] == "function_call_output"

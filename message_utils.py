@@ -5,7 +5,8 @@ def normalize_messages(messages: list[dict]) -> list[dict]:
     """Normalize history before API call.
 
     - Keep only supported keys for message-like records.
-    - Merge consecutive same-role role/content messages.
+    - Preserve message boundaries; callers rely on adjacent user messages
+      staying separate (for example compact summaries vs. new user input).
     """
     cleaned: list[dict] = []
     for msg in messages:
@@ -37,19 +38,4 @@ def normalize_messages(messages: list[dict]) -> list[dict]:
                 "content": msg.get("content", ""),
             })
 
-    if not cleaned:
-        return cleaned
-
-    merged = [cleaned[0]]
-    for msg in cleaned[1:]:
-        prev = merged[-1]
-        if (
-            prev.get("role") in ("user", "assistant", "system")
-            and msg.get("role") == prev.get("role")
-            and "type" not in prev
-            and "type" not in msg
-        ):
-            prev["content"] = f"{prev.get('content', '')}\n{msg.get('content', '')}".strip()
-        else:
-            merged.append(msg)
-    return merged
+    return cleaned
