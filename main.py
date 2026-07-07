@@ -92,6 +92,8 @@ INPUT_PROMPT = "\001\033[36m\002s01 >> \001\033[0m\002"
 CONTEXT_WINDOW_PATTERNS: list[tuple[re.Pattern[str], int]] = [
     (re.compile(r"^kimi-"), 262144),
     (re.compile(r"^deepseek-v4"), 1_000_000),
+    (re.compile(r"^minimax-m3"), 524_288),
+    (re.compile(r"^glm-5"), 202_800),
 ]
 DEFAULT_CONTEXT_WINDOW = 32000
 # Deliberate override, e.g. shrink the window in tests so auto-compaction is

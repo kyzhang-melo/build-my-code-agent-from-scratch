@@ -32,13 +32,30 @@ pip install -r requirements.txt
 
 ## Environment Variables
 
-Create a `.env` file in this directory:
+Copy `.env.example` to `.env` and fill in real values:
 
 ```env
 OPENROUTER_API_KEY="your_key"
 OPENROUTER_BASE_URL="https://openrouter.ai/api/v1"
-MODEL_ID="moonshotai/kimi-k2.5"
+MODEL_ID="moonshotai/kimi-k2.5:exacto"
+OPENROUTER_PROVIDER="moonshotai/int4"
 ```
+
+`OPENROUTER_PROVIDER` is optional, but recommended when testing context-window
+behavior through OpenRouter. When it is set, the agent pins requests to that
+provider and disables fallbacks, so the effective context window stays
+consistent across turns and compaction side calls.
+
+When using a pinned OpenRouter provider, add the `:exacto` suffix to `MODEL_ID`.
+This tells OpenRouter to route the model request exactly as specified instead of
+silently falling back to another route. For example:
+
+```env
+MODEL_ID="moonshotai/kimi-k2.5:exacto"
+OPENROUTER_PROVIDER="moonshotai/int4"
+```
+
+Leave `OPENROUTER_PROVIDER` empty if you want OpenRouter's default routing.
 
 ## Run
 

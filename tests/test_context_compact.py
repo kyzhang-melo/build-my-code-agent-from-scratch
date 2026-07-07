@@ -237,10 +237,20 @@ def test_provider_extra_body_threads_to_side_call(load_module, tmp_path) -> None
     assert client3.captured["extra_body"] is None
 
 
-def test_provider_extra_body_disabled_by_default(load_module) -> None:
+def test_provider_extra_body_disabled_by_default(load_module, monkeypatch) -> None:
+    monkeypatch.delenv("OPENROUTER_PROVIDER", raising=False)
     main = load_module("main", "main.py")
     # OPENROUTER_PROVIDER is unset in the test env -> no routing override.
     assert main.PROVIDER_EXTRA_BODY is None
+
+
+def test_provider_extra_body_supports_minimax_fp8(load_module, monkeypatch) -> None:
+    monkeypatch.setenv("OPENROUTER_PROVIDER", "minimax/fp8")
+    main = load_module("main", "main.py")
+
+    assert main.PROVIDER_EXTRA_BODY == {
+        "provider": {"only": ["minimax/fp8"], "allow_fallbacks": False}
+    }
 
 
 def test_reinject_todo_gated_on_active_plan(load_module) -> None:
@@ -428,6 +438,12 @@ def test_context_window_normalizes_routing_and_quant_suffixes(load_module) -> No
 
     main.MODEL_ID = "deepseek/deepseek-v4-pro:floor"
     assert main.context_window() == 1_000_000
+
+    main.MODEL_ID = "minimax/minimax-m3:exacto"
+    assert main.context_window() == 524_288
+
+    main.MODEL_ID = "z-ai/glm-5:exacto"
+    assert main.context_window() == 202_800
 
     main.MODEL_ID = "nope/unknown:exacto"
     assert main.context_window() == main.DEFAULT_CONTEXT_WINDOW
