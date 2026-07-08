@@ -275,3 +275,26 @@
 
 - Sometimes, when the LLM responds with an empty message, the agent loop ends the turn without producing any output.
 - Some models with weaker agentic capabilities perform poorly with this agent harness when the user asks the model to read many files and summarize them.
+
+## July 08
+
+### What I've done
+
+- Added a debug scaffold for empty Responses API outputs: when `output_text` is empty, the loop prints each `response.output` item's `type`, `status`, and message content block types.
+- Fixed the empty-response bug where a reasoning-only response could end the user turn with no visible output.
+- Added lightweight Responses API reasoning replay: `reasoning` items are now captured from `response.output`, stored in history, and passed back through `normalize_messages()`.
+- Preserved `function_call.id` during message normalization, in addition to `call_id`, `name`, and `arguments`.
+- Added a bounded empty-response nudge: when the model returns no assistant-visible text and no tool calls, the loop asks it to continue from the saved reasoning and either produce a visible answer or call a tool.
+- Updated context compaction's droppable-message detection so `reasoning` items are treated as agent work.
+- Added regression tests for reasoning replay, empty-response nudging, function-call ID preservation, and SDK-like response item serialization.
+
+### Why
+
+- Debugging the raw response shape showed that the bug was not caused by a missing `message` item. The model sometimes returned only a completed `reasoning` item, with no `output_text` and no structured `function_call`.
+- In one prompt-case log, the model placed tool-call-like markup inside the reasoning channel. The harness must not execute pseudo tool calls from reasoning text; it should replay the reasoning and let the model emit a proper `function_call` item on the next turn.
+- Treating empty reasoning-only responses as completed caused the REPL to silently return to the prompt. A bounded nudge turns this into a recoverable protocol correction while avoiding infinite loops.
+- Saving and replaying reasoning items makes the OpenAI Responses API adapter closer to pi's design: reasoning remains part of the model-visible context instead of being discarded between API calls.
+
+### Items for improvement
+
+- Context compact still has room for improvement: summaries should preserve more file-level technical details, function names, and already-confirmed conclusions so the agent does not need to re-read source files for follow-up questions after compaction.
