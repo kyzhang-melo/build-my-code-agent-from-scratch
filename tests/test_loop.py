@@ -78,6 +78,15 @@ def _no_tool_response(output_text: str):
     return types.SimpleNamespace(output=[], output_text=output_text)
 
 
+def _reasoning_item():
+    return types.SimpleNamespace(
+        type="reasoning",
+        id="rs_1",
+        status="completed",
+        summary=[types.SimpleNamespace(type="summary_text", text="thought")],
+    )
+
+
 def test_run_one_turn_surfaces_intermediate_text_with_tool_calls(load_module, monkeypatch) -> None:
     main_module = load_module("main", "main.py")
     main_module.TODO.update(_todo_params([]))
@@ -168,8 +177,9 @@ def test_run_one_turn_does_not_surface_stale_assistant_text(load_module, monkeyp
     ])
     outcome = _run(main_module.run_one_turn(state))
 
-    assert outcome is not None
-    assert outcome.final_text == ""
+    assert outcome is None
+    assert state.messages[-1]["role"] == "user"
+    assert "assistant-visible text" in state.messages[-1]["content"]
 
 
 def test_run_one_turn_contract_nudge_when_unresolved_todo(load_module, monkeypatch) -> None:
@@ -277,7 +287,76 @@ def test_run_one_turn_tool_calls_extend_messages(load_module, monkeypatch) -> No
 
     assert outcome is None
     assert state.api_call_count == 1
+    assert state.empty_response_nudges == 0
     assert state.messages[-1]["type"] == "function_call_output"
+
+
+def test_run_one_turn_reasoning_only_response_is_nudged(load_module, monkeypatch) -> None:
+    main_module = load_module("main", "main.py")
+    main_module.TODO.update(_todo_params([]))
+    fake_response = types.SimpleNamespace(output=[_reasoning_item()], output_text="")
+    monkeypatch.setattr(main_module, "client", _client_for_response(fake_response))
+    state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
+
+    outcome = _run(main_module.run_one_turn(state))
+
+    assert outcome is None
+    assert state.empty_response_nudges == 1
+    assert state.messages[-2]["type"] == "reasoning"
+    assert state.messages[-2]["summary"][0]["text"] == "thought"
+    assert state.messages[-1]["role"] == "user"
+    assert "assistant-visible text" in state.messages[-1]["content"]
+
+
+def test_agent_loop_replays_reasoning_item_after_empty_response(load_module, monkeypatch) -> None:
+    main_module = load_module("main", "main.py")
+    main_module.TODO.update(_todo_params([]))
+    responses = [
+        types.SimpleNamespace(output=[_reasoning_item()], output_text=""),
+        _no_tool_response("Final answer."),
+    ]
+    captured_inputs: list[list[dict]] = []
+
+    async def fake_create(**kwargs):
+        captured_inputs.append(kwargs["input"])
+        return responses.pop(0)
+
+    monkeypatch.setattr(
+        main_module,
+        "client",
+        types.SimpleNamespace(responses=types.SimpleNamespace(create=fake_create)),
+    )
+    state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
+
+    outcome = _run(main_module.agent_loop(state))
+
+    assert outcome.final_text == "Final answer."
+    assert outcome.api_calls == 2
+    assert any(msg.get("type") == "reasoning" for msg in captured_inputs[1])
+    assert any(
+        msg.get("role") == "user" and "assistant-visible text" in msg.get("content", "")
+        for msg in captured_inputs[1]
+    )
+
+
+def test_run_one_turn_empty_response_after_retry_returns_warning(load_module, monkeypatch) -> None:
+    main_module = load_module("main", "main.py")
+    main_module.TODO.update(_todo_params([]))
+    fake_response = types.SimpleNamespace(output=[_reasoning_item()], output_text="")
+    monkeypatch.setattr(main_module, "client", _client_for_response(fake_response))
+    state = main_module.LoopState(
+        messages=[{"role": "user", "content": "task"}],
+        empty_response_nudges=main_module.EMPTY_RESPONSE_MAX_NUDGES,
+    )
+
+    outcome = _run(main_module.run_one_turn(state))
+
+    assert outcome is not None
+    assert outcome.stop_reason == "completed"
+    assert "empty response with no tool calls" in outcome.final_text
+    assert state.empty_response_nudges == 0
+    assert state.messages[-1]["role"] == "assistant"
+    assert state.messages[-1]["content"] == outcome.final_text
 
 
 def test_run_one_turn_debugs_empty_output_text_shape(load_module, monkeypatch, capsys) -> None:
@@ -394,8 +473,8 @@ def test_run_one_turn_subagent_evaluates_only_current_text(load_module, monkeypa
     outcome = _run(main_module.run_one_turn(state, main_module.EXPLORE_SUBAGENT_CONFIG))
 
     assert outcome is None
-    assert state.nudges == 1
-    assert "too brief" in state.messages[-1]["content"]
+    assert state.empty_response_nudges == 1
+    assert "assistant-visible text" in state.messages[-1]["content"]
 
 
 def test_run_one_turn_budget_exhausted_returns_max_api_calls_outcome(load_module) -> None:

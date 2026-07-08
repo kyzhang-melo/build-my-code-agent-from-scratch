@@ -265,7 +265,7 @@ def _has_droppable(messages: list) -> bool:
     for msg in messages:
         if not isinstance(msg, dict):
             continue
-        if msg.get("type") in ("function_call", "function_call_output"):
+        if msg.get("type") in ("reasoning", "function_call", "function_call_output"):
             return True
         if msg.get("role") == "assistant":
             return True

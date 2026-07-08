@@ -16,7 +16,7 @@ from typing import Literal, Protocol
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from message_utils import normalize_messages
+from message_utils import normalize_messages, response_item_to_dict
 from prompts import EXPLORE_SUBAGENT_SYSTEM, GLOB_DISCOVERY_RULES, PARENT_SYSTEM
 from tools import (
     EXPLORE_TOOL_REGISTRY,
@@ -70,6 +70,13 @@ PROVIDER_EXTRA_BODY = (
     else None
 )
 TODO_CONTRACT_MAX_NUDGES = 2
+EMPTY_RESPONSE_MAX_NUDGES = 1
+EMPTY_RESPONSE_NUDGE = (
+    "Your previous response contained no assistant-visible text and no tool "
+    "calls. Continue from any reasoning above and provide the required "
+    "assistant-visible answer now. If more information is needed, call a tool "
+    "instead of returning an empty response."
+)
 SUMMARY_MIN_LENGTH = 200
 SUMMARY_CONTINUATION_ATTEMPTS = 1
 SUMMARY_CONTINUATION_PROMPT = (
@@ -142,6 +149,7 @@ class LoopState:
     messages: list
     api_call_count: int = 0
     nudges: int = 0
+    empty_response_nudges: int = 0
     # Input tokens the last API call consumed (from response.usage, or estimated).
     # Drives the auto-compaction trigger.
     last_input_tokens: int = 0
@@ -334,26 +342,55 @@ async def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) ->
         else len(json.dumps(input_messages, default=str)) // 4
     )
 
-    if response.output_text:
+    output_text = getattr(response, "output_text", "") or ""
+    response_output = getattr(response, "output", None) or []
+
+    if output_text:
         state.messages.append({
             "role": "assistant",
-            "content": response.output_text,
+            "content": output_text,
         })
     
     tool_calls = []
-    for item in response.output:
-        if item.type == "function_call":
-            state.messages.append({
+    for item in response_output:
+        item_type = _response_item_attr(item, "type")
+        if item_type == "reasoning":
+            reasoning = response_item_to_dict(item)
+            if reasoning.get("type") == "reasoning":
+                state.messages.append(reasoning)
+            continue
+
+        if item_type == "function_call":
+            function_call = {
                 "type": "function_call",
-                "call_id": item.call_id,
-                "name": item.name,
-                "arguments": item.arguments,
-            })
+                "call_id": _response_item_attr(item, "call_id", ""),
+                "name": _response_item_attr(item, "name", ""),
+                "arguments": _response_item_attr(item, "arguments", "{}"),
+            }
+            item_id = _response_item_attr(item, "id")
+            if item_id:
+                function_call["id"] = item_id
+            state.messages.append(function_call)
 
             tool_calls.append(item)
 
     if not tool_calls:
-        response_text = (response.output_text or "").strip()
+        response_text = output_text.strip()
+        if not response_text:
+            if state.empty_response_nudges < EMPTY_RESPONSE_MAX_NUDGES:
+                state.empty_response_nudges += 1
+                state.messages.append({"role": "user", "content": EMPTY_RESPONSE_NUDGE})
+                return None
+
+            warning = (
+                "Warning: model returned an empty response with no tool calls "
+                "after retry."
+            )
+            state.empty_response_nudges = 0
+            state.messages.append({"role": "assistant", "content": warning})
+            return StepOutcome(stop_reason="completed", final_text=warning)
+
+        state.empty_response_nudges = 0
         nudge = config.stop_gate.check(response_text)
         if nudge is not None and state.nudges < config.stop_gate.max_nudges:
             # The loop continues, so this text won't become final_text and would
@@ -373,10 +410,11 @@ async def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) ->
         # Turn ends on a model message with no tool calls: this is the answer.
         return StepOutcome(stop_reason="completed", final_text=response_text)
 
+    state.empty_response_nudges = 0
     # Surface assistant text that accompanies tool calls; otherwise it would be
     # retained in history but never shown, swallowing real deliverables.
-    if response.output_text and config.on_text is not None:
-        config.on_text(response.output_text)
+    if output_text and config.on_text is not None:
+        config.on_text(output_text)
 
     results, _ = await execute_configured_tool_calls(tool_calls, config)
     if not results:
