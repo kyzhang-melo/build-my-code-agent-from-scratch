@@ -196,6 +196,35 @@ def emit_assistant_text(text: str) -> None:
     print(text)
 
 
+def _response_item_attr(item, name: str, default=None):
+    if isinstance(item, dict):
+        return item.get(name, default)
+    return getattr(item, name, default)
+
+
+def debug_empty_output_text_response(response) -> None:
+    """Print response.output shape when output_text is empty."""
+    if (getattr(response, "output_text", "") or "").strip():
+        return
+
+    output = getattr(response, "output", None) or []
+    print(f"[debug] output_text empty; response.output has {len(output)} item(s)")
+    for i, item in enumerate(output):
+        item_type = _response_item_attr(item, "type")
+        status = _response_item_attr(item, "status")
+        line = f"[debug]  output[{i}] type={item_type!r} status={status!r}"
+
+        if item_type == "message":
+            content = _response_item_attr(item, "content", []) or []
+            content_types = [
+                _response_item_attr(part, "type")
+                for part in content
+            ]
+            line += f" content_types={content_types!r}"
+
+        print(line)
+
+
 class TodoStopGate:
     def __init__(self, todo, max_nudges: int):
         self.todo = todo
@@ -294,6 +323,7 @@ async def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) ->
         max_output_tokens=8000,
         extra_body=PROVIDER_EXTRA_BODY,
     )
+    debug_empty_output_text_response(response)
 
     # Track input-token load for the auto-compaction trigger. Prefer the API's
     # reported usage; fall back to a char-based estimate if it's absent.

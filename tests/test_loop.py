@@ -280,6 +280,26 @@ def test_run_one_turn_tool_calls_extend_messages(load_module, monkeypatch) -> No
     assert state.messages[-1]["type"] == "function_call_output"
 
 
+def test_run_one_turn_debugs_empty_output_text_shape(load_module, monkeypatch, capsys) -> None:
+    main_module = load_module("main", "main.py")
+    main_module.TODO.update(_todo_params([]))
+    message_item = types.SimpleNamespace(
+        type="message",
+        status="completed",
+        content=[types.SimpleNamespace(type="output_text", text="hidden")],
+    )
+    fake_response = types.SimpleNamespace(output=[message_item], output_text="")
+    monkeypatch.setattr(main_module, "client", _client_for_response(fake_response))
+    state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
+
+    _run(main_module.run_one_turn(state))
+
+    output = capsys.readouterr().out
+    assert "output_text empty; response.output has 1 item(s)" in output
+    assert "output[0] type='message' status='completed'" in output
+    assert "content_types=['output_text']" in output
+
+
 def test_explore_subagent_tools_are_read_only(load_module) -> None:
     main_module = load_module("main", "main.py")
 
