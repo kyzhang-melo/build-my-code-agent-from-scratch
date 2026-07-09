@@ -97,6 +97,7 @@ INPUT_PROMPT = "\001\033[36m\002s01 >> \001\033[0m\002"
 # instead of silently falling through to DEFAULT_CONTEXT_WINDOW. Unknown models
 # fall back to a conservative default so they compact early rather than overflow.
 CONTEXT_WINDOW_PATTERNS: list[tuple[re.Pattern[str], int]] = [
+    (re.compile(r"^hy3$"), 262144),
     (re.compile(r"^kimi-"), 262144),
     (re.compile(r"^deepseek-v4"), 1_000_000),
     (re.compile(r"^minimax-m3"), 524_288),

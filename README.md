@@ -59,10 +59,10 @@ Leave `OPENROUTER_PROVIDER` empty if you want OpenRouter's default routing.
 
 ### Model Choice and Context Window
 
-For debugging this agent harness, prefer `kimi-k2.5` or another model with
-strong agentic capability. Models with weaker tool-use and long-context behavior
-may fail on prompt cases that require reading several files and summarizing the
-results.
+For debugging this agent harness, prefer `kimi-k2.5`, `tencent/hy3`, or another
+model with strong agentic capability. Models with weaker tool-use and
+long-context behavior may fail on prompt cases that require reading several
+files and summarizing the results.
 
 Also check the context-window detection logic in `main.py` when changing
 `MODEL_ID`. The project resolves known model IDs to their configured context
