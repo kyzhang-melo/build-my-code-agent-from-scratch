@@ -1,6 +1,6 @@
 """context_compact.py
 
-Tier 2 of context compaction: ``compact_history``. When the conversation
+Tier 2 of context compaction: ``compact_history_async``. When the conversation
 approaches the model's context window (auto) or on user command (``/compact``),
 an LLM side-call summarizes the older history, which is then rebuilt as a
 checkpoint summary plus a recent verbatim tail. Old user requests that were
@@ -8,8 +8,8 @@ summarized are not replayed as active instructions.
 
 Tier 1 (per-output middle-truncation) lives in ``tools.truncate_middle``.
 
-Manual and automatic compaction both call ``compact_history``; they differ only
-in ``source`` and whether a ``focus`` is supplied.
+Manual and automatic compaction both call ``compact_history_async``; they differ
+only in ``source`` and whether a ``focus`` is supplied.
 """
 
 import json
@@ -186,36 +186,6 @@ def build_compacted_history(summary: str, tail_messages: list[dict]) -> list[dic
     return [build_summary_message(summary), *tail_messages]
 
 
-def summarize(
-    messages: list,
-    focus: str | None,
-    *,
-    client,
-    model: str,
-    extra_body: dict | None = None,
-    previous_summary: str | None = None,
-) -> str:
-    """Side-call the model for a handoff summary. No tools. Raises on empty output.
-
-    ``extra_body`` carries OpenRouter routing (e.g. provider pinning) so the
-    side-call lands on the same upstream host as the main agent turns.
-    """
-    api_input = normalize_messages(
-        messages + [{"role": "user", "content": render_prompt(focus, previous_summary)}]
-    )
-    response = client.responses.create(
-        model=model,
-        instructions=_COMPACTION_DIRECTIVE,
-        input=api_input,
-        max_output_tokens=SUMMARY_MAX_OUTPUT_TOKENS,
-        extra_body=extra_body,
-    )
-    summary = (getattr(response, "output_text", "") or "").strip()
-    if not summary:
-        raise ValueError("compaction summary was empty")
-    return summary
-
-
 async def summarize_async(
     messages: list,
     focus: str | None,
@@ -290,7 +260,7 @@ def prepare_compaction(messages: list) -> tuple[str | None, list[dict], list[dic
     return previous_summary, to_summarize, tail
 
 
-def compact_history(
+async def compact_history_async(
     state,
     *,
     source: str,
@@ -305,55 +275,6 @@ def compact_history(
     compacting or the summary call fails. Order is failure-safe: snapshot first,
     summarize next, and only replace the live history once a summary is in hand.
     """
-    messages = state.messages
-    if not _has_droppable(messages):
-        return None
-
-    tokens_before = state.last_input_tokens or estimate_tokens(messages)
-    transcript_path = write_transcript(messages)
-
-    previous_summary, to_summarize, tail = prepare_compaction(messages)
-    if not to_summarize:
-        return None
-
-    try:
-        summary = summarize(
-            to_summarize,
-            focus,
-            client=client,
-            model=model,
-            extra_body=extra_body,
-            previous_summary=previous_summary,
-        )
-    except Exception as exc:  # any failure -> keep the original history
-        print(f"[compact] summarization failed ({exc}); history left unchanged")
-        return None
-
-    summary = reinject_todo(summary)
-    new_messages = build_compacted_history(summary, tail)
-
-    # Mutate in place so any alias of this list (e.g. the REPL's `history`) sees it.
-    state.messages[:] = new_messages
-    tokens_after = estimate_tokens(new_messages)
-    state.last_input_tokens = tokens_after
-    return CompactionResult(
-        source=source,
-        tokens_before=tokens_before,
-        tokens_after=tokens_after,
-        transcript_path=str(transcript_path),
-    )
-
-
-async def compact_history_async(
-    state,
-    *,
-    source: str,
-    focus: str | None = None,
-    client,
-    model: str,
-    extra_body: dict | None = None,
-) -> CompactionResult | None:
-    """Async variant of ``compact_history`` for the async agent loop."""
     messages = state.messages
     if not _has_droppable(messages):
         return None

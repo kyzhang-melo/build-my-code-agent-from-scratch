@@ -15,22 +15,6 @@ def _fc(name: str, call_id: str, arguments: str):
     )
 
 
-class _FakeClient:
-    """Minimal client whose responses.create returns a fixed summary and records
-    the kwargs it was called with."""
-
-    def __init__(self, output_text: str = "SUMMARY: editing foo.py:10; next run tests."):
-        captured: dict = {}
-
-        class _Responses:
-            def create(self, **kwargs):
-                captured.update(kwargs)
-                return types.SimpleNamespace(output_text=output_text)
-
-        self.responses = _Responses()
-        self.captured = captured
-
-
 class _AsyncFakeClient:
     def __init__(self, output_text: str = "SUMMARY: editing foo.py:10; next run tests."):
         captured: dict = {}
@@ -184,30 +168,30 @@ def test_find_cut_index_summarizes_short_history(load_module) -> None:
     assert cc.find_cut_index(messages, keep_recent_tokens=1000) == len(messages)
 
 
-def test_summarize_omits_tools_and_raises_on_empty(load_module) -> None:
+def test_summarize_async_omits_tools_and_raises_on_empty(load_module) -> None:
     cc = load_module("context_compact", "context_compact.py")
-    client = _FakeClient(output_text="  the summary  ")
-    out = cc.summarize([{"role": "user", "content": "hi"}], "focus", client=client, model="m")
+    client = _AsyncFakeClient(output_text="  the summary  ")
+    out = _run(cc.summarize_async([{"role": "user", "content": "hi"}], "focus", client=client, model="m"))
     assert out == "the summary"
     assert "tools" not in client.captured, "side-call must not expose tools"
     assert client.captured["max_output_tokens"] == cc.SUMMARY_MAX_OUTPUT_TOKENS
 
-    empty_client = _FakeClient(output_text="   ")
+    empty_client = _AsyncFakeClient(output_text="   ")
     with pytest.raises(ValueError):
-        cc.summarize([{"role": "user", "content": "hi"}], None, client=empty_client, model="m")
+        _run(cc.summarize_async([{"role": "user", "content": "hi"}], None, client=empty_client, model="m"))
 
 
-def test_summarize_uses_previous_summary_fold_forward(load_module) -> None:
+def test_summarize_async_uses_previous_summary_fold_forward(load_module) -> None:
     cc = load_module("context_compact", "context_compact.py")
-    client = _FakeClient(output_text="updated")
+    client = _AsyncFakeClient(output_text="updated")
 
-    cc.summarize(
+    _run(cc.summarize_async(
         [{"role": "user", "content": "new work"}],
         None,
         client=client,
         model="m",
         previous_summary="old summary",
-    )
+    ))
 
     prompt = client.captured["input"][-1]["content"]
     assert "<previous-summary>\nold summary\n</previous-summary>" in prompt
@@ -219,21 +203,21 @@ def test_provider_extra_body_threads_to_side_call(load_module, tmp_path) -> None
     cc.TRANSCRIPT_DIR = tmp_path
     routing = {"provider": {"only": ["moonshotai"], "allow_fallbacks": False}}
 
-    # summarize forwards extra_body verbatim to responses.create
-    client = _FakeClient()
-    cc.summarize([{"role": "user", "content": "hi"}], None, client=client, model="m",
-                 extra_body=routing)
+    # summarize_async forwards extra_body verbatim to responses.create
+    client = _AsyncFakeClient()
+    _run(cc.summarize_async([{"role": "user", "content": "hi"}], None, client=client, model="m",
+                 extra_body=routing))
     assert client.captured["extra_body"] == routing
 
-    # compact_history threads it down to the same side-call
-    client2 = _FakeClient()
+    # compact_history_async threads it down to the same side-call
+    client2 = _AsyncFakeClient()
     state = types.SimpleNamespace(messages=list(_droppable_history(cc)), last_input_tokens=0)
-    cc.compact_history(state, source="auto", client=client2, model="m", extra_body=routing)
+    _run(cc.compact_history_async(state, source="auto", client=client2, model="m", extra_body=routing))
     assert client2.captured["extra_body"] == routing
 
     # default (no pinning) leaves routing unset -> SDK no-op
-    client3 = _FakeClient()
-    cc.summarize([{"role": "user", "content": "hi"}], None, client=client3, model="m")
+    client3 = _AsyncFakeClient()
+    _run(cc.summarize_async([{"role": "user", "content": "hi"}], None, client=client3, model="m"))
     assert client3.captured["extra_body"] is None
 
 
@@ -276,7 +260,7 @@ def _droppable_history(cc):
     ]
 
 
-def test_compact_history_happy_path(load_module, tmp_path) -> None:
+def test_compact_history_async_happy_path(load_module, tmp_path) -> None:
     cc = load_module("context_compact", "context_compact.py")
     cc.TRANSCRIPT_DIR = tmp_path / "transcripts"
     cc.TODO = types.SimpleNamespace(has_active_plan=lambda: False, render=lambda: "")
@@ -284,10 +268,16 @@ def test_compact_history_happy_path(load_module, tmp_path) -> None:
     messages = _droppable_history(cc)
     state = types.SimpleNamespace(messages=list(messages), last_input_tokens=5000)
     original_list_id = id(state.messages)
+    client = _AsyncFakeClient()
 
-    result = cc.compact_history(
-        state, source="manual", focus="foo", client=_FakeClient(), model="m"
-    )
+    result = _run(cc.compact_history_async(
+        state,
+        source="manual",
+        focus="foo",
+        client=client,
+        model="m",
+    ))
+
     assert result is not None and result.source == "manual"
     assert id(state.messages) == original_list_id, "history mutated in place (alias-safe)"
     assert len(state.messages) == 1, "short compacted history becomes summary-only"
@@ -296,32 +286,10 @@ def test_compact_history_happy_path(load_module, tmp_path) -> None:
     assert state.last_input_tokens == result.tokens_after
     assert (tmp_path / "transcripts").exists()
     assert result.transcript_path.endswith(".jsonl")
-
-
-def test_compact_history_async_happy_path(load_module, tmp_path) -> None:
-    cc = load_module("context_compact", "context_compact.py")
-    cc.TRANSCRIPT_DIR = tmp_path / "transcripts"
-    cc.TODO = types.SimpleNamespace(has_active_plan=lambda: False, render=lambda: "")
-
-    state = types.SimpleNamespace(messages=list(_droppable_history(cc)), last_input_tokens=5000)
-    client = _AsyncFakeClient()
-
-    result = _run(cc.compact_history_async(
-        state,
-        source="auto",
-        focus="async",
-        client=client,
-        model="m",
-    ))
-
-    assert result is not None and result.source == "auto"
-    assert len(state.messages) == 1
-    assert state.messages[0]["content"].startswith(cc.SUMMARY_PREFIX)
-    assert state.last_input_tokens == result.tokens_after
     assert client.captured["max_output_tokens"] == cc.SUMMARY_MAX_OUTPUT_TOKENS
 
 
-def test_compact_history_preserves_recent_tail(load_module, tmp_path) -> None:
+def test_compact_history_async_preserves_recent_tail(load_module, tmp_path) -> None:
     cc = load_module("context_compact", "context_compact.py")
     cc.TRANSCRIPT_DIR = tmp_path / "transcripts"
     cc.TODO = types.SimpleNamespace(has_active_plan=lambda: False, render=lambda: "")
@@ -338,7 +306,7 @@ def test_compact_history_preserves_recent_tail(load_module, tmp_path) -> None:
         {"role": "assistant", "content": "recent answer"},
     ], last_input_tokens=5000)
 
-    result = cc.compact_history(state, source="manual", client=_FakeClient(), model="m")
+    result = _run(cc.compact_history_async(state, source="manual", client=_AsyncFakeClient(), model="m"))
 
     assert result is not None
     assert state.messages[0]["content"].startswith(cc.SUMMARY_PREFIX)
@@ -347,18 +315,18 @@ def test_compact_history_preserves_recent_tail(load_module, tmp_path) -> None:
     assert state.messages[3]["type"] == "function_call_output"
 
 
-def test_compact_history_folds_forward_previous_summary(load_module, tmp_path) -> None:
+def test_compact_history_async_folds_forward_previous_summary(load_module, tmp_path) -> None:
     cc = load_module("context_compact", "context_compact.py")
     cc.TRANSCRIPT_DIR = tmp_path / "transcripts"
     cc.TODO = types.SimpleNamespace(has_active_plan=lambda: False, render=lambda: "")
-    client = _FakeClient(output_text="updated summary")
+    client = _AsyncFakeClient(output_text="updated summary")
     state = types.SimpleNamespace(messages=[
         cc.build_summary_message("old summary"),
         {"role": "user", "content": "new completed request"},
         {"role": "assistant", "content": "new completed answer"},
     ], last_input_tokens=5000)
 
-    result = cc.compact_history(state, source="manual", client=client, model="m")
+    result = _run(cc.compact_history_async(state, source="manual", client=client, model="m"))
 
     assert result is not None
     assert len(state.messages) == 1
@@ -367,29 +335,29 @@ def test_compact_history_folds_forward_previous_summary(load_module, tmp_path) -
     assert "<previous-summary>\nold summary\n</previous-summary>" in client.captured["input"][-1]["content"]
 
 
-def test_compact_history_aborts_on_summary_failure(load_module, tmp_path) -> None:
+def test_compact_history_async_aborts_on_summary_failure(load_module, tmp_path) -> None:
     cc = load_module("context_compact", "context_compact.py")
     cc.TRANSCRIPT_DIR = tmp_path / "transcripts"
 
-    class _Boom:
+    class _AsyncBoom:
         class responses:
             @staticmethod
-            def create(**kwargs):
+            async def create(**kwargs):
                 raise RuntimeError("api down")
 
     messages = _droppable_history(cc)
     state = types.SimpleNamespace(messages=list(messages), last_input_tokens=5000)
-    result = cc.compact_history(state, source="auto", client=_Boom(), model="m")
+    result = _run(cc.compact_history_async(state, source="auto", client=_AsyncBoom(), model="m"))
     assert result is None, "failure returns None"
     assert state.messages == messages, "history is left untouched on failure"
 
 
-def test_compact_history_noop_when_nothing_to_compact(load_module) -> None:
+def test_compact_history_async_noop_when_nothing_to_compact(load_module) -> None:
     cc = load_module("context_compact", "context_compact.py")
     state = types.SimpleNamespace(
         messages=[{"role": "user", "content": "hi"}], last_input_tokens=10
     )
-    assert cc.compact_history(state, source="manual", client=_FakeClient(), model="m") is None
+    assert _run(cc.compact_history_async(state, source="manual", client=_AsyncFakeClient(), model="m")) is None
 
 
 # --------------------------------------------------------------------------- #
