@@ -458,7 +458,7 @@ def test_run_one_turn_subagent_accepts_after_max_attempts(load_module, monkeypat
 
     assert outcome is not None
     assert outcome.final_text == "Short."
-    # SummaryStopGate has no give-up note: no nudge or warning is appended.
+    # ReportStopGate has no give-up note: no nudge or warning is appended.
     assert state.messages[-1] == {"role": "assistant", "content": "Short."}
 
 

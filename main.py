@@ -254,7 +254,7 @@ class TodoStopGate:
         )
 
 
-class SummaryStopGate:
+class ReportStopGate:
     def __init__(self, min_length: int, max_nudges: int):
         self.min_length = min_length
         self.max_nudges = max_nudges
@@ -283,7 +283,7 @@ EXPLORE_SUBAGENT_CONFIG = AgentConfig(
     tools=EXPLORE_TOOLS,
     registry=EXPLORE_TOOL_REGISTRY,
     max_api_calls=MAX_SUBAGENT_API_CALLS,
-    stop_gate=SummaryStopGate(SUMMARY_MIN_LENGTH, SUMMARY_CONTINUATION_ATTEMPTS),
+    stop_gate=ReportStopGate(SUMMARY_MIN_LENGTH, SUMMARY_CONTINUATION_ATTEMPTS),
 )
 
 
