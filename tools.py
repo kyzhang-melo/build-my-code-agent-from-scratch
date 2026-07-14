@@ -11,6 +11,14 @@ from typing import Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
+from permissions import (
+    PermissionBehavior,
+    PermissionDecision,
+    PermissionService,
+    is_sensitive_path,
+    permission_denied_output,
+)
+
 
 WORKDIR = Path.cwd()
 TOOL_OUTPUT_PREVIEW_CHARS = 500
@@ -27,6 +35,22 @@ EXCLUDE_DIRS = {
     ".pytest_cache",
     ".claude",
 }
+SENSITIVE_GLOB_PATTERNS = (
+    ".env",
+    ".env.*",
+    "*.key",
+    "*.pem",
+    "*.p12",
+    "*.pfx",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "credentials",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "id_rsa",
+)
 
 # Budget for a single tool output handed back to the model. Char-based (chars
 # ~= 4x tokens); a token-aware policy can replace it later without touching callers.
@@ -746,6 +770,7 @@ def _glob_walk(base: Path, tail: str, include_dirs: bool) -> list[Path]:
 
 def _format_glob_matches(pattern: str, base: Path, matches: list[Path], limit: int) -> str:
     matches = [path for path in matches if not _glob_excluded(path.relative_to(base))]
+    matches = [path for path in matches if not is_sensitive_path(path.resolve(), WORKDIR)]
     matches.sort()
     total = len(matches)
     if total == 0:
@@ -835,6 +860,10 @@ def run_grep(
             args.append("--ignore-case")
         if glob:
             args.extend(["--glob", glob])
+        # Apply sensitive excludes last so a caller-supplied include glob cannot
+        # re-include files that must stay out of model context.
+        for sensitive_pattern in SENSITIVE_GLOB_PATTERNS:
+            args.extend(["--glob", f"!{sensitive_pattern}"])
         if output_mode == "files_with_matches":
             args.append("--files-with-matches")
         elif output_mode == "count_matches":
@@ -1036,20 +1065,30 @@ def parse_tool_args(raw_arguments) -> tuple[dict, str | None]:
     return parsed, None
 
 
+def _tool_call_preview(tool_name: str, args: dict) -> str:
+    if tool_name == "bash":
+        return f"$ {args.get('command', '')}"
+    if tool_name == "write_file":
+        content = args.get("content", "")
+        size = len(content) if isinstance(content, str) else "?"
+        return f"# write_file path={args.get('path', '')!r} chars={size}"
+    if tool_name == "edit_file":
+        return f"# edit_file path={args.get('path', '')!r}"
+    return f"# {tool_name} {args}"
+
+
 async def run_tool_call_async(
     item,
     registry: dict[str, ToolRuntimeSpec] | None = None,
+    permission_service: PermissionService | None = None,
+    permission_source: str = "parent",
 ) -> tuple[dict, bool]:
     used_todo = item.name == "todo"
     args, parse_error = parse_tool_args(item.arguments)
     active_registry = registry or TOOL_REGISTRY
     spec = active_registry.get(item.name)
 
-    if item.name == "bash":
-        preview = args.get("command", "") if isinstance(args, dict) else ""
-        print(f"\033[33m$ {preview}\033[0m")
-    else:
-        print(f"\033[33m# {item.name} {args}\033[0m")
+    print(f"\033[33m{_tool_call_preview(item.name, args)}\033[0m")
 
     if parse_error:
         output = f"Error: invalid arguments for tool '{item.name}': {parse_error}"
@@ -1062,10 +1101,26 @@ async def run_tool_call_async(
         except Exception as e:
             output = f"Error: invalid arguments for tool '{item.name}': {e}"
         else:
-            try:
-                output = await spec.execute(params)
-            except Exception as e:
-                output = f"Error: tool '{item.name}' failed: {e}"
+            decision = None
+            if permission_service is not None:
+                try:
+                    decision = await permission_service.authorize(
+                        item.name,
+                        params.model_dump(by_alias=True),
+                        source=permission_source,
+                    )
+                except Exception:
+                    decision = PermissionDecision(
+                        PermissionBehavior.DENY,
+                        "Permission check failed; the tool was not executed.",
+                    )
+            if decision is not None and decision.behavior is PermissionBehavior.DENY:
+                output = permission_denied_output(item.name, decision)
+            else:
+                try:
+                    output = await spec.execute(params)
+                except Exception as e:
+                    output = f"Error: tool '{item.name}' failed: {e}"
 
     # Bound the output for the model's context at the one chokepoint every tool
     # flows through. `todo` is control-plane state (small, structured); `read_file`
@@ -1089,8 +1144,12 @@ async def run_tool_call_async(
 def run_tool_call(
     item,
     registry: dict[str, ToolRuntimeSpec] | None = None,
+    permission_service: PermissionService | None = None,
+    permission_source: str = "parent",
 ) -> tuple[dict, bool]:
-    return _run_async_from_sync(run_tool_call_async(item, registry))
+    return _run_async_from_sync(
+        run_tool_call_async(item, registry, permission_service, permission_source)
+    )
 
 
 def _run_async_from_sync(awaitable):
@@ -1123,6 +1182,8 @@ def _partition_tool_calls(
 async def execute_tool_calls_async(
     tool_calls,
     registry: dict[str, ToolRuntimeSpec] | None = None,
+    permission_service: PermissionService | None = None,
+    permission_source: str = "parent",
 ) -> tuple[list[dict], bool]:
     active_registry = registry or TOOL_REGISTRY
     results = []
@@ -1133,7 +1194,15 @@ async def execute_tool_calls_async(
             for start in range(0, len(batch), MAX_PARALLEL_TOOL_CALLS):
                 chunk = batch[start:start + MAX_PARALLEL_TOOL_CALLS]
                 chunk_results = await asyncio.gather(
-                    *(run_tool_call_async(item, active_registry) for item in chunk)
+                    *(
+                        run_tool_call_async(
+                            item,
+                            active_registry,
+                            permission_service,
+                            permission_source,
+                        )
+                        for item in chunk
+                    )
                 )
                 for tool_result, called_todo in chunk_results:
                     if called_todo:
@@ -1141,7 +1210,12 @@ async def execute_tool_calls_async(
                     results.append(tool_result)
         else:
             for item in batch:
-                tool_result, called_todo = await run_tool_call_async(item, active_registry)
+                tool_result, called_todo = await run_tool_call_async(
+                    item,
+                    active_registry,
+                    permission_service,
+                    permission_source,
+                )
                 if called_todo:
                     used_todo = True
                 results.append(tool_result)
@@ -1151,5 +1225,14 @@ async def execute_tool_calls_async(
 def execute_tool_calls(
     tool_calls,
     registry: dict[str, ToolRuntimeSpec] | None = None,
+    permission_service: PermissionService | None = None,
+    permission_source: str = "parent",
 ) -> tuple[list[dict], bool]:
-    return _run_async_from_sync(execute_tool_calls_async(tool_calls, registry))
+    return _run_async_from_sync(
+        execute_tool_calls_async(
+            tool_calls,
+            registry,
+            permission_service,
+            permission_source,
+        )
+    )

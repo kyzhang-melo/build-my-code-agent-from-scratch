@@ -14,6 +14,18 @@ def test_input_prompt_marks_ansi_sequences_as_nonprinting(load_module) -> None:
     assert main_module.INPUT_PROMPT == "\001\033[36m\002s01 >> \001\033[0m\002"
 
 
+def test_permission_mode_commands(load_module, capsys) -> None:
+    main_module = load_module("main", "main.py")
+
+    assert _run(main_module.handle_command("/mode plan", [])) is True
+    assert main_module.PERMISSION_MANAGER.mode.value == "plan"
+    assert _run(main_module.handle_command("/permissions", [])) is True
+
+    output = capsys.readouterr().out
+    assert "mode=plan" in output
+    assert "session-approved paths: none" in output
+
+
 def _todo_params(items: list[dict]):
     return sys.modules["tools"].TodoParams.model_validate({"items": items})
 
@@ -48,7 +60,7 @@ def test_run_one_turn_full_iteration(load_module, monkeypatch) -> None:
 
     monkeypatch.setattr(main_module, "client", _client_for_response(fake_response, captured))
 
-    async def fake_execute(_output):
+    async def fake_execute(_output, **_kwargs):
         return ([{"type": "function_call_output", "call_id": "c1", "output": "ok"}], False)
 
     monkeypatch.setattr(main_module, "execute_tool_calls_async", fake_execute)
@@ -95,7 +107,7 @@ def test_run_one_turn_surfaces_intermediate_text_with_tool_calls(load_module, mo
     fake_response = types.SimpleNamespace(output=[function_call], output_text="INTERIM SUMMARY")
     monkeypatch.setattr(main_module, "client", _client_for_response(fake_response))
 
-    async def fake_execute(_output):
+    async def fake_execute(_output, **_kwargs):
         return ([{"type": "function_call_output", "call_id": "c1", "output": "ok"}], False)
 
     monkeypatch.setattr(main_module, "execute_tool_calls_async", fake_execute)
@@ -277,7 +289,7 @@ def test_run_one_turn_tool_calls_extend_messages(load_module, monkeypatch) -> No
     fake_response = types.SimpleNamespace(output=[function_call], output_text="")
     monkeypatch.setattr(main_module, "client", _client_for_response(fake_response))
 
-    async def fake_execute(_output):
+    async def fake_execute(_output, **_kwargs):
         return ([{"type": "function_call_output", "call_id": "c1", "output": "ok"}], False)
 
     monkeypatch.setattr(main_module, "execute_tool_calls_async", fake_execute)

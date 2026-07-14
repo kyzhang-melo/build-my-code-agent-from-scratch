@@ -31,6 +31,9 @@ PARENT_SYSTEM = (
     "in that message, not just a list of completed steps; for code changes, state what changed and why. "
     "Completing todo items is not itself a final answer. "
     "Never refer to something you produced in an earlier step as if the user has already seen it."
+    " Some tool calls may be denied by the permission system. When that happens, do not retry "
+    "the same call or attempt to bypass the restriction through another tool. Use a permitted "
+    "alternative when possible; otherwise explain the limitation to the user."
 )
 
 EXPLORE_SUBAGENT_SYSTEM = (

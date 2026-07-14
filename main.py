@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import re
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -17,12 +18,14 @@ from typing import Literal, Protocol
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from message_utils import normalize_messages, response_item_to_dict
+from permissions import PermissionManager, PermissionMode, PermissionService, TerminalApprovalHandler
 from prompts import EXPLORE_SUBAGENT_SYSTEM, GLOB_DISCOVERY_RULES, PARENT_SYSTEM
 from tools import (
     EXPLORE_TOOL_REGISTRY,
     EXPLORE_TOOLS,
     TODO,
     TOOLS,
+    WORKDIR,
     configure_task_runner,
     execute_tool_calls_async,
 )
@@ -114,6 +117,12 @@ COMPACT_TRIGGER_RATIO = 0.85
 # still works). The destructive rewrite is backed by a .transcripts/ snapshot.
 AUTO_COMPACT_ENABLED = os.getenv("AUTO_COMPACT", "1") != "0"
 
+PERMISSION_MANAGER = PermissionManager(WORKDIR)
+PERMISSION_SERVICE = PermissionService(
+    manager=PERMISSION_MANAGER,
+    handler=TerminalApprovalHandler(interactive=sys.stdin.isatty()),
+)
+
 
 def normalize_model_id(model_id: str) -> str:
     """vendor/model:route -> model  (moonshotai/kimi-k2.5:exacto -> kimi-k2.5)."""
@@ -195,6 +204,8 @@ class AgentConfig:
     max_api_calls: int
     stop_gate: StopGate
     registry: dict | None = None
+    permission_service: PermissionService | None = None
+    permission_source: str = "parent"
     # Sink for assistant text as it is produced; None means do not surface it.
     # Display is intentionally decoupled from loop termination: text that rides
     # along with tool calls is shown here, not only the final no-tool message.
@@ -274,6 +285,7 @@ PARENT_CONFIG = AgentConfig(
     tools=TOOLS,
     max_api_calls=MAX_API_CALLS_PER_USER_TURN,
     stop_gate=TodoStopGate(TODO, TODO_CONTRACT_MAX_NUDGES),
+    permission_service=PERMISSION_SERVICE,
     on_text=emit_assistant_text,
 )
 
@@ -282,6 +294,8 @@ EXPLORE_SUBAGENT_CONFIG = AgentConfig(
     system=EXPLORE_SUBAGENT_SYSTEM,
     tools=EXPLORE_TOOLS,
     registry=EXPLORE_TOOL_REGISTRY,
+    permission_service=PERMISSION_SERVICE,
+    permission_source="subagent:explore",
     max_api_calls=MAX_SUBAGENT_API_CALLS,
     stop_gate=ReportStopGate(SUMMARY_MIN_LENGTH, SUMMARY_CONTINUATION_ATTEMPTS),
 )
@@ -297,8 +311,17 @@ def build_subagent_prompt(prompt: str) -> str:
 
 async def execute_configured_tool_calls(tool_calls, config: AgentConfig) -> tuple[list[dict], bool]:
     if config.registry is None:
-        return await execute_tool_calls_async(tool_calls)
-    return await execute_tool_calls_async(tool_calls, config.registry)
+        return await execute_tool_calls_async(
+            tool_calls,
+            permission_service=config.permission_service,
+            permission_source=config.permission_source,
+        )
+    return await execute_tool_calls_async(
+        tool_calls,
+        config.registry,
+        permission_service=config.permission_service,
+        permission_source=config.permission_source,
+    )
 
 
 async def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) -> StepOutcome | None:
@@ -520,12 +543,41 @@ async def cmd_compact(arg: str, history: list) -> None:
 
 
 async def cmd_help(arg: str, history: list) -> None:
-    print("commands: /compact [focus]  |  /help   (q or exit to quit)")
+    print(
+        "commands: /compact [focus]  |  /mode <default|plan>  |  "
+        "/permissions  |  /help   (q or exit to quit)"
+    )
+
+
+async def cmd_mode(arg: str, history: list) -> None:
+    value = arg.strip().lower()
+    if value not in {mode.value for mode in PermissionMode}:
+        print("usage: /mode <default|plan>")
+        return
+    PERMISSION_MANAGER.set_mode(value)
+    print(f"[permissions] mode={PERMISSION_MANAGER.mode.value}")
+
+
+async def cmd_permissions(arg: str, history: list) -> None:
+    print(f"[permissions] mode={PERMISSION_MANAGER.mode.value}")
+    paths = sorted(
+        action.removeprefix("file_mutation:")
+        for action in PERMISSION_MANAGER.auto_approve_actions
+        if action.startswith("file_mutation:")
+    )
+    if not paths:
+        print("[permissions] session-approved paths: none")
+        return
+    print("[permissions] session-approved paths:")
+    for path in paths:
+        print(f"  {path}")
 
 
 COMMANDS = {
     "compact": cmd_compact,
     "help": cmd_help,
+    "mode": cmd_mode,
+    "permissions": cmd_permissions,
 }
 
 
