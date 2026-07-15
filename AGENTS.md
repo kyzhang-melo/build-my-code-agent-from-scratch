@@ -4,12 +4,15 @@ Guidelines for contributors and coding agents working in this repository.
 
 ## Project Goal
 
-This project is a personal code agent project:
+This project is a personal code-agent learning project. Its current core modules are:
 
-- `main.py`: loop control and app entrypoint
-- `tools.py`: tool schema, tool runtime validation/sanitization, and todo manager
-- `message_utils.py`: message normalization and final assistant text extraction
-- `prompts.py`: system prompt definitions
+- `main.py`: agent loop, CLI entrypoint, Agent configuration, and tool dispatch wiring
+- `tools.py`: tool schemas, runtime validation/sanitization, file/search/shell tools, and todo manager
+- `permissions.py`: workspace safety checks, permission decisions, and terminal approval handling
+- `message_utils.py`: Responses API message normalization and response-item adapters
+- `prompts.py`: parent-agent and exploration-subagent system prompts
+- `context_compact.py`: token estimation, transcript snapshots, and conversation-history compaction
+- `tests/`: behavior-focused pytest coverage for the loop, tools, permissions, paths, and message protocol
 
 Keep changes simple and educational.
 
@@ -18,6 +21,7 @@ Keep changes simple and educational.
 1. Preserve module boundaries.
 - Keep orchestration in `main.py`.
 - Keep tool definitions/runtime execution in `tools.py`.
+- With the evolution of this project, the `tools.py` could be divided into multiple tool scripts and placed in a folder named `tools`.
 - Keep message protocol adapters in `message_utils.py`.
 - Keep prompt text in `prompts.py`.
 
