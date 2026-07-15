@@ -167,12 +167,24 @@ TOOLS = [
     {
         "type": "function",
         "name": "write_file",
-        "description": "Write content to a file in workspace.",
+        "description": (
+            "Create or completely rewrite a workspace file, or append exact content to it. "
+            "Parent directories are created automatically. Use overwrite for new files and "
+            "complete rewrites; use edit_file for precise changes to an existing file."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
                 "content": {"type": "string"},
+                "mode": {
+                    "type": "string",
+                    "enum": ["overwrite", "append"],
+                    "description": (
+                        "overwrite replaces the whole file; append adds content exactly as "
+                        "provided without inserting a newline. Defaults to overwrite."
+                    ),
+                },
             },
             "required": ["path", "content"],
             "additionalProperties": False,
@@ -488,6 +500,7 @@ class WriteFileParams(BaseModel):
 
     path: str = Field(min_length=1)
     content: str
+    mode: Literal["overwrite", "append"] = "overwrite"
 
 
 class EditFileParams(BaseModel):
@@ -700,12 +713,24 @@ def _read_footer(
     return f"[{head}{total_part}{note_part}{hint}]"
 
 
-def run_write(path: str, content: str) -> str:
+def run_write(path: str, content: str, mode: str = "overwrite") -> str:
+    """Create, overwrite, or append to a UTF-8 workspace file."""
     try:
+        if mode not in {"overwrite", "append"}:
+            return "Error: mode must be 'overwrite' or 'append'"
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content)
-        return f"Wrote {len(content)} bytes to {path}"
+        file_mode = "w" if mode == "overwrite" else "a"
+        with fp.open(file_mode, encoding="utf-8", newline="") as handle:
+            handle.write(content)
+        written_bytes = len(content.encode("utf-8"))
+        current_size = fp.stat().st_size
+        if mode == "append":
+            return (
+                f"Appended {written_bytes} bytes to {path} "
+                f"(current size: {current_size} bytes)"
+            )
+        return f"Wrote {written_bytes} bytes to {path} (current size: {current_size} bytes)"
     except Exception as e:
         return f"Error: {e}"
 
@@ -992,7 +1017,7 @@ def build_tool_registry(
             name="write_file",
             params_model=WriteFileParams,
             sanitize_args=sanitize_file_args,
-            execute=async_tool(lambda params: run_write(params.path, params.content)),
+            execute=async_tool(lambda params: run_write(params.path, params.content, params.mode)),
         ),
         "edit_file": ToolRuntimeSpec(
             name="edit_file",
@@ -1071,7 +1096,10 @@ def _tool_call_preview(tool_name: str, args: dict) -> str:
     if tool_name == "write_file":
         content = args.get("content", "")
         size = len(content) if isinstance(content, str) else "?"
-        return f"# write_file path={args.get('path', '')!r} chars={size}"
+        return (
+            f"# write_file path={args.get('path', '')!r} "
+            f"mode={args.get('mode', 'overwrite')!r} chars={size}"
+        )
     if tool_name == "edit_file":
         return f"# edit_file path={args.get('path', '')!r}"
     return f"# {tool_name} {args}"
