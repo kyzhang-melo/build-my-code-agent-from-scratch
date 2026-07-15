@@ -19,11 +19,14 @@ def test_file_tools_stay_inside_workspace(load_module) -> None:
     assert escaped_write.startswith("Error: Path escapes workspace")
 
     rel = "tests/_tmp_boundary.txt"
-    write_out = tools.run_write(rel, "hello world")
-    assert write_out.startswith("Wrote ")
+    try:
+        write_out = tools.run_write(rel, "hello world")
+        assert write_out.startswith("Wrote ")
 
-    assert "hello world" in tools.run_read(rel, limit=1)
-    assert tools.run_edit(rel, "hello", "HELLO") == f"Edited {rel}"
-    assert "HELLO world" in tools.run_read(rel)
-
-    Path(tools.WORKDIR / rel).unlink(missing_ok=True)
+        assert "hello world" in tools.run_read(rel, limit=1)
+        edit_out = tools.run_edit(rel, "hello", "HELLO")
+        assert edit_out.startswith(f"Edited {rel}")
+        assert "1 replacement" in edit_out
+        assert "HELLO world" in tools.run_read(rel)
+    finally:
+        Path(tools.WORKDIR / rel).unlink(missing_ok=True)

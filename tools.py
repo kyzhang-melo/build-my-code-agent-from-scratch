@@ -2,8 +2,10 @@ import asyncio
 import fnmatch
 import json
 import os
+import re
 import shutil
 import subprocess
+import unicodedata
 from collections.abc import Awaitable
 from dataclasses import dataclass
 from pathlib import Path
@@ -193,15 +195,41 @@ TOOLS = [
     {
         "type": "function",
         "name": "edit_file",
-        "description": "Replace exact text in a workspace file.",
+        "description": (
+            "Make one or more precise replacements in an existing workspace file. Each "
+            "old_text must identify one unique, non-overlapping region of the original file. "
+            "Put separate changes to the same file in one edits array. Keep old_text as small "
+            "as possible while including enough surrounding context to make it unique."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "old_text": {"type": "string"},
-                "new_text": {"type": "string"},
+                "edits": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": (
+                        "Targeted replacements, all matched against the original file rather "
+                        "than against the result of earlier edits."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_text": {
+                                "type": "string",
+                                "description": "Unique text to replace; may span multiple lines.",
+                            },
+                            "new_text": {
+                                "type": "string",
+                                "description": "Replacement text; may span multiple lines.",
+                            },
+                        },
+                        "required": ["old_text", "new_text"],
+                        "additionalProperties": False,
+                    },
+                },
             },
-            "required": ["path", "old_text", "new_text"],
+            "required": ["path", "edits"],
             "additionalProperties": False,
         },
     },
@@ -503,12 +531,18 @@ class WriteFileParams(BaseModel):
     mode: Literal["overwrite", "append"] = "overwrite"
 
 
+class EditParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    old_text: str = Field(min_length=1)
+    new_text: str
+
+
 class EditFileParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     path: str = Field(min_length=1)
-    old_text: str = Field(min_length=1)
-    new_text: str
+    edits: list[EditParams] = Field(min_length=1)
 
 
 class GlobParams(BaseModel):
@@ -735,14 +769,254 @@ def run_write(path: str, content: str, mode: str = "overwrite") -> str:
         return f"Error: {e}"
 
 
-def run_edit(path: str, old_text: str, new_text: str) -> str:
+@dataclass(frozen=True)
+class _MatchedEdit:
+    edit_index: int
+    match_index: int
+    match_length: int
+    new_text: str
+
+
+_FUZZY_CHAR_TRANSLATION = str.maketrans({
+    "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'",
+    "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"',
+    "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-",
+    "\u2014": "-", "\u2015": "-", "\u2212": "-",
+    "\u00a0": " ", "\u2002": " ", "\u2003": " ", "\u2004": " ",
+    "\u2005": " ", "\u2006": " ", "\u2007": " ", "\u2008": " ",
+    "\u2009": " ", "\u200a": " ", "\u202f": " ", "\u205f": " ",
+    "\u3000": " ",
+})
+
+
+def _normalize_to_lf(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _detect_line_ending(text: str) -> str:
+    first_lf = text.find("\n")
+    if first_lf != -1 and first_lf > 0 and text[first_lf - 1] == "\r":
+        return "\r\n"
+    return "\n"
+
+
+def _restore_line_endings(text: str, line_ending: str) -> str:
+    return text.replace("\n", "\r\n") if line_ending == "\r\n" else text
+
+
+def _normalize_for_fuzzy_match(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text)
+    normalized = "\n".join(line.rstrip() for line in normalized.split("\n"))
+    return normalized.translate(_FUZZY_CHAR_TRANSLATION)
+
+
+def _find_occurrences(content: str, needle: str) -> list[int]:
+    positions: list[int] = []
+    start = 0
+    while True:
+        index = content.find(needle, start)
+        if index == -1:
+            return positions
+        positions.append(index)
+        start = index + len(needle)
+
+
+def _split_lines_with_endings(content: str) -> list[str]:
+    return re.findall(r"[^\n]*\n|[^\n]+", content)
+
+
+def _line_spans(content: str) -> list[tuple[int, int]]:
+    offset = 0
+    spans = []
+    for line in _split_lines_with_endings(content):
+        spans.append((offset, offset + len(line)))
+        offset += len(line)
+    return spans
+
+
+def _replacement_line_range(
+    spans: list[tuple[int, int]],
+    replacement: _MatchedEdit,
+) -> tuple[int, int]:
+    replacement_start = replacement.match_index
+    replacement_end = replacement.match_index + replacement.match_length
+    start_line = next(
+        (i for i, (start, end) in enumerate(spans) if start <= replacement_start < end),
+        -1,
+    )
+    if start_line == -1:
+        raise ValueError("Replacement range is outside the file content")
+    end_line = start_line
+    while end_line < len(spans) and spans[end_line][1] < replacement_end:
+        end_line += 1
+    if end_line >= len(spans):
+        raise ValueError("Replacement range is outside the file content")
+    return start_line, end_line + 1
+
+
+def _apply_replacements(
+    content: str,
+    replacements: list[_MatchedEdit],
+    *,
+    offset: int = 0,
+) -> str:
+    result = content
+    for replacement in reversed(replacements):
+        index = replacement.match_index - offset
+        result = (
+            result[:index]
+            + replacement.new_text
+            + result[index + replacement.match_length:]
+        )
+    return result
+
+
+def _apply_fuzzy_replacements_preserving_lines(
+    original_content: str,
+    fuzzy_content: str,
+    replacements: list[_MatchedEdit],
+) -> str:
+    """Rewrite touched lines in fuzzy space while copying untouched lines verbatim."""
+    original_lines = _split_lines_with_endings(original_content)
+    spans = _line_spans(fuzzy_content)
+    if len(original_lines) != len(spans):
+        raise ValueError("Fuzzy normalization changed the file's line structure")
+
+    groups: list[dict] = []
+    for replacement in sorted(replacements, key=lambda item: item.match_index):
+        start_line, end_line = _replacement_line_range(spans, replacement)
+        current = groups[-1] if groups else None
+        if current is not None and start_line < current["end_line"]:
+            current["end_line"] = max(current["end_line"], end_line)
+            current["replacements"].append(replacement)
+        else:
+            groups.append({
+                "start_line": start_line,
+                "end_line": end_line,
+                "replacements": [replacement],
+            })
+
+    result: list[str] = []
+    original_line_index = 0
+    for group in groups:
+        start_line = group["start_line"]
+        end_line = group["end_line"]
+        result.extend(original_lines[original_line_index:start_line])
+        group_start = spans[start_line][0]
+        group_end = spans[end_line - 1][1]
+        result.append(_apply_replacements(
+            fuzzy_content[group_start:group_end],
+            group["replacements"],
+            offset=group_start,
+        ))
+        original_line_index = end_line
+    result.extend(original_lines[original_line_index:])
+    return "".join(result)
+
+
+def _coerce_edits(
+    edits_or_old_text: list[EditParams] | list[dict] | str,
+    new_text: str | None,
+) -> list[EditParams]:
+    if isinstance(edits_or_old_text, str):
+        if new_text is None:
+            raise ValueError("new_text is required with a legacy old_text argument")
+        return [EditParams(old_text=edits_or_old_text, new_text=new_text)]
+    if new_text is not None:
+        raise ValueError("new_text cannot be combined with an edits list")
+    return [
+        edit if isinstance(edit, EditParams) else EditParams.model_validate(edit)
+        for edit in edits_or_old_text
+    ]
+
+
+def _prepare_edits(
+    content: str,
+    edits: list[EditParams],
+    path: str,
+) -> tuple[str, str]:
+    normalized_edits = [
+        EditParams(
+            old_text=_normalize_to_lf(edit.old_text),
+            new_text=_normalize_to_lf(edit.new_text),
+        )
+        for edit in edits
+    ]
+
+    needs_fuzzy = False
+    for i, edit in enumerate(normalized_edits):
+        if edit.old_text in content:
+            continue
+        if _normalize_for_fuzzy_match(edit.old_text) in _normalize_for_fuzzy_match(content):
+            needs_fuzzy = True
+            continue
+        raise ValueError(
+            f"Could not find edits[{i}].old_text in {path}. Re-read the file and copy "
+            "the target text, including its whitespace and newlines."
+        )
+
+    match_content = _normalize_for_fuzzy_match(content) if needs_fuzzy else content
+    matched: list[_MatchedEdit] = []
+    for i, edit in enumerate(normalized_edits):
+        old_text = _normalize_for_fuzzy_match(edit.old_text) if needs_fuzzy else edit.old_text
+        positions = _find_occurrences(match_content, old_text)
+        if not positions:
+            raise ValueError(
+                f"Could not find edits[{i}].old_text in {path}. Re-read the file and copy "
+                "the target text, including its whitespace and newlines."
+            )
+        if len(positions) > 1:
+            raise ValueError(
+                f"Found {len(positions)} occurrences of edits[{i}].old_text in {path}. "
+                "Add surrounding context so the target is unique."
+            )
+        matched.append(_MatchedEdit(i, positions[0], len(old_text), edit.new_text))
+
+    matched.sort(key=lambda item: item.match_index)
+    for previous, current in zip(matched, matched[1:]):
+        if previous.match_index + previous.match_length > current.match_index:
+            raise ValueError(
+                f"edits[{previous.edit_index}] and edits[{current.edit_index}] overlap in "
+                f"{path}. Merge them into one edit or target disjoint regions."
+            )
+
+    new_content = (
+        _apply_fuzzy_replacements_preserving_lines(content, match_content, matched)
+        if needs_fuzzy
+        else _apply_replacements(match_content, matched)
+    )
+    if new_content == content:
+        raise ValueError(
+            f"No changes made to {path}. The replacements produced identical content."
+        )
+    return content, new_content
+
+
+def run_edit(
+    path: str,
+    edits_or_old_text: list[EditParams] | list[dict] | str,
+    new_text: str | None = None,
+) -> str:
+    """Apply validated, unique, non-overlapping edits to one UTF-8 file."""
     try:
+        edits = _coerce_edits(edits_or_old_text, new_text)
+        if not edits:
+            return "Error: edits must contain at least one replacement"
         fp = safe_path(path)
-        content = fp.read_text()
-        if old_text not in content:
-            return f"Error: Text not found in {path}"
-        fp.write_text(content.replace(old_text, new_text, 1))
-        return f"Edited {path}"
+        if not fp.exists():
+            return f"Error: File not found: {path}. Use write_file to create it first."
+        if not fp.is_file():
+            return f"Error: Not a file: {path}"
+
+        raw_content = fp.read_bytes().decode("utf-8", errors="replace")
+        bom = "\ufeff" if raw_content.startswith("\ufeff") else ""
+        content_without_bom = raw_content[len(bom):]
+        line_ending = _detect_line_ending(content_without_bom)
+        normalized_content = _normalize_to_lf(content_without_bom)
+        _, edited_content = _prepare_edits(normalized_content, edits, path)
+        final_content = bom + _restore_line_endings(edited_content, line_ending)
+        fp.write_text(final_content, encoding="utf-8", newline="")
+        return f"Edited {path}: applied {len(edits)} replacement(s)"
     except Exception as e:
         return f"Error: {e}"
 
@@ -967,6 +1241,32 @@ def sanitize_file_args(args: dict) -> dict:
     return clean
 
 
+def sanitize_edit_args(args: dict) -> dict:
+    """Normalize common model mistakes before strict Pydantic validation."""
+    clean = sanitize_file_args(args)
+    edits = clean.get("edits")
+    if isinstance(edits, str):
+        try:
+            parsed = json.loads(edits)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if isinstance(parsed, list):
+                clean["edits"] = parsed
+
+    old_text = clean.get("old_text")
+    new_text = clean.get("new_text")
+    if isinstance(old_text, str) and isinstance(new_text, str):
+        current_edits = clean.get("edits")
+        if isinstance(current_edits, list):
+            clean["edits"] = [*current_edits, {"old_text": old_text, "new_text": new_text}]
+        elif current_edits is None:
+            clean["edits"] = [{"old_text": old_text, "new_text": new_text}]
+        clean.pop("old_text", None)
+        clean.pop("new_text", None)
+    return clean
+
+
 def sanitize_search_args(args: dict) -> dict:
     clean = dict(args)
     for key in ("pattern", "path", "directory"):
@@ -1022,8 +1322,8 @@ def build_tool_registry(
         "edit_file": ToolRuntimeSpec(
             name="edit_file",
             params_model=EditFileParams,
-            sanitize_args=sanitize_file_args,
-            execute=async_tool(lambda params: run_edit(params.path, params.old_text, params.new_text)),
+            sanitize_args=sanitize_edit_args,
+            execute=async_tool(lambda params: run_edit(params.path, params.edits)),
         ),
         "glob": ToolRuntimeSpec(
             name="glob",
@@ -1101,7 +1401,9 @@ def _tool_call_preview(tool_name: str, args: dict) -> str:
             f"mode={args.get('mode', 'overwrite')!r} chars={size}"
         )
     if tool_name == "edit_file":
-        return f"# edit_file path={args.get('path', '')!r}"
+        edits = args.get("edits")
+        count = len(edits) if isinstance(edits, list) else "?"
+        return f"# edit_file path={args.get('path', '')!r} edits={count}"
     return f"# {tool_name} {args}"
 
 
