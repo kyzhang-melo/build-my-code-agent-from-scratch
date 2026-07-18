@@ -1,11 +1,15 @@
 import asyncio
+import codecs
 import fnmatch
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
+import time
 import unicodedata
+from collections import deque
 from collections.abc import Awaitable
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +21,7 @@ from permissions import (
     PermissionBehavior,
     PermissionDecision,
     PermissionService,
+    bash_hard_deny_reason,
     is_sensitive_path,
     permission_denied_output,
 )
@@ -59,6 +64,23 @@ SENSITIVE_GLOB_PATTERNS = (
 TOOL_OUTPUT_MAX_CHARS = 48000
 TOOL_OUTPUT_MAX_LINE_CHARS = 2000
 DEFAULT_MAX_PARALLEL_TOOL_CALLS = 4
+
+# `run_bash` bounds its own output before returning a structured result.  Leave
+# room for the metadata block and a truncation marker so the dispatcher-level
+# truncation chokepoint never has to rewrite that result.
+BASH_TIMEOUT_SECONDS = 120
+BASH_TERMINATE_GRACE_SECONDS = 0.5
+BASH_POST_EXIT_DRAIN_SECONDS = 0.5
+BASH_PROCESS_POLL_SECONDS = 0.01
+BASH_READ_CHUNK_BYTES = 8192
+BASH_OUTPUT_MAX_CHARS = 46_000
+BASH_ERROR_MAX_CHARS = 500
+BASH_CANDIDATE_PATHS = (
+    "/bin/bash",
+    "/usr/bin/bash",
+    "/usr/local/bin/bash",
+    "/opt/homebrew/bin/bash",
+)
 
 # read_file bounds. The reader self-bounds and is exempt from truncate_middle
 # (see run_tool_call), so these are the sole authority over read output size.
@@ -128,7 +150,7 @@ TOOLS = [
     {
         "type": "function",
         "name": "bash",
-        "description": "Run a shell command in the current workspace.",
+        "description": "Run a non-interactive Bash command in the current workspace.",
         "parameters": {
             "type": "object",
             "properties": {"command": {"type": "string"}},
@@ -573,25 +595,267 @@ class TaskParams(BaseModel):
     description: str = "exploration"
 
 
-def run_bash(command: str) -> str:
-    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-    if any(item in command for item in dangerous):
-        return "Error: dangerous command!"
-    try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            cwd=str(WORKDIR),
-            capture_output=True,
-            text=True,
-            timeout=120,
+@dataclass
+class BashResult:
+    """The bounded, model-facing outcome of one foreground shell command."""
+
+    status: Literal["completed", "failed", "timed_out", "execution_error", "blocked"]
+    exit_code: int | None
+    output: str
+    truncated: bool
+    duration_ms: int
+    timed_out: bool = False
+    post_exit_cleanup: bool = False
+
+    def render(self) -> str:
+        output = self.output or "(no output)"
+        return (
+            f"[status] {self.status}\n"
+            f"[exit_code] {self.exit_code if self.exit_code is not None else 'null'}\n"
+            f"[timed_out] {str(self.timed_out).lower()}\n"
+            f"[post_exit_cleanup] {str(self.post_exit_cleanup).lower()}\n"
+            f"[truncated] {str(self.truncated).lower()}\n"
+            f"[duration_ms] {self.duration_ms}\n\n"
+            f"{output}"
         )
-    except subprocess.TimeoutExpired:
-        return "Error: Timeout (120s)."
-    except (FileNotFoundError, OSError) as e:
-        return f"Error: {e}."
-    output = (result.stdout + result.stderr).strip()
-    return output if output else "(no output)"
+
+
+class _BashOutputBuffer:
+    """Keep the useful tail of a command's combined output within a char budget."""
+
+    def __init__(self, max_chars: int | None = None) -> None:
+        self.max_chars = BASH_OUTPUT_MAX_CHARS if max_chars is None else max_chars
+        self._chunks: deque[str] = deque()
+        self._chars = 0
+        self._discarded_chars = 0
+
+    @property
+    def truncated(self) -> bool:
+        return self._discarded_chars > 0
+
+    def append(self, text: str) -> None:
+        if not text:
+            return
+        self._chunks.append(text)
+        self._chars += len(text)
+
+        while self._chars > self.max_chars and self._chunks:
+            excess = self._chars - self.max_chars
+            first = self._chunks.popleft()
+            if len(first) <= excess:
+                self._discarded_chars += len(first)
+                self._chars -= len(first)
+                continue
+            self._discarded_chars += excess
+            self._chunks.appendleft(first[excess:])
+            self._chars -= excess
+
+    def render(self) -> str:
+        content = "".join(self._chunks)
+        if not self.truncated:
+            return content
+
+        discarded = self._discarded_chars
+        # The marker is part of the bounded result too. Its digit count depends
+        # on the final discarded count, so recompute until both fit together.
+        while True:
+            marker = f"[... {discarded} chars of earlier command output discarded ...]\n"
+            available = max(0, self.max_chars - len(marker))
+            extra_discarded = max(0, len(content) - available)
+            if extra_discarded == 0:
+                return marker + content
+            content = content[extra_discarded:]
+            discarded += extra_discarded
+
+
+async def _pump_bash_stream(
+    stream: asyncio.StreamReader,
+    queue: asyncio.Queue[str | None],
+) -> None:
+    """Decode one pipe incrementally and forward chunks in observed arrival order."""
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    try:
+        while chunk := await stream.read(BASH_READ_CHUNK_BYTES):
+            text = decoder.decode(chunk)
+            if text:
+                await queue.put(text)
+        tail = decoder.decode(b"", final=True)
+        if tail:
+            await queue.put(tail)
+    finally:
+        await queue.put(None)
+
+
+async def _collect_bash_output(
+    queue: asyncio.Queue[str | None],
+    buffer: _BashOutputBuffer,
+) -> None:
+    finished_streams = 0
+    while finished_streams < 2:
+        item = await queue.get()
+        if item is None:
+            finished_streams += 1
+        else:
+            buffer.append(item)
+
+
+def _signal_bash_process_group(proc: asyncio.subprocess.Process, sig: int) -> None:
+    if proc.pid is None:
+        return
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+async def _terminate_bash_process_group(proc: asyncio.subprocess.Process) -> None:
+    """Stop the shell and descendants, escalating from TERM to KILL when needed."""
+    _signal_bash_process_group(proc, signal.SIGTERM)
+    try:
+        await asyncio.wait_for(_wait_for_bash_exit(proc), timeout=BASH_TERMINATE_GRACE_SECONDS)
+    except TimeoutError:
+        _signal_bash_process_group(proc, signal.SIGKILL)
+        await _wait_for_bash_exit(proc)
+
+
+async def _wait_for_bash_exit(proc: asyncio.subprocess.Process) -> int:
+    """Wait for the shell process itself, not for inherited output pipes to close."""
+    # asyncio.Process.wait() may wait for pipe transports to close when a
+    # descendant inherits stdout/stderr. `returncode` changes when the shell
+    # exits, which lets the caller apply a separate post-exit drain policy.
+    while proc.returncode is None:
+        await asyncio.sleep(BASH_PROCESS_POLL_SECONDS)
+    return proc.returncode
+
+
+def _limit_bash_error(error: BaseException) -> str:
+    text = str(error).strip() or type(error).__name__
+    if len(text) > BASH_ERROR_MAX_CHARS:
+        return text[:BASH_ERROR_MAX_CHARS] + " [...error truncated]"
+    return text
+
+
+def _resolve_bash_executable() -> str:
+    """Find Bash from fixed absolute paths without consulting $SHELL or PATH."""
+    for raw_path in BASH_CANDIDATE_PATHS:
+        path = Path(raw_path)
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+    checked = ", ".join(BASH_CANDIDATE_PATHS)
+    raise FileNotFoundError(f"Bash executable not found. Checked: {checked}")
+
+
+async def run_bash(command: str) -> str:
+    """Run one foreground Bash command with bounded, merged output."""
+    started_at = time.monotonic()
+    deny_reason = bash_hard_deny_reason(command, WORKDIR)
+    if deny_reason:
+        return BashResult(
+            status="blocked",
+            exit_code=None,
+            output=deny_reason,
+            truncated=False,
+            duration_ms=0,
+        ).render()
+
+    buffer = _BashOutputBuffer()
+    queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=64)
+    proc: asyncio.subprocess.Process | None = None
+    reader_tasks: tuple[asyncio.Task[None], asyncio.Task[None]] | None = None
+    collector_task: asyncio.Task[None] | None = None
+
+    try:
+        bash_path = _resolve_bash_executable()
+        proc = await asyncio.create_subprocess_exec(
+            bash_path,
+            "-c",
+            command,
+            cwd=str(WORKDIR),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        assert proc.stdout is not None and proc.stderr is not None
+        reader_tasks = (
+            asyncio.create_task(_pump_bash_stream(proc.stdout, queue)),
+            asyncio.create_task(_pump_bash_stream(proc.stderr, queue)),
+        )
+        collector_task = asyncio.create_task(_collect_bash_output(queue, buffer))
+
+        try:
+            exit_code = await asyncio.wait_for(
+                _wait_for_bash_exit(proc),
+                timeout=BASH_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            await _terminate_bash_process_group(proc)
+            await asyncio.gather(*reader_tasks)
+            await collector_task
+            buffer.append(f"\n\n[Command killed by timeout ({BASH_TIMEOUT_SECONDS}s)]")
+            return BashResult(
+                status="timed_out",
+                exit_code=None,
+                output=buffer.render(),
+                truncated=buffer.truncated,
+                duration_ms=round((time.monotonic() - started_at) * 1000),
+                timed_out=True,
+            ).render()
+
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(collector_task),
+                timeout=BASH_POST_EXIT_DRAIN_SECONDS,
+            )
+        except TimeoutError:
+            # A completed shell whose streams stay open has left descendants
+            # behind. Foreground bash has no background-task contract, so clean
+            # the group rather than hanging the agent indefinitely.
+            await _terminate_bash_process_group(proc)
+            await asyncio.gather(*reader_tasks)
+            await collector_task
+            buffer.append("\n\n[Command descendants were terminated after the shell exited.]")
+            return BashResult(
+                status="failed",
+                exit_code=exit_code,
+                output=buffer.render(),
+                truncated=buffer.truncated,
+                duration_ms=round((time.monotonic() - started_at) * 1000),
+                post_exit_cleanup=True,
+            ).render()
+
+        status: Literal["completed", "failed"] = "completed" if exit_code == 0 else "failed"
+        return BashResult(
+            status=status,
+            exit_code=exit_code,
+            output=buffer.render(),
+            truncated=buffer.truncated,
+            duration_ms=round((time.monotonic() - started_at) * 1000),
+        ).render()
+    except asyncio.CancelledError:
+        if proc is not None:
+            await _terminate_bash_process_group(proc)
+        raise
+    except (FileNotFoundError, OSError, RuntimeError) as error:
+        if proc is not None:
+            await _terminate_bash_process_group(proc)
+        buffer.append(f"Command execution failed: {_limit_bash_error(error)}")
+        return BashResult(
+            status="execution_error",
+            exit_code=None,
+            output=buffer.render(),
+            truncated=buffer.truncated,
+            duration_ms=round((time.monotonic() - started_at) * 1000),
+        ).render()
+    finally:
+        if reader_tasks is not None:
+            for task in reader_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*reader_tasks, return_exceptions=True)
+        if collector_task is not None and not collector_task.done():
+            collector_task.cancel()
+            await asyncio.gather(collector_task, return_exceptions=True)
 
 
 def safe_path(path: str) -> Path:
@@ -1304,7 +1568,7 @@ def build_tool_registry(
             name="bash",
             params_model=BashParams,
             sanitize_args=sanitize_bash_args,
-            execute=async_tool(lambda params: run_bash(params.command)),
+            execute=lambda params: run_bash(params.command),
         ),
         "read_file": ToolRuntimeSpec(
             name="read_file",
@@ -1454,9 +1718,10 @@ async def run_tool_call_async(
 
     # Bound the output for the model's context at the one chokepoint every tool
     # flows through. `todo` is control-plane state (small, structured); `read_file`
-    # self-bounds (line caps + a footer) and middle-truncation would break its line
-    # numbering -- leave both verbatim; everything else gets middle-truncated if oversized.
-    if item.name not in ("todo", "read_file"):
+    # self-bounds (line caps + a footer) and `bash` self-bounds before rendering
+    # structured metadata -- leave these verbatim; everything else gets
+    # middle-truncated if oversized.
+    if item.name not in ("todo", "read_file", "bash"):
         output = truncate_middle(output)
 
     if item.name == "todo":
