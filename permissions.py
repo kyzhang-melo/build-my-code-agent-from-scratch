@@ -251,6 +251,7 @@ class PermissionService:
             source=source,
         )
         response = await self.handler.request(request)
+        print(f"[approval] kind={response.kind} tool={request.tool_name}")
         if response.kind == "approve_for_session" and request.allow_for_session:
             self.manager.remember(request.action)
             return PermissionDecision(
