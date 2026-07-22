@@ -314,8 +314,6 @@ def bash_hard_deny_reason(command: str, workdir: Path) -> str | None:
         return "Privilege escalation with sudo is blocked."
     if re.search(r"\b(?:shutdown|reboot|halt|poweroff)\b", command):
         return "System shutdown commands are blocked."
-    if re.search(r"(?:>|>>|1>|2>)\s*/dev/", command):
-        return "Writing to device files is blocked."
 
     for match in re.finditer(r"(?:^|[;&|]\s*)cd\s+([^\s;&|]+)", command):
         target = _shell_path(match.group(1), workdir)
@@ -323,8 +321,17 @@ def bash_hard_deny_reason(command: str, workdir: Path) -> str | None:
             return f"Changing directory outside the workspace is blocked: {match.group(1)}"
 
     for match in re.finditer(r"(?:^|[\s;&|])(?:[12])?>>?\s*([^\s;&|]+)", command):
-        target = _shell_path(match.group(1), workdir)
-        if target is not None and not target.is_relative_to(workdir):
+        raw_target = match.group(1)
+        target = _shell_path(raw_target, workdir)
+        if target is None:
+            if _looks_like_dev_path(raw_target):
+                return "Writing to device files is blocked."
+            continue
+        if _is_devnull(target):
+            continue
+        if target.is_relative_to(Path("/dev")):
+            return "Writing to device files is blocked."
+        if not target.is_relative_to(workdir):
             return f"Redirecting output outside the workspace is blocked: {match.group(1)}"
 
     for segment in re.split(r"&&|\|\||;|\|", command):
@@ -352,3 +359,13 @@ def _shell_path(raw: str, workdir: Path) -> Path | None:
     if not value or any(char in value for char in "$`*?{}[]"):
         return None
     return (workdir / os.path.expanduser(value)).resolve()
+
+
+def _is_devnull(target: Path | None) -> bool:
+    """True if the resolved redirect target is /dev/null."""
+    return target is not None and target == Path("/dev/null")
+
+
+def _looks_like_dev_path(raw: str) -> bool:
+    """True if an unresolved redirect target explicitly starts in /dev/."""
+    return raw.strip("'\"").startswith("/dev/")

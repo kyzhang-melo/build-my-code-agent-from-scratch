@@ -89,7 +89,9 @@ def test_symlink_write_escape_is_denied(load_module, tmp_path) -> None:
     [
         ("sudo echo hi", "sudo"),
         ("shutdown -h now", "shutdown"),
-        ("echo x > /dev/null", "device"),
+        ("echo x > /dev/tty", "device"),
+        ("echo x > /dev/sda1", "device"),
+        ("echo x > /dev/random", "device"),
         ("cd .. && pwd", "outside"),
         ("echo x > ../outside.txt", "outside"),
         ("rm -rf ../outside", "outside"),
@@ -102,6 +104,57 @@ def test_bash_hard_deny_checks(load_module, command, expected) -> None:
 
     assert reason is not None
     assert expected in reason.lower()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find . 2>/dev/null",
+        "echo x >/dev/null",
+        "echo x >>/dev/null",
+        "echo x 1>/dev/null",
+        "cmd 2>>/dev/null",
+        "echo x > '/dev/null'",
+        "echo x > /dev/../dev/null",
+        "grep -r foo . 2>/dev/null | head -10",
+    ],
+)
+def test_devnull_redirects_are_allowed(load_module, command) -> None:
+    permissions = permission_module
+
+    reason = permissions.bash_hard_deny_reason(command, Path.cwd())
+
+    assert reason is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "device_target=zero; printf 'x' > /dev/$device_target",
+        "printf 'x' > /dev/zer*",
+        "printf 'x' > /dev/{zero,null}",
+    ],
+)
+def test_dynamic_dev_redirects_are_hard_denied(load_module, command) -> None:
+    permissions = permission_module
+    manager = permissions.PermissionManager(Path.cwd())
+
+    reason = permissions.bash_hard_deny_reason(command, Path.cwd())
+    decision = manager.check("bash", {"command": command})
+
+    assert reason is not None
+    assert "device" in reason.lower()
+    assert decision.behavior.value == "deny"
+    assert "device" in decision.reason.lower()
+
+
+def test_devnull_bash_returns_ask_not_allow(load_module) -> None:
+    permissions = permission_module
+    manager = permissions.PermissionManager(Path.cwd())
+
+    decision = manager.check("bash", {"command": "find . 2>/dev/null"})
+
+    assert decision.behavior.value == "ask"
 
 
 def test_file_session_approval_is_path_scoped(load_module) -> None:
