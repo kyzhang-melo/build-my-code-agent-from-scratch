@@ -1,0 +1,10 @@
+{
+  "name": "read and summarize without modifying",
+  "prompt": "Read the files a.py and b.py and tell me, in your final message, what each module's function does. Do not modify any files.",
+  "timeout": 180,
+  "expect": {
+    "tools_used": [{ "name": "read_file" }],
+    "tools_not_used": ["write_file", "edit_file"],
+    "final_answer_contains": ["add", "multiply"]
+  }
+}

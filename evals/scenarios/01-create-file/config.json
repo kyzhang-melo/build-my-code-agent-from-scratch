@@ -1,0 +1,10 @@
+{
+  "name": "create a file",
+  "prompt": "Create a file named hello.txt in the current directory containing exactly this text: Hello, world!",
+  "timeout": 180,
+  "expect": {
+    "files_exist": ["hello.txt"],
+    "file_contains": [{ "file": "hello.txt", "contains": "Hello, world!" }],
+    "tools_used": [{ "name": "write_file", "args_contains": { "path": "hello.txt" } }]
+  }
+}

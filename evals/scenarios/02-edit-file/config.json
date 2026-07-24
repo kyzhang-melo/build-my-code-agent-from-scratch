@@ -1,0 +1,9 @@
+{
+  "name": "edit an existing file",
+  "prompt": "Edit the file greeting.txt and change the word 'Hello' to 'Goodbye'. Leave everything else unchanged.",
+  "timeout": 180,
+  "expect": {
+    "file_contains": [{ "file": "greeting.txt", "contains": "Goodbye, friend." }],
+    "tools_used": [{ "name": "edit_file", "args_contains": { "path": "greeting.txt" } }]
+  }
+}

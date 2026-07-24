@@ -1,0 +1,10 @@
+{
+  "name": "delegate broad exploration to a subagent",
+  "prompt": "I need a thorough investigation of how the 'widget' system works across this codebase: where widgets are defined, registered, and rendered, spanning multiple files. This is broad research requiring several searches, so use the task tool to delegate the exploration, then summarize the findings in your final message.",
+  "timeout": 300,
+  "expect": {
+    "tools_used": [{ "name": "task" }],
+    "tools_not_used": ["write_file", "edit_file"],
+    "final_answer_contains": ["widget"]
+  }
+}

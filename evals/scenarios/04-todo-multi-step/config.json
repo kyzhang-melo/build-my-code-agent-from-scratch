@@ -1,0 +1,10 @@
+{
+  "name": "multi-step task tracked with todo",
+  "prompt": "This is a multi-step task; use the todo tool to plan and track it. Step 1: create a file config.json containing {\"debug\": true}. Step 2: create a file README.md that documents that config.json enables debug mode.",
+  "timeout": 240,
+  "expect": {
+    "files_exist": ["config.json", "README.md"],
+    "file_contains": [{ "file": "config.json", "contains": "debug" }],
+    "tools_used": [{ "name": "todo" }, { "name": "write_file" }]
+  }
+}

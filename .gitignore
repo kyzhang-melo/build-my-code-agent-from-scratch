@@ -24,3 +24,6 @@ dist/
 
 # Pre-compaction transcript snapshots
 .transcripts/
+
+# Eval run artifacts (workspaces kept on failure, reports)
+evals/.runs/
