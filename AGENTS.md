@@ -12,7 +12,16 @@ This project is a personal code-agent learning project. Its current core modules
 - `message_utils.py`: Responses API message normalization and response-item adapters
 - `prompts.py`: parent-agent and exploration-subagent system prompts
 - `context_compact.py`: token estimation, transcript snapshots, and conversation-history compaction
+- `trace.py`: lightweight runtime events and trace sinks used to observe tool, permission, todo, and stop-gate behavior
+- `evals/`: live-model behavioral evaluations that run isolated scenarios, consume runtime traces, assert workspace and agent outcomes, and generate JSON/Markdown reports
 - `tests/`: behavior-focused pytest coverage for the loop, tools, permissions, paths, and message protocol
+
+The eval module complements the deterministic pytest suite with manually invoked,
+end-to-end checks against a live model. Each scenario uses a fresh conversation,
+workspace, todo state, permission service, and in-memory trace sink so behavioral
+regressions can be attributed to one isolated task. Because these evaluations
+consume real model tokens and are non-deterministic, they must remain separate
+from the default test suite.
 
 Keep changes simple and educational.
 

@@ -6,8 +6,11 @@ A learning project that refactors a monolithic code-agent loop into a multi-file
 
 - `main.py`: agent loop, OpenAI client initialization, CLI entrypoint.
 - `tools.py`: tool schema and shell tool execution logic.
+- `permissions.py`: workspace safety policy and approval handling.
+- `trace.py`: lightweight runtime trace events and in-memory/JSONL sinks.
 - `prompts.py`: system prompt definition.
 - `message_utils.py`: message protocol adapter helpers.
+- `evals/`: live-model behavioral scenarios, assertions, and reports.
 
 ## Requirements
 
@@ -93,6 +96,57 @@ Run all tests including marked ones:
 ```bash
 pytest -m "integration or slow or not (integration or slow)"
 ```
+
+### Runtime Trace and Behavioral Evals
+
+The runtime trace records structured facts at the agent's execution boundaries.
+It captures requested and completed tool calls, permission decisions, todo
+transitions, and stop-gate decisions. Trace events contain safe metadata such
+as paths, modes, counts, durations, and statuses; they do not retain full file
+contents, shell commands, edit text, task prompts, or tool output.
+
+Normal CLI runs use a no-op trace sink and do not create trace files. The eval
+runner executes the real parent agent in-process and injects an in-memory trace
+sink for each scenario. It combines those trace events with workspace and final
+answer assertions to verify end-to-end agent behavior. Each scenario receives a
+fresh conversation state, isolated workspace, todo state, and permission
+service.
+
+Live-model evals require the same OpenRouter environment variables as
+`main.py`. They cost tokens and may be non-deterministic; the regular `pytest`
+suite never runs them.
+
+List available scenarios:
+
+```bash
+./.venv/bin/python evals/run_evals.py --list
+```
+
+Run all scenarios:
+
+```bash
+./.venv/bin/python evals/run_evals.py
+```
+
+Run one scenario or override the model:
+
+```bash
+./.venv/bin/python evals/run_evals.py --scenario 01-create-file
+./.venv/bin/python evals/run_evals.py \
+  --scenario 01-create-file \
+  --model moonshotai/kimi-k2.5:exacto
+```
+
+Passing scenario workspaces are deleted by default, while failed workspaces are
+kept for debugging. Preserve every workspace with:
+
+```bash
+./.venv/bin/python evals/run_evals.py --keep-workspaces
+```
+
+Reports are written to `evals/.runs/<timestamp>/report.json` and
+`summary.md`. See [`evals/README.md`](evals/README.md) for the scenario format,
+trace-backed assertions, and implementation notes.
 
 ### Testing Conventions
 
