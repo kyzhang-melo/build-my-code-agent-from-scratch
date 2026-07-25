@@ -13,6 +13,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal
 
+from trace import TraceContext, emit_trace
+
 
 READ_ONLY_TOOLS = {"read_file", "glob", "grep", "task", "todo"}
 CONTROLLED_TOOLS = {"write_file", "edit_file", "bash"}
@@ -231,40 +233,82 @@ class PermissionService:
         tool_input: dict,
         *,
         source: str = "parent",
+        trace_context: TraceContext | None = None,
+        call_id: str | None = None,
     ) -> PermissionDecision:
-        decision = self.manager.check(tool_name, tool_input)
-        if decision.behavior is not PermissionBehavior.ASK:
+        policy = self.manager.check(tool_name, tool_input)
+
+        def finish(
+            decision: PermissionDecision,
+            approval_kind: ApprovalKind | Literal["not_required"],
+        ) -> PermissionDecision:
+            action = decision.action
+            if action and action.startswith("bash:"):
+                action = f"bash:<{len(action) - len('bash:')} chars>"
+            trace_reason = decision.reason
+            feedback_marker = " Feedback: "
+            if feedback_marker in trace_reason:
+                prefix, feedback = trace_reason.split(feedback_marker, 1)
+                trace_reason = f"{prefix}{feedback_marker}<redacted:{len(feedback)} chars>"
+            emit_trace(
+                trace_context,
+                "permission.decided",
+                call_id=call_id,
+                source=source,
+                tool_name=tool_name,
+                policy_behavior=policy.behavior.value,
+                approval_kind=approval_kind,
+                decision=(
+                    "allow"
+                    if decision.behavior is PermissionBehavior.ALLOW
+                    else "deny"
+                ),
+                reason=trace_reason,
+                action=action,
+            )
             return decision
 
+        if policy.behavior is not PermissionBehavior.ASK:
+            return finish(policy, "not_required")
+
         if self.handler is None:
-            return PermissionDecision(
-                PermissionBehavior.DENY,
-                "Interactive approval is unavailable in headless mode.",
-                action=decision.action,
+            return finish(
+                PermissionDecision(
+                    PermissionBehavior.DENY,
+                    "Interactive approval is unavailable in headless mode.",
+                    action=policy.action,
+                ),
+                "reject",
             )
 
         request = ApprovalRequest(
             tool_name=tool_name,
-            action=decision.action or f"tool:{tool_name}",
-            description=self.manager.describe_request(tool_name, tool_input, decision),
-            allow_for_session=decision.allow_for_session,
+            action=policy.action or f"tool:{tool_name}",
+            description=self.manager.describe_request(tool_name, tool_input, policy),
+            allow_for_session=policy.allow_for_session,
             source=source,
         )
         response = await self.handler.request(request)
         print(f"[approval] kind={response.kind} tool={request.tool_name}")
         if response.kind == "approve_for_session" and request.allow_for_session:
             self.manager.remember(request.action)
-            return PermissionDecision(
-                PermissionBehavior.ALLOW,
-                "Approved for this session.",
-                action=request.action,
-                allow_for_session=True,
+            return finish(
+                PermissionDecision(
+                    PermissionBehavior.ALLOW,
+                    "Approved for this session.",
+                    action=request.action,
+                    allow_for_session=True,
+                ),
+                response.kind,
             )
         if response.kind == "approve":
-            return PermissionDecision(
-                PermissionBehavior.ALLOW,
-                "Approved by user.",
-                action=request.action,
+            return finish(
+                PermissionDecision(
+                    PermissionBehavior.ALLOW,
+                    "Approved by user.",
+                    action=request.action,
+                ),
+                response.kind,
             )
 
         reason = "Permission denied by user."
@@ -272,7 +316,10 @@ class PermissionService:
             reason += f" Feedback: {response.feedback}"
         if source != "parent":
             reason += " Do not retry or attempt to bypass this restriction indirectly."
-        return PermissionDecision(PermissionBehavior.DENY, reason, action=request.action)
+        return finish(
+            PermissionDecision(PermissionBehavior.DENY, reason, action=request.action),
+            response.kind,
+        )
 
 
 def permission_denied_output(tool_name: str, decision: PermissionDecision) -> str:

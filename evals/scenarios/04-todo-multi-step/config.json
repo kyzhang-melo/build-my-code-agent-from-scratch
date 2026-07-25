@@ -5,6 +5,8 @@
   "expect": {
     "files_exist": ["config.json", "README.md"],
     "file_contains": [{ "file": "config.json", "contains": "debug" }],
-    "tools_used": [{ "name": "todo" }, { "name": "write_file" }]
+    "tools_used": [{ "name": "todo" }, { "name": "write_file" }],
+    "todo_transitions": [{ "to": "completed" }],
+    "stop_gate_decisions": [{ "gate": "todo", "decision": "allow" }]
   }
 }

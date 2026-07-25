@@ -11,7 +11,7 @@ import re
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal, Protocol
 
@@ -29,6 +29,7 @@ from tools import (
     configure_task_runner,
     execute_tool_calls_async,
 )
+from trace import TraceContext, emit_trace
 from context_compact import (
     SUMMARY_PREFIX,
     compact_history_async,
@@ -189,6 +190,7 @@ class TurnOutcome:
 class StopGate(Protocol):
     # Decides whether a turn may end when the model stops calling tools.
     max_nudges: int
+    name: str
 
     def check(self, final_text: str) -> str | None:
         """Return None to accept the stop, or a nudge message to push back."""
@@ -209,6 +211,7 @@ class AgentConfig:
     registry: dict | None = None
     permission_service: PermissionService | None = None
     permission_source: str = "parent"
+    trace_context: TraceContext = field(default_factory=TraceContext)
     # Sink for assistant text as it is produced; None means do not surface it.
     # Display is intentionally decoupled from loop termination: text that rides
     # along with tool calls is shown here, not only the final no-tool message.
@@ -249,6 +252,8 @@ def debug_empty_output_text_response(response) -> None:
 
 
 class TodoStopGate:
+    name = "todo"
+
     def __init__(self, todo, max_nudges: int):
         self.todo = todo
         self.max_nudges = max_nudges
@@ -269,6 +274,8 @@ class TodoStopGate:
 
 
 class ReportStopGate:
+    name = "report"
+
     def __init__(self, min_length: int, max_nudges: int):
         self.min_length = min_length
         self.max_nudges = max_nudges
@@ -318,12 +325,14 @@ async def execute_configured_tool_calls(tool_calls, config: AgentConfig) -> tupl
             tool_calls,
             permission_service=config.permission_service,
             permission_source=config.permission_source,
+            trace_context=config.trace_context,
         )
     return await execute_tool_calls_async(
         tool_calls,
         config.registry,
         permission_service=config.permission_service,
         permission_source=config.permission_source,
+        trace_context=config.trace_context,
     )
 
 
@@ -419,6 +428,35 @@ async def run_one_turn(state: LoopState, config: AgentConfig = PARENT_CONFIG) ->
 
         state.empty_response_nudges = 0
         nudge = config.stop_gate.check(response_text)
+        if nudge is None:
+            gate_decision = "allow"
+            gate_reason = "requirements_satisfied"
+            gate_nudge_count = state.nudges
+        elif state.nudges < config.stop_gate.max_nudges:
+            gate_decision = "block"
+            gate_reason = (
+                "unresolved_todos"
+                if config.stop_gate.name == "todo"
+                else "response_too_brief"
+            )
+            gate_nudge_count = state.nudges + 1
+        else:
+            gate_decision = "give_up"
+            gate_reason = (
+                "unresolved_todos"
+                if config.stop_gate.name == "todo"
+                else "nudge_budget_exhausted"
+            )
+            gate_nudge_count = state.nudges
+        emit_trace(
+            config.trace_context,
+            "stop_gate.checked",
+            source=config.permission_source,
+            gate=config.stop_gate.name,
+            decision=gate_decision,
+            nudge_count=gate_nudge_count,
+            reason=gate_reason,
+        )
         if nudge is not None and state.nudges < config.stop_gate.max_nudges:
             # The loop continues, so this text won't become final_text and would
             # otherwise be lost. Surface the rejected answer before nudging.

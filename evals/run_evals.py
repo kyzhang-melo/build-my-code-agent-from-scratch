@@ -34,6 +34,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import main  # noqa: E402  (path setup must happen first)
 import tools  # noqa: E402
+from trace import MemoryTraceSink, TraceContext  # noqa: E402
 from permissions import (  # noqa: E402
     ApprovalRequest,
     ApprovalResponse,
@@ -77,12 +78,6 @@ class Check:
 
 
 @dataclass
-class ToolCall:
-    name: str
-    args: dict
-
-
-@dataclass
 class ScenarioResult:
     name: str
     passed: bool
@@ -92,6 +87,7 @@ class ScenarioResult:
     tool_calls: list[str] = field(default_factory=list)
     api_calls: int = 0
     workspace: str = ""
+    trace_event_count: int = 0
 
 
 def discover_scenarios(only: str | None) -> list[Path]:
@@ -120,16 +116,6 @@ def prepare_workspace(scenario_dir: Path, run_root: Path) -> Path:
     return workspace
 
 
-def extract_tool_calls(messages: list) -> list[ToolCall]:
-    """Pull the function_call trajectory out of the loop's message history."""
-    calls: list[ToolCall] = []
-    for msg in messages:
-        if isinstance(msg, dict) and msg.get("type") == "function_call":
-            args, _ = tools.parse_tool_args(msg.get("arguments", "{}"))
-            calls.append(ToolCall(name=msg.get("name", ""), args=args or {}))
-    return calls
-
-
 # --- Assertion helpers ------------------------------------------------------
 
 def _check_files_exist(workspace: Path, rels: list[str]) -> list[Check]:
@@ -156,17 +142,19 @@ def _check_file_contains(workspace: Path, specs: list[dict]) -> list[Check]:
     return checks
 
 
-def _check_tools_used(calls: list[ToolCall], specs: list[dict]) -> list[Check]:
+def _check_tools_used(events: list[dict], specs: list[dict]) -> list[Check]:
     checks = []
+    completed = [event for event in events if event.get("event") == "tool.completed"]
     for spec in specs:
         name = spec["name"]
         args_contains = spec.get("args_contains", {})
         match = None
-        for call in calls:
-            if call.name != name:
+        for event in completed:
+            if event.get("tool_name") != name:
                 continue
-            if all(str(sub) in str(call.args.get(key, "")) for key, sub in args_contains.items()):
-                match = call
+            arguments = event.get("arguments", {})
+            if all(str(sub) in str(arguments.get(key, "")) for key, sub in args_contains.items()):
+                match = event
                 break
         label = f"tool used: {name}"
         if args_contains:
@@ -176,11 +164,70 @@ def _check_tools_used(calls: list[ToolCall], specs: list[dict]) -> list[Check]:
     return checks
 
 
-def _check_tools_not_used(calls: list[ToolCall], names: list[str]) -> list[Check]:
-    used = {call.name for call in calls}
+def _check_tools_not_used(events: list[dict], names: list[str]) -> list[Check]:
+    used = {
+        event.get("tool_name")
+        for event in events
+        if event.get("event") == "tool.requested"
+    }
     return [Check(f"tool NOT used: {name}", name not in used,
                   "" if name not in used else "tool was called")
             for name in names]
+
+
+def _event_matches(event: dict, spec: dict, aliases: dict[str, str]) -> bool:
+    for key, expected in spec.items():
+        actual_key = aliases.get(key, key)
+        if actual_key == "args_contains":
+            arguments = event.get("arguments", {})
+            if not all(
+                str(value) in str(arguments.get(arg_key, ""))
+                for arg_key, value in expected.items()
+            ):
+                return False
+        elif event.get(actual_key) != expected:
+            return False
+    return True
+
+
+def _check_event_specs(
+    events: list[dict],
+    event_name: str,
+    specs: list[dict],
+    *,
+    label: str,
+    aliases: dict[str, str] | None = None,
+) -> list[Check]:
+    candidates = [event for event in events if event.get("event") == event_name]
+    aliases = aliases or {}
+    checks = []
+    for spec in specs:
+        matched = any(_event_matches(event, spec, aliases) for event in candidates)
+        checks.append(Check(
+            f"{label}: {spec}",
+            matched,
+            "" if matched else "no matching trace event",
+        ))
+    return checks
+
+
+def _check_todo_transitions(events: list[dict], specs: list[dict]) -> list[Check]:
+    transitions = [
+        transition
+        for event in events
+        if event.get("event") == "todo.changed"
+        for transition in event.get("transitions", [])
+    ]
+    return [
+        Check(
+            f"todo transition: {spec}",
+            any(all(transition.get(key) == value for key, value in spec.items())
+                for transition in transitions),
+            "" if any(all(transition.get(key) == value for key, value in spec.items())
+                      for transition in transitions) else "no matching transition",
+        )
+        for spec in specs
+    ]
 
 
 def _check_final_answer(final_text: str, needles: list[str]) -> list[Check]:
@@ -192,13 +239,34 @@ def _check_final_answer(final_text: str, needles: list[str]) -> list[Check]:
     return checks
 
 
-def evaluate(expect: dict, workspace: Path, calls: list[ToolCall],
+def evaluate(expect: dict, workspace: Path, events: list[dict],
              final_text: str) -> list[Check]:
     checks: list[Check] = []
     checks += _check_files_exist(workspace, expect.get("files_exist", []))
     checks += _check_file_contains(workspace, expect.get("file_contains", []))
-    checks += _check_tools_used(calls, expect.get("tools_used", []))
-    checks += _check_tools_not_used(calls, expect.get("tools_not_used", []))
+    checks += _check_tools_used(events, expect.get("tools_used", []))
+    checks += _check_tools_not_used(events, expect.get("tools_not_used", []))
+    checks += _check_event_specs(
+        events,
+        "tool.completed",
+        expect.get("tool_completed", []),
+        label="tool completed",
+        aliases={"name": "tool_name"},
+    )
+    checks += _check_event_specs(
+        events,
+        "permission.decided",
+        expect.get("permission_decisions", []),
+        label="permission decision",
+        aliases={"tool": "tool_name"},
+    )
+    checks += _check_todo_transitions(events, expect.get("todo_transitions", []))
+    checks += _check_event_specs(
+        events,
+        "stop_gate.checked",
+        expect.get("stop_gate_decisions", []),
+        label="stop gate decision",
+    )
     checks += _check_final_answer(final_text, expect.get("final_answer_contains", []))
     return checks
 
@@ -218,6 +286,12 @@ async def run_scenario(scenario_dir: Path, run_root: Path) -> ScenarioResult:
     tools.TODO.state = tools.PlanningState()
     manager = PermissionManager(workspace.resolve(), mode=PermissionMode.DEFAULT)
     service = PermissionService(manager=manager, handler=AutoApproveHandler())
+    trace_sink = MemoryTraceSink()
+    trace_context = TraceContext(
+        sink=trace_sink,
+        run_id=f"{run_root.name}:{scenario_dir.name}",
+        agent_id="parent",
+    )
 
     # Rewrite the baked-in workspace path (derived from the pristine originals,
     # never a previously-patched value) so both the parent and the explore
@@ -227,6 +301,7 @@ async def run_scenario(scenario_dir: Path, run_root: Path) -> ScenarioResult:
         main.PARENT_CONFIG,
         system=parent_system,
         permission_service=service,
+        trace_context=trace_context,
         on_text=None,
     )
     main.EXPLORE_SUBAGENT_CONFIG = replace(
@@ -249,11 +324,16 @@ async def run_scenario(scenario_dir: Path, run_root: Path) -> ScenarioResult:
         result.error = f"{type(exc).__name__}: {exc}"
         return result
 
-    calls = extract_tool_calls(state.messages)
+    events = trace_sink.events
     result.final_text = outcome.final_text
-    result.tool_calls = [call.name for call in calls]
+    result.tool_calls = [
+        event["tool_name"]
+        for event in events
+        if event.get("event") == "tool.completed"
+    ]
+    result.trace_event_count = len(events)
     result.api_calls = outcome.api_calls
-    result.checks = evaluate(config.get("expect", {}), workspace, calls, outcome.final_text)
+    result.checks = evaluate(config.get("expect", {}), workspace, events, outcome.final_text)
     result.passed = all(check.passed for check in result.checks) and bool(result.checks)
     if not result.checks:
         result.error = "no expectations defined in config.json 'expect'"
@@ -290,6 +370,7 @@ def write_reports(results: list[ScenarioResult], run_root: Path) -> None:
                 "error": r.error,
                 "api_calls": r.api_calls,
                 "tool_calls": r.tool_calls,
+                "trace_event_count": r.trace_event_count,
                 "checks": [{"label": c.label, "passed": c.passed, "detail": c.detail}
                            for c in r.checks],
             }

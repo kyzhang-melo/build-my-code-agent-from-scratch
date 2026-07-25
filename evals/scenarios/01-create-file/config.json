@@ -5,6 +5,8 @@
   "expect": {
     "files_exist": ["hello.txt"],
     "file_contains": [{ "file": "hello.txt", "contains": "Hello, world!" }],
-    "tools_used": [{ "name": "write_file", "args_contains": { "path": "hello.txt" } }]
+    "tools_used": [{ "name": "write_file", "args_contains": { "path": "hello.txt" } }],
+    "tool_completed": [{ "name": "write_file", "status": "success" }],
+    "permission_decisions": [{ "tool": "write_file", "policy_behavior": "ask", "decision": "allow" }]
   }
 }

@@ -25,6 +25,7 @@ from permissions import (
     is_sensitive_path,
     permission_denied_output,
 )
+from trace import TraceContext, emit_trace
 
 
 WORKDIR = Path.cwd()
@@ -1671,37 +1672,175 @@ def _tool_call_preview(tool_name: str, args: dict) -> str:
     return f"# {tool_name} {args}"
 
 
+def _trace_arguments(tool_name: str, args: dict) -> dict:
+    """Project validated tool arguments into non-sensitive trace metadata."""
+    if tool_name == "write_file":
+        content = args.get("content", "")
+        return {
+            "path": args.get("path", ""),
+            "mode": args.get("mode", "overwrite"),
+            "content_chars": len(content) if isinstance(content, str) else 0,
+        }
+    if tool_name == "edit_file":
+        edits = args.get("edits", [])
+        return {
+            "path": args.get("path", ""),
+            "edits_count": len(edits) if isinstance(edits, list) else 0,
+        }
+    if tool_name == "bash":
+        command = args.get("command", "")
+        return {"command_chars": len(command) if isinstance(command, str) else 0}
+    if tool_name == "task":
+        prompt = args.get("prompt", "")
+        return {
+            "description": args.get("description", "exploration"),
+            "prompt_chars": len(prompt) if isinstance(prompt, str) else 0,
+        }
+    if tool_name == "todo":
+        items = args.get("items", [])
+        counts = {"pending": 0, "in_progress": 0, "completed": 0}
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict) and item.get("status", "pending") in counts:
+                    counts[item.get("status", "pending")] += 1
+        return {"item_count": len(items) if isinstance(items, list) else 0,
+                "status_counts": counts}
+    if tool_name == "grep":
+        pattern = args.get("pattern", "")
+        return {
+            key: value
+            for key, value in {
+                "path": args.get("path", "."),
+                "glob": args.get("glob"),
+                "output_mode": args.get("output_mode", "files_with_matches"),
+                "ignore_case": args.get("ignore_case", False),
+                "line_number": args.get("line_number", True),
+                "head_limit": args.get("head_limit", 250),
+                "pattern_chars": len(pattern) if isinstance(pattern, str) else 0,
+            }.items()
+            if value is not None
+        }
+    if tool_name == "glob":
+        pattern = args.get("pattern", "")
+        return {
+            "directory": args.get("directory", "."),
+            "include_dirs": args.get("include_dirs", False),
+            "limit": args.get("limit", 1000),
+            "pattern_chars": len(pattern) if isinstance(pattern, str) else 0,
+        }
+    if tool_name == "read_file":
+        return {
+            "path": args.get("path", ""),
+            "offset": args.get("offset", 1),
+            "limit": args.get("limit", MAX_READ_LINES),
+        }
+    return {"argument_keys": sorted(str(key) for key in args)}
+
+
+def _safe_trace_arguments(tool_name: str, args: dict) -> dict:
+    try:
+        return _trace_arguments(tool_name, args)
+    except Exception:
+        return {"argument_keys": sorted(str(key) for key in args)}
+
+
+def _todo_items_snapshot() -> list[dict]:
+    return [
+        item.model_dump(by_alias=True)
+        for item in TODO.state.items
+    ]
+
+
+def _todo_transitions(before: list[dict], after: list[dict]) -> list[dict]:
+    before_by_content = {item["content"]: item.get("status") for item in before}
+    after_by_content = {item["content"]: item.get("status") for item in after}
+    transitions = []
+    for content in dict.fromkeys([*before_by_content, *after_by_content]):
+        old = before_by_content.get(content)
+        new = after_by_content.get(content)
+        if old != new:
+            transitions.append({"content": content, "from": old, "to": new})
+    return transitions
+
+
+def _tool_reported_error(tool_name: str, output: str) -> bool:
+    if output.startswith("Error:"):
+        return True
+    if tool_name == "bash":
+        return output.startswith("[status] failed") or output.startswith(
+            ("[status] timed_out", "[status] execution_error", "[status] blocked")
+        )
+    return False
+
+
 async def run_tool_call_async(
     item,
     registry: dict[str, ToolRuntimeSpec] | None = None,
     permission_service: PermissionService | None = None,
     permission_source: str = "parent",
+    trace_context: TraceContext | None = None,
 ) -> tuple[dict, bool]:
+    started_at = time.monotonic()
     used_todo = item.name == "todo"
     args, parse_error = parse_tool_args(item.arguments)
     active_registry = registry or TOOL_REGISTRY
     spec = active_registry.get(item.name)
+    status = "success"
+    error_type = None
+    normalized_args = args
+    todo_before = None
+
+    def emit_requested(argument_error: str | None = None) -> None:
+        emit_trace(
+            trace_context,
+            "tool.requested",
+            call_id=item.call_id,
+            source=permission_source,
+            tool_name=item.name,
+            arguments=_safe_trace_arguments(item.name, normalized_args),
+            argument_error=argument_error,
+        )
 
     print(f"\033[33m{_tool_call_preview(item.name, args)}\033[0m")
 
     if parse_error:
+        emit_requested(parse_error)
+        status = "invalid_arguments"
+        error_type = "json_parse"
         output = f"Error: invalid arguments for tool '{item.name}': {parse_error}"
     elif spec is None:
+        emit_requested()
+        status = "unknown_tool"
+        error_type = "unknown_tool"
         output = f"Error: unknown tool '{item.name}'"
     else:
         clean_args = spec.sanitize_args(args)
+        normalized_args = clean_args
         try:
             params = spec.params_model.model_validate(clean_args)
         except Exception as e:
+            emit_requested()
+            status = "invalid_arguments"
+            error_type = "validation"
             output = f"Error: invalid arguments for tool '{item.name}': {e}"
         else:
+            if hasattr(params, "model_dump"):
+                normalized_args = params.model_dump(by_alias=True)
+            emit_requested()
+            if item.name == "todo":
+                try:
+                    todo_before = _todo_items_snapshot()
+                except Exception:
+                    todo_before = None
             decision = None
             if permission_service is not None:
                 try:
                     decision = await permission_service.authorize(
                         item.name,
-                        params.model_dump(by_alias=True),
+                        normalized_args,
                         source=permission_source,
+                        trace_context=trace_context,
+                        call_id=item.call_id,
                     )
                 except Exception:
                     decision = PermissionDecision(
@@ -1709,25 +1848,83 @@ async def run_tool_call_async(
                         "Permission check failed; the tool was not executed.",
                     )
             if decision is not None and decision.behavior is PermissionBehavior.DENY:
+                status = "permission_denied"
+                error_type = "permission_denied"
                 output = permission_denied_output(item.name, decision)
             else:
                 try:
                     output = await spec.execute(params)
+                except asyncio.CancelledError:
+                    emit_trace(
+                        trace_context,
+                        "tool.completed",
+                        call_id=item.call_id,
+                        source=permission_source,
+                        tool_name=item.name,
+                        arguments=_safe_trace_arguments(item.name, normalized_args),
+                        duration_ms=round((time.monotonic() - started_at) * 1000),
+                        success=False,
+                        status="cancelled",
+                        error_type="cancelled",
+                        output_chars=0,
+                        output_truncated=False,
+                    )
+                    raise
                 except Exception as e:
+                    status = "execution_error"
+                    error_type = type(e).__name__
                     output = f"Error: tool '{item.name}' failed: {e}"
+                else:
+                    if _tool_reported_error(item.name, output):
+                        status = "execution_error"
+                        error_type = "tool_reported_error"
+                    if item.name == "todo" and status == "success":
+                        try:
+                            todo_after = _todo_items_snapshot()
+                            transitions = _todo_transitions(todo_before or [], todo_after)
+                        except Exception:
+                            pass
+                        else:
+                            emit_trace(
+                                trace_context,
+                                "todo.changed",
+                                call_id=item.call_id,
+                                source=permission_source,
+                                before=todo_before or [],
+                                after=todo_after,
+                                transitions=transitions,
+                            )
 
+    trace_arguments = _safe_trace_arguments(item.name, normalized_args)
     # Bound the output for the model's context at the one chokepoint every tool
     # flows through. `todo` is control-plane state (small, structured); `read_file`
     # self-bounds (line caps + a footer) and `bash` self-bounds before rendering
     # structured metadata -- leave these verbatim; everything else gets
     # middle-truncated if oversized.
+    original_output_length = len(output)
     if item.name not in ("todo", "read_file", "bash"):
         output = truncate_middle(output)
+    output_truncated = len(output) < original_output_length
 
     if item.name == "todo":
         print(output)
     else:
         print(output[:TOOL_OUTPUT_PREVIEW_CHARS])
+
+    emit_trace(
+        trace_context,
+        "tool.completed",
+        call_id=item.call_id,
+        source=permission_source,
+        tool_name=item.name,
+        arguments=trace_arguments,
+        duration_ms=round((time.monotonic() - started_at) * 1000),
+        success=status == "success",
+        status=status,
+        error_type=error_type,
+        output_chars=len(output),
+        output_truncated=output_truncated,
+    )
 
     return {
         "type": "function_call_output",
@@ -1741,9 +1938,16 @@ def run_tool_call(
     registry: dict[str, ToolRuntimeSpec] | None = None,
     permission_service: PermissionService | None = None,
     permission_source: str = "parent",
+    trace_context: TraceContext | None = None,
 ) -> tuple[dict, bool]:
     return _run_async_from_sync(
-        run_tool_call_async(item, registry, permission_service, permission_source)
+        run_tool_call_async(
+            item,
+            registry,
+            permission_service,
+            permission_source,
+            trace_context,
+        )
     )
 
 
@@ -1779,6 +1983,7 @@ async def execute_tool_calls_async(
     registry: dict[str, ToolRuntimeSpec] | None = None,
     permission_service: PermissionService | None = None,
     permission_source: str = "parent",
+    trace_context: TraceContext | None = None,
 ) -> tuple[list[dict], bool]:
     active_registry = registry or TOOL_REGISTRY
     results = []
@@ -1795,6 +2000,7 @@ async def execute_tool_calls_async(
                             active_registry,
                             permission_service,
                             permission_source,
+                            trace_context,
                         )
                         for item in chunk
                     )
@@ -1810,6 +2016,7 @@ async def execute_tool_calls_async(
                     active_registry,
                     permission_service,
                     permission_source,
+                    trace_context,
                 )
                 if called_todo:
                     used_todo = True
@@ -1822,6 +2029,7 @@ def execute_tool_calls(
     registry: dict[str, ToolRuntimeSpec] | None = None,
     permission_service: PermissionService | None = None,
     permission_source: str = "parent",
+    trace_context: TraceContext | None = None,
 ) -> tuple[list[dict], bool]:
     return _run_async_from_sync(
         execute_tool_calls_async(
@@ -1829,5 +2037,6 @@ def execute_tool_calls(
             registry,
             permission_service,
             permission_source,
+            trace_context,
         )
     )

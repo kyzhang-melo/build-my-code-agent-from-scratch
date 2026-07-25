@@ -54,8 +54,12 @@ For each scenario the runner:
    **auto-approve** handler (so writes/shell run headlessly). Hard denials in
    the permission layer still apply.
 3. Runs the parent agent loop in-process on the scenario `prompt`.
-4. Extracts the tool-call trajectory from the loop history and the agent's
-   final message, then evaluates the `expect` block.
+4. Reads structured runtime trace events from an in-memory sink and evaluates
+   the `expect` block together with workspace state and the final message.
+
+The trace is emitted at the tool execution boundary, so it records what the
+runtime actually validated, authorized, and completed rather than merely what
+the model requested in its response.
 
 A scenario passes only if **all** of its expectations hold.
 
@@ -71,6 +75,10 @@ A scenario passes only if **all** of its expectations hold.
     "file_contains": [{ "file": "hello.txt", "contains": "substring" }],
     "tools_used": [{ "name": "write_file", "args_contains": { "path": "hello.txt" } }],
     "tools_not_used": ["edit_file"],
+    "tool_completed": [{ "name": "write_file", "status": "success" }],
+    "permission_decisions": [{ "tool": "write_file", "decision": "allow" }],
+    "todo_transitions": [{ "content": "Write file", "to": "completed" }],
+    "stop_gate_decisions": [{ "gate": "todo", "decision": "allow" }],
     "final_answer_contains": ["substring in the agent's closing message"]
   }
 }
@@ -78,8 +86,29 @@ A scenario passes only if **all** of its expectations hold.
 
 - `prompt` is required; everything under `expect` is optional, but a scenario
   with no expectations is reported as an error (nothing to assert).
-- `args_contains` is a substring match against the stringified tool argument.
+- `tools_used` remains backward compatible, but now matches completed runtime
+  tool events instead of Responses API message history.
+- `args_contains` is a substring match against safe argument metadata. Trace
+  records paths, modes, counts, and lengths; it does not retain file contents,
+  shell commands, edit text, task prompts, or full tool output.
+- `tool_completed` may match `name`, `status`, and `args_contains`. Status is
+  one of `success`, `invalid_arguments`, `unknown_tool`, `permission_denied`,
+  `execution_error`, or `cancelled`.
+- `permission_decisions` may match `tool`, `policy_behavior`
+  (`allow`/`ask`/`deny`), `approval_kind`, and final `decision`
+  (`allow`/`deny`).
+- `todo_transitions` matches individual `{content, from, to}` transitions.
+- `stop_gate_decisions` matches `gate`, `decision`
+  (`allow`/`block`/`give_up`), and optional `reason`.
 - `timeout` is in seconds; omit for no timeout.
+
+## Runtime trace
+
+Normal CLI runs use a no-op trace sink and do not create files. Evals inject an
+in-memory sink per scenario. For manual debugging, Python callers can construct
+`JsonlTraceSink(path)` and place it in an `AgentConfig` through
+`TraceContext`; each emitted event is then appended as one JSON object per line.
+Trace sink failures are isolated and never change tool or permission behavior.
 
 ## Adding a scenario
 
