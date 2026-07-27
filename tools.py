@@ -26,6 +26,7 @@ from permissions import (
     permission_denied_output,
 )
 from trace import TraceContext, emit_trace
+from workspace import Workspace
 
 
 WORKDIR = Path.cwd()
@@ -889,7 +890,12 @@ def _looks_binary(fp: Path) -> bool:
         return False
 
 
-def run_read(path: str, offset: int = 1, limit: int = MAX_READ_LINES) -> str:
+def run_read(
+    workspace: Workspace,
+    path: str,
+    offset: int = 1,
+    limit: int = MAX_READ_LINES,
+) -> str:
     """Read a slice of a text file, streaming and bounded.
 
     Returns `cat -n`-style numbered lines for the window [offset, offset+limit)
@@ -897,7 +903,7 @@ def run_read(path: str, offset: int = 1, limit: int = MAX_READ_LINES) -> str:
     `offset=` hint when more remains) so the model can page instead of re-reading.
     """
     try:
-        fp = safe_path(path)
+        fp = workspace.resolve(path)
     except Exception as e:
         return f"Error: {e}"
     if not fp.exists():
@@ -1012,12 +1018,17 @@ def _read_footer(
     return f"[{head}{total_part}{note_part}{hint}]"
 
 
-def run_write(path: str, content: str, mode: str = "overwrite") -> str:
+def run_write(
+    workspace: Workspace,
+    path: str,
+    content: str,
+    mode: str = "overwrite",
+) -> str:
     """Create, overwrite, or append to a UTF-8 workspace file."""
     try:
         if mode not in {"overwrite", "append"}:
             return "Error: mode must be 'overwrite' or 'append'"
-        fp = safe_path(path)
+        fp = workspace.resolve(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
         file_mode = "w" if mode == "overwrite" else "a"
         with fp.open(file_mode, encoding="utf-8", newline="") as handle:
@@ -1258,6 +1269,7 @@ def _prepare_edits(
 
 
 def run_edit(
+    workspace: Workspace,
     path: str,
     edits_or_old_text: list[EditParams] | list[dict] | str,
     new_text: str | None = None,
@@ -1267,7 +1279,7 @@ def run_edit(
         edits = _coerce_edits(edits_or_old_text, new_text)
         if not edits:
             return "Error: edits must contain at least one replacement"
-        fp = safe_path(path)
+        fp = workspace.resolve(path)
         if not fp.exists():
             return f"Error: File not found: {path}. Use write_file to create it first."
         if not fp.is_file():
@@ -1575,20 +1587,26 @@ def build_tool_registry(
             name="read_file",
             params_model=ReadFileParams,
             sanitize_args=sanitize_file_args,
-            execute=async_tool(lambda params: run_read(params.path, params.offset, params.limit)),
+            execute=async_tool(lambda params: run_read(
+                Workspace(WORKDIR), params.path, params.offset, params.limit,
+            )),
             concurrency_safe=True,
         ),
         "write_file": ToolRuntimeSpec(
             name="write_file",
             params_model=WriteFileParams,
             sanitize_args=sanitize_file_args,
-            execute=async_tool(lambda params: run_write(params.path, params.content, params.mode)),
+            execute=async_tool(lambda params: run_write(
+                Workspace(WORKDIR), params.path, params.content, params.mode,
+            )),
         ),
         "edit_file": ToolRuntimeSpec(
             name="edit_file",
             params_model=EditFileParams,
             sanitize_args=sanitize_edit_args,
-            execute=async_tool(lambda params: run_edit(params.path, params.edits)),
+            execute=async_tool(lambda params: run_edit(
+                Workspace(WORKDIR), params.path, params.edits,
+            )),
         ),
         "glob": ToolRuntimeSpec(
             name="glob",

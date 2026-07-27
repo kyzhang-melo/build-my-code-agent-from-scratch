@@ -10,6 +10,10 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from workspace import Workspace  # noqa: E402  (path setup must happen first)
 
 
 def _install_import_stubs() -> None:
@@ -40,6 +44,22 @@ def _test_runtime_setup() -> None:
     os.environ.setdefault("MODEL_ID", "test-model")
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
+
+
+@pytest.fixture
+def workspace(tmp_path) -> Workspace:
+    """An isolated, empty workspace for one test.
+
+    Prefer this over writing into the repository checkout: it needs no cleanup
+    and cannot leak state between tests.
+    """
+    return Workspace(tmp_path)
+
+
+@pytest.fixture
+def repo_workspace() -> Workspace:
+    """The repository checkout, for the few tests that assert against real files."""
+    return Workspace(ROOT)
 
 
 @pytest.fixture
