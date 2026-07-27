@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import sys
 import types
 
@@ -14,12 +13,13 @@ def test_input_prompt_marks_ansi_sequences_as_nonprinting(load_module) -> None:
     assert main_module.INPUT_PROMPT == "\001\033[36m\002s01 >> \001\033[0m\002"
 
 
-def test_permission_mode_commands(load_module, capsys) -> None:
+def test_permission_mode_commands(load_module, capsys, tmp_path) -> None:
     main_module = load_module("main", "main.py")
+    session = _parent(main_module, tmp_path)
 
-    assert _run(main_module.handle_command("/mode plan", [])) is True
-    assert main_module.PERMISSION_MANAGER.mode.value == "plan"
-    assert _run(main_module.handle_command("/permissions", [])) is True
+    assert _run(main_module.handle_command("/mode plan", [], session)) is True
+    assert session.permission_service.manager.mode.value == "plan"
+    assert _run(main_module.handle_command("/permissions", [], session)) is True
 
     output = capsys.readouterr().out
     assert "mode=plan" in output
@@ -34,6 +34,22 @@ def _run(awaitable):
     return asyncio.run(awaitable)
 
 
+def _parent(main_module, tmp_path, on_text=None):
+    return main_module.create_parent_session(
+        tmp_path,
+        approval_handler=None,
+        on_text=on_text,
+    )
+
+
+def _explore(main_module, parent):
+    return main_module.create_explore_session(
+        parent.workspace,
+        parent.permission_service,
+        parent.trace_context,
+    )
+
+
 def _client_for_response(response, captured: dict | None = None):
     async def fake_create(**kwargs):
         if captured is not None:
@@ -43,8 +59,9 @@ def _client_for_response(response, captured: dict | None = None):
     return types.SimpleNamespace(responses=types.SimpleNamespace(create=fake_create))
 
 
-def test_run_one_turn_full_iteration(load_module, monkeypatch) -> None:
+def test_run_one_turn_full_iteration(load_module, monkeypatch, tmp_path) -> None:
     main_module = load_module("main", "main.py")
+    session = _parent(main_module, tmp_path)
     captured = {}
 
     function_call = types.SimpleNamespace(
@@ -60,7 +77,7 @@ def test_run_one_turn_full_iteration(load_module, monkeypatch) -> None:
 
     monkeypatch.setattr(main_module, "client", _client_for_response(fake_response, captured))
 
-    async def fake_execute(_output, **_kwargs):
+    async def fake_execute(_output, *_args, **_kwargs):
         return ([{"type": "function_call_output", "call_id": "c1", "output": "ok"}], False)
 
     monkeypatch.setattr(main_module, "execute_tool_calls_async", fake_execute)
@@ -72,7 +89,7 @@ def test_run_one_turn_full_iteration(load_module, monkeypatch) -> None:
         ]
     )
 
-    outcome = _run(main_module.run_one_turn(state))
+    outcome = _run(main_module.run_one_turn(state, session))
 
     assert outcome is None
     assert state.api_call_count == 1
@@ -99,40 +116,38 @@ def _reasoning_item():
     )
 
 
-def test_run_one_turn_surfaces_intermediate_text_with_tool_calls(load_module, monkeypatch) -> None:
+def test_run_one_turn_surfaces_intermediate_text_with_tool_calls(load_module, monkeypatch, tmp_path) -> None:
     main_module = load_module("main", "main.py")
-    main_module.TODO.update(_todo_params([]))
 
     function_call = types.SimpleNamespace(type="function_call", call_id="c1", name="bash", arguments="{}")
     fake_response = types.SimpleNamespace(output=[function_call], output_text="INTERIM SUMMARY")
     monkeypatch.setattr(main_module, "client", _client_for_response(fake_response))
 
-    async def fake_execute(_output, **_kwargs):
+    async def fake_execute(_output, *_args, **_kwargs):
         return ([{"type": "function_call_output", "call_id": "c1", "output": "ok"}], False)
 
     monkeypatch.setattr(main_module, "execute_tool_calls_async", fake_execute)
 
     surfaced: list[str] = []
-    config = dataclasses.replace(main_module.PARENT_CONFIG, on_text=surfaced.append)
+    session = _parent(main_module, tmp_path, surfaced.append)
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
 
-    outcome = _run(main_module.run_one_turn(state, config))
+    outcome = _run(main_module.run_one_turn(state, session))
 
     # Text that rides along with a tool call is shown, not swallowed.
     assert outcome is None
     assert surfaced == ["INTERIM SUMMARY"]
 
 
-def test_run_one_turn_no_tool_calls_does_not_surface_via_on_text(load_module, monkeypatch) -> None:
+def test_run_one_turn_no_tool_calls_does_not_surface_via_on_text(load_module, monkeypatch, tmp_path) -> None:
     main_module = load_module("main", "main.py")
-    main_module.TODO.update(_todo_params([]))
     monkeypatch.setattr(main_module, "client", _client_for_response(_no_tool_response("Final answer.")))
 
     surfaced: list[str] = []
-    config = dataclasses.replace(main_module.PARENT_CONFIG, on_text=surfaced.append)
+    session = _parent(main_module, tmp_path, surfaced.append)
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
 
-    outcome = _run(main_module.run_one_turn(state, config))
+    outcome = _run(main_module.run_one_turn(state, session))
 
     # The final no-tool answer is delivered via the return value (and __main__),
     # not on_text -- so it is not surfaced twice.
@@ -141,18 +156,18 @@ def test_run_one_turn_no_tool_calls_does_not_surface_via_on_text(load_module, mo
     assert surfaced == []
 
 
-def test_run_one_turn_surfaces_text_when_nudged(load_module, monkeypatch) -> None:
+def test_run_one_turn_surfaces_text_when_nudged(load_module, monkeypatch, tmp_path) -> None:
     main_module = load_module("main", "main.py")
     # An unresolved todo makes TodoStopGate.check() reject the stop with a nudge,
     # so the model's no-tool answer rides a *continuing* turn (Door 2).
-    main_module.TODO.update(_todo_params([{"content": "unfinished", "status": "in_progress"}]))
     monkeypatch.setattr(main_module, "client", _client_for_response(_no_tool_response("MY SUMMARY")))
 
     surfaced: list[str] = []
-    config = dataclasses.replace(main_module.PARENT_CONFIG, on_text=surfaced.append)
+    session = _parent(main_module, tmp_path, surfaced.append)
+    session.todo.update(_todo_params([{"content": "unfinished", "status": "in_progress"}]))
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
 
-    outcome = _run(main_module.run_one_turn(state, config))
+    outcome = _run(main_module.run_one_turn(state, session))
 
     # The rejected answer is shown before the contract nudge, not swallowed.
     assert outcome is None
@@ -161,23 +176,23 @@ def test_run_one_turn_surfaces_text_when_nudged(load_module, monkeypatch) -> Non
     assert "Before ending, either complete all todo items" in state.messages[-1]["content"]
 
 
-def test_run_one_turn_sets_final_text_from_current_turn(load_module, monkeypatch) -> None:
+def test_run_one_turn_sets_final_text_from_current_turn(load_module, monkeypatch, tmp_path) -> None:
     main_module = load_module("main", "main.py")
-    main_module.TODO.update(_todo_params([]))
+    session = _parent(main_module, tmp_path)
 
     monkeypatch.setattr(main_module, "client", _client_for_response(_no_tool_response("Fresh answer.")))
 
     state = main_module.LoopState(messages=[{"role": "user", "content": "new query"}])
-    outcome = _run(main_module.run_one_turn(state))
+    outcome = _run(main_module.run_one_turn(state, session))
 
     assert outcome is not None
     assert outcome.stop_reason == "completed"
     assert outcome.final_text == "Fresh answer."
 
 
-def test_run_one_turn_does_not_surface_stale_assistant_text(load_module, monkeypatch) -> None:
+def test_run_one_turn_does_not_surface_stale_assistant_text(load_module, monkeypatch, tmp_path) -> None:
     main_module = load_module("main", "main.py")
-    main_module.TODO.update(_todo_params([]))
+    session = _parent(main_module, tmp_path)
 
     monkeypatch.setattr(main_module, "client", _client_for_response(_no_tool_response("")))
 
@@ -187,22 +202,23 @@ def test_run_one_turn_does_not_surface_stale_assistant_text(load_module, monkeyp
         {"role": "assistant", "content": "STALE ANSWER"},
         {"role": "user", "content": "new query"},
     ])
-    outcome = _run(main_module.run_one_turn(state))
+    outcome = _run(main_module.run_one_turn(state, session))
 
     assert outcome is None
     assert state.messages[-1]["role"] == "user"
     assert "assistant-visible text" in state.messages[-1]["content"]
 
 
-def test_run_one_turn_contract_nudge_when_unresolved_todo(load_module, monkeypatch) -> None:
+def test_run_one_turn_contract_nudge_when_unresolved_todo(load_module, monkeypatch, tmp_path) -> None:
     main_module = load_module("main", "main.py")
-    main_module.TODO.update(_todo_params([{"content": "unfinished", "status": "in_progress"}]))
+    session = _parent(main_module, tmp_path)
+    session.todo.update(_todo_params([{"content": "unfinished", "status": "in_progress"}]))
 
     fake_response = types.SimpleNamespace(output=[], output_text="All done.")
     monkeypatch.setattr(main_module, "client", _client_for_response(fake_response))
 
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
-    outcome = _run(main_module.run_one_turn(state))
+    outcome = _run(main_module.run_one_turn(state, session))
 
     assert outcome is None
     assert state.nudges == 1
@@ -210,20 +226,20 @@ def test_run_one_turn_contract_nudge_when_unresolved_todo(load_module, monkeypat
     assert "Before ending, either complete all todo items" in state.messages[-1]["content"]
 
 
-def test_run_one_turn_contract_warns_after_max_nudges(load_module, monkeypatch) -> None:
+def test_run_one_turn_contract_warns_after_max_nudges(load_module, monkeypatch, tmp_path) -> None:
     main_module = load_module("main", "main.py")
-    main_module.TODO.update(_todo_params([{"content": "unfinished", "status": "pending"}]))
 
     fake_response = types.SimpleNamespace(output=[], output_text="Done.")
     monkeypatch.setattr(main_module, "client", _client_for_response(fake_response))
 
     surfaced: list[str] = []
-    config = dataclasses.replace(main_module.PARENT_CONFIG, on_text=surfaced.append)
+    session = _parent(main_module, tmp_path, surfaced.append)
+    session.todo.update(_todo_params([{"content": "unfinished", "status": "pending"}]))
     state = main_module.LoopState(
         messages=[{"role": "user", "content": "task"}],
         nudges=main_module.TODO_CONTRACT_MAX_NUDGES,
     )
-    outcome = _run(main_module.run_one_turn(state, config))
+    outcome = _run(main_module.run_one_turn(state, session))
 
     assert outcome is not None
     assert outcome.stop_reason == "completed"
@@ -235,9 +251,9 @@ def test_run_one_turn_contract_warns_after_max_nudges(load_module, monkeypatch) 
 
 
 def test_todo_update_echoes_system_reminder(load_module) -> None:
-    main_module = load_module("main", "main.py")
-
-    output = main_module.TODO.update(_todo_params([{"content": "one", "status": "in_progress"}]))
+    load_module("main", "main.py")
+    todo = sys.modules["tools"].TodoManager()
+    output = todo.update(_todo_params([{"content": "one", "status": "in_progress"}]))
 
     assert "<system-reminder>" in output
     assert "Your todo list has changed" in output
@@ -245,18 +261,18 @@ def test_todo_update_echoes_system_reminder(load_module) -> None:
 
 
 def test_todo_update_empty_echoes_cleared_reminder(load_module) -> None:
-    main_module = load_module("main", "main.py")
-
-    output = main_module.TODO.update(_todo_params([]))
+    load_module("main", "main.py")
+    todo = sys.modules["tools"].TodoManager()
+    output = todo.update(_todo_params([]))
 
     assert "<system-reminder>" in output
     assert "Your todo list is now empty." in output
 
 
 def test_todo_update_completed_reminder_steers_to_final_answer(load_module) -> None:
-    main_module = load_module("main", "main.py")
-
-    output = main_module.TODO.update(_todo_params([{"content": "done", "status": "completed"}]))
+    load_module("main", "main.py")
+    todo = sys.modules["tools"].TodoManager()
+    output = todo.update(_todo_params([{"content": "done", "status": "completed"}]))
 
     # A fully-complete plan should stop nudging for more todo calls and steer
     # the model to deliver its result instead.
@@ -265,37 +281,39 @@ def test_todo_update_completed_reminder_steers_to_final_answer(load_module) -> N
     assert "Keep using the todo tool" not in output
 
 
-def test_todo_stop_gate_nudges_on_unresolved_todo(load_module) -> None:
+def test_todo_stop_gate_nudges_on_unresolved_todo(load_module, tmp_path) -> None:
     main_module = load_module("main", "main.py")
-    main_module.TODO.update(_todo_params([{"content": "unfinished", "status": "in_progress"}]))
+    session = _parent(main_module, tmp_path)
+    session.todo.update(_todo_params([{"content": "unfinished", "status": "in_progress"}]))
 
-    nudge = main_module.PARENT_CONFIG.stop_gate.check("All done.")
+    nudge = session.stop_gate.check("All done.")
 
     assert nudge is not None
     assert "Before ending, either complete all todo items" in nudge
 
 
-def test_todo_stop_gate_accepts_when_plan_completed(load_module) -> None:
+def test_todo_stop_gate_accepts_when_plan_completed(load_module, tmp_path) -> None:
     main_module = load_module("main", "main.py")
-    main_module.TODO.update(_todo_params([{"content": "done", "status": "completed"}]))
+    session = _parent(main_module, tmp_path)
+    session.todo.update(_todo_params([{"content": "done", "status": "completed"}]))
 
-    assert main_module.PARENT_CONFIG.stop_gate.check("All done.") is None
+    assert session.stop_gate.check("All done.") is None
 
 
-def test_run_one_turn_tool_calls_extend_messages(load_module, monkeypatch) -> None:
+def test_run_one_turn_tool_calls_extend_messages(load_module, monkeypatch, tmp_path) -> None:
     main_module = load_module("main", "main.py")
-    main_module.TODO.update(_todo_params([]))
+    session = _parent(main_module, tmp_path)
     function_call = types.SimpleNamespace(type="function_call", call_id="c1", name="bash", arguments="{}")
     fake_response = types.SimpleNamespace(output=[function_call], output_text="")
     monkeypatch.setattr(main_module, "client", _client_for_response(fake_response))
 
-    async def fake_execute(_output, **_kwargs):
+    async def fake_execute(_output, *_args, **_kwargs):
         return ([{"type": "function_call_output", "call_id": "c1", "output": "ok"}], False)
 
     monkeypatch.setattr(main_module, "execute_tool_calls_async", fake_execute)
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
 
-    outcome = _run(main_module.run_one_turn(state))
+    outcome = _run(main_module.run_one_turn(state, session))
 
     assert outcome is None
     assert state.api_call_count == 1
@@ -303,14 +321,14 @@ def test_run_one_turn_tool_calls_extend_messages(load_module, monkeypatch) -> No
     assert state.messages[-1]["type"] == "function_call_output"
 
 
-def test_run_one_turn_reasoning_only_response_is_nudged(load_module, monkeypatch) -> None:
+def test_run_one_turn_reasoning_only_response_is_nudged(load_module, monkeypatch, tmp_path) -> None:
     main_module = load_module("main", "main.py")
-    main_module.TODO.update(_todo_params([]))
+    session = _parent(main_module, tmp_path)
     fake_response = types.SimpleNamespace(output=[_reasoning_item()], output_text="")
     monkeypatch.setattr(main_module, "client", _client_for_response(fake_response))
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
 
-    outcome = _run(main_module.run_one_turn(state))
+    outcome = _run(main_module.run_one_turn(state, session))
 
     assert outcome is None
     assert state.empty_response_nudges == 1
@@ -320,9 +338,9 @@ def test_run_one_turn_reasoning_only_response_is_nudged(load_module, monkeypatch
     assert "assistant-visible text" in state.messages[-1]["content"]
 
 
-def test_agent_loop_replays_reasoning_item_after_empty_response(load_module, monkeypatch) -> None:
+def test_agent_loop_replays_reasoning_item_after_empty_response(load_module, monkeypatch, tmp_path) -> None:
     main_module = load_module("main", "main.py")
-    main_module.TODO.update(_todo_params([]))
+    session = _parent(main_module, tmp_path)
     responses = [
         types.SimpleNamespace(output=[_reasoning_item()], output_text=""),
         _no_tool_response("Final answer."),
@@ -340,7 +358,7 @@ def test_agent_loop_replays_reasoning_item_after_empty_response(load_module, mon
     )
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
 
-    outcome = _run(main_module.agent_loop(state))
+    outcome = _run(main_module.agent_loop(state, session))
 
     assert outcome.final_text == "Final answer."
     assert outcome.api_calls == 2
@@ -351,9 +369,9 @@ def test_agent_loop_replays_reasoning_item_after_empty_response(load_module, mon
     )
 
 
-def test_run_one_turn_empty_response_after_retry_returns_warning(load_module, monkeypatch) -> None:
+def test_run_one_turn_empty_response_after_retry_returns_warning(load_module, monkeypatch, tmp_path) -> None:
     main_module = load_module("main", "main.py")
-    main_module.TODO.update(_todo_params([]))
+    session = _parent(main_module, tmp_path)
     fake_response = types.SimpleNamespace(output=[_reasoning_item()], output_text="")
     monkeypatch.setattr(main_module, "client", _client_for_response(fake_response))
     state = main_module.LoopState(
@@ -361,7 +379,7 @@ def test_run_one_turn_empty_response_after_retry_returns_warning(load_module, mo
         empty_response_nudges=main_module.EMPTY_RESPONSE_MAX_NUDGES,
     )
 
-    outcome = _run(main_module.run_one_turn(state))
+    outcome = _run(main_module.run_one_turn(state, session))
 
     assert outcome is not None
     assert outcome.stop_reason == "completed"
@@ -371,9 +389,9 @@ def test_run_one_turn_empty_response_after_retry_returns_warning(load_module, mo
     assert state.messages[-1]["content"] == outcome.final_text
 
 
-def test_run_one_turn_debugs_empty_output_text_shape(load_module, monkeypatch, capsys) -> None:
+def test_run_one_turn_debugs_empty_output_text_shape(load_module, monkeypatch, capsys, tmp_path) -> None:
     main_module = load_module("main", "main.py")
-    main_module.TODO.update(_todo_params([]))
+    session = _parent(main_module, tmp_path)
     message_item = types.SimpleNamespace(
         type="message",
         status="completed",
@@ -383,7 +401,7 @@ def test_run_one_turn_debugs_empty_output_text_shape(load_module, monkeypatch, c
     monkeypatch.setattr(main_module, "client", _client_for_response(fake_response))
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
 
-    _run(main_module.run_one_turn(state))
+    _run(main_module.run_one_turn(state, session))
 
     output = capsys.readouterr().out
     assert "output_text empty; response.output has 1 item(s)" in output
@@ -391,19 +409,21 @@ def test_run_one_turn_debugs_empty_output_text_shape(load_module, monkeypatch, c
     assert "content_types=['output_text']" in output
 
 
-def test_explore_subagent_tools_are_read_only(load_module) -> None:
+def test_explore_subagent_tools_are_read_only(load_module, tmp_path) -> None:
     main_module = load_module("main", "main.py")
+    parent = _parent(main_module, tmp_path)
+    explore = _explore(main_module, parent)
 
-    tool_names = {tool["name"] for tool in main_module.EXPLORE_SUBAGENT_CONFIG.tools}
+    tool_names = {tool["name"] for tool in explore.tools}
 
     assert tool_names == {"read_file", "glob", "grep"}
-    assert set(main_module.EXPLORE_SUBAGENT_CONFIG.registry) == {"read_file", "glob", "grep"}
+    assert set(explore.registry) == {"read_file", "glob", "grep"}
+    assert explore.todo is not parent.todo
 
 
-def test_explore_subagent_system_includes_glob_rule(load_module) -> None:
+def test_explore_subagent_system_includes_glob_rule(load_module, tmp_path) -> None:
     main_module = load_module("main", "main.py")
-
-    system = main_module.EXPLORE_SUBAGENT_CONFIG.system
+    system = _explore(main_module, _parent(main_module, tmp_path)).system
 
     assert "CRITICAL GLOB RULE" in system
     assert "**/*" in system
@@ -422,35 +442,35 @@ def test_build_subagent_prompt_includes_glob_rule_and_task(load_module) -> None:
     assert prompt.endswith(f"Task:\n{task}")
 
 
-def test_parent_tools_include_task(load_module) -> None:
+def test_parent_tools_include_task(load_module, tmp_path) -> None:
     main_module = load_module("main", "main.py")
-
-    tool_names = {tool["name"] for tool in main_module.PARENT_CONFIG.tools}
+    tool_names = {tool["name"] for tool in _parent(main_module, tmp_path).tools}
 
     assert "task" in tool_names
 
 
-def test_summary_stop_gate_nudges_short_summary(load_module) -> None:
+def test_summary_stop_gate_nudges_short_summary(load_module, tmp_path) -> None:
     main_module = load_module("main", "main.py")
-
-    nudge = main_module.EXPLORE_SUBAGENT_CONFIG.stop_gate.check("Short.")
+    explore = _explore(main_module, _parent(main_module, tmp_path))
+    nudge = explore.stop_gate.check("Short.")
 
     assert nudge is not None
     assert "too brief" in nudge
 
 
-def test_summary_stop_gate_accepts_long_summary(load_module) -> None:
+def test_summary_stop_gate_accepts_long_summary(load_module, tmp_path) -> None:
     main_module = load_module("main", "main.py")
+    explore = _explore(main_module, _parent(main_module, tmp_path))
+    assert explore.stop_gate.check("x" * 200) is None
 
-    assert main_module.EXPLORE_SUBAGENT_CONFIG.stop_gate.check("x" * 200) is None
 
-
-def test_run_one_turn_subagent_nudges_short_summary(load_module, monkeypatch) -> None:
+def test_run_one_turn_subagent_nudges_short_summary(load_module, monkeypatch, tmp_path) -> None:
     main_module = load_module("main", "main.py")
+    explore = _explore(main_module, _parent(main_module, tmp_path))
     monkeypatch.setattr(main_module, "client", _client_for_response(_no_tool_response("Short.")))
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
 
-    outcome = _run(main_module.run_one_turn(state, main_module.EXPLORE_SUBAGENT_CONFIG))
+    outcome = _run(main_module.run_one_turn(state, explore))
 
     assert outcome is None
     assert state.nudges == 1
@@ -458,15 +478,16 @@ def test_run_one_turn_subagent_nudges_short_summary(load_module, monkeypatch) ->
     assert "too brief" in state.messages[-1]["content"]
 
 
-def test_run_one_turn_subagent_accepts_after_max_attempts(load_module, monkeypatch) -> None:
+def test_run_one_turn_subagent_accepts_after_max_attempts(load_module, monkeypatch, tmp_path) -> None:
     main_module = load_module("main", "main.py")
+    explore = _explore(main_module, _parent(main_module, tmp_path))
     monkeypatch.setattr(main_module, "client", _client_for_response(_no_tool_response("Short.")))
     state = main_module.LoopState(
         messages=[{"role": "user", "content": "task"}],
         nudges=main_module.SUMMARY_CONTINUATION_ATTEMPTS,
     )
 
-    outcome = _run(main_module.run_one_turn(state, main_module.EXPLORE_SUBAGENT_CONFIG))
+    outcome = _run(main_module.run_one_turn(state, explore))
 
     assert outcome is not None
     assert outcome.final_text == "Short."
@@ -474,29 +495,31 @@ def test_run_one_turn_subagent_accepts_after_max_attempts(load_module, monkeypat
     assert state.messages[-1] == {"role": "assistant", "content": "Short."}
 
 
-def test_run_one_turn_subagent_evaluates_only_current_text(load_module, monkeypatch) -> None:
+def test_run_one_turn_subagent_evaluates_only_current_text(load_module, monkeypatch, tmp_path) -> None:
     main_module = load_module("main", "main.py")
+    explore = _explore(main_module, _parent(main_module, tmp_path))
     monkeypatch.setattr(main_module, "client", _client_for_response(_no_tool_response("")))
     # A long prior assistant message must NOT be mistaken for this turn's summary.
     state = main_module.LoopState(
         messages=[{"role": "assistant", "content": "x" * 200}],
     )
 
-    outcome = _run(main_module.run_one_turn(state, main_module.EXPLORE_SUBAGENT_CONFIG))
+    outcome = _run(main_module.run_one_turn(state, explore))
 
     assert outcome is None
     assert state.empty_response_nudges == 1
     assert "assistant-visible text" in state.messages[-1]["content"]
 
 
-def test_run_one_turn_budget_exhausted_returns_max_api_calls_outcome(load_module) -> None:
+def test_run_one_turn_budget_exhausted_returns_max_api_calls_outcome(load_module, tmp_path) -> None:
     main_module = load_module("main", "main.py")
+    session = _parent(main_module, tmp_path)
     state = main_module.LoopState(
         messages=[{"role": "user", "content": "task"}],
-        api_call_count=main_module.PARENT_CONFIG.max_api_calls,
+        api_call_count=session.max_api_calls,
     )
 
-    outcome = _run(main_module.run_one_turn(state))
+    outcome = _run(main_module.run_one_turn(state, session))
 
     assert outcome is not None
     assert outcome.stop_reason == "max_api_calls"

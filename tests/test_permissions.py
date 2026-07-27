@@ -215,7 +215,7 @@ def test_terminal_handler_does_not_block_event_loop(load_module) -> None:
     assert response.kind == "approve"
 
 
-def test_permission_denial_short_circuits_tool_execution(load_module) -> None:
+def test_permission_denial_short_circuits_tool_execution(load_module, workspace) -> None:
     tools = load_module("tools", "tools.py")
     permissions = permission_module
     executed = False
@@ -225,14 +225,17 @@ def test_permission_denial_short_circuits_tool_execution(load_module) -> None:
         executed = True
         return "should not run"
 
-    tools.TOOL_REGISTRY["bash"].execute = execute
+    registry = tools.build_tool_registry(workspace, tools.TodoManager())
+    registry["bash"].execute = execute
     service = permissions.PermissionService(
-        permissions.PermissionManager(Path(tools.WORKDIR)),
+        permissions.PermissionManager(workspace.root),
         permissions.TerminalApprovalHandler(interactive=False),
     )
 
     output, _ = asyncio.run(tools.execute_tool_calls_async(
         [_fc("bash", "b1", '{"command":"echo hi"}')],
+        registry,
+        tools.TodoManager(),
         permission_service=service,
     ))
 
@@ -243,7 +246,7 @@ def test_permission_denial_short_circuits_tool_execution(load_module) -> None:
     assert payload["retryable"] is False
 
 
-def test_permission_failure_is_fail_closed(load_module) -> None:
+def test_permission_failure_is_fail_closed(load_module, workspace) -> None:
     tools = load_module("tools", "tools.py")
     executed = False
 
@@ -256,9 +259,12 @@ def test_permission_failure_is_fail_closed(load_module) -> None:
         executed = True
         return "should not run"
 
-    tools.TOOL_REGISTRY["bash"].execute = execute
+    registry = tools.build_tool_registry(workspace, tools.TodoManager())
+    registry["bash"].execute = execute
     output, _ = asyncio.run(tools.execute_tool_calls_async(
         [_fc("bash", "b1", '{"command":"echo hi"}')],
+        registry,
+        tools.TodoManager(),
         permission_service=BrokenService(),
     ))
 
@@ -268,14 +274,15 @@ def test_permission_failure_is_fail_closed(load_module) -> None:
     assert "failed" in payload["reason"].lower()
 
 
-def test_write_preview_does_not_print_content(load_module, capsys) -> None:
+def test_write_preview_does_not_print_content(load_module, workspace, capsys) -> None:
     tools = load_module("tools", "tools.py")
-    tools.TOOL_REGISTRY["write_file"].execute = lambda _params: asyncio.sleep(
+    registry = tools.build_tool_registry(workspace, tools.TodoManager())
+    registry["write_file"].execute = lambda _params: asyncio.sleep(
         0, result="wrote"
     )
     tools.execute_tool_calls([
         _fc("write_file", "w1", '{"path":"tmp/x.txt","content":"TOP_SECRET_VALUE"}'),
-    ])
+    ], registry, tools.TodoManager())
 
     printed = capsys.readouterr().out
     assert "path='tmp/x.txt'" in printed
@@ -283,14 +290,14 @@ def test_write_preview_does_not_print_content(load_module, capsys) -> None:
     assert "TOP_SECRET_VALUE" not in printed
 
 
-def test_glob_hides_sensitive_paths(load_module) -> None:
+def test_glob_hides_sensitive_paths(load_module, workspace) -> None:
     tools = load_module("tools", "tools.py")
-    base = Path(tools.WORKDIR) / "tests" / "_tmp_permission_glob"
+    base = workspace.root / "tests" / "_tmp_permission_glob"
     base.mkdir(parents=True, exist_ok=True)
     (base / ".env").write_text("SECRET=value")
     (base / "visible.txt").write_text("ok")
     try:
-        output = tools.run_glob("*", "tests/_tmp_permission_glob")
+        output = tools.run_glob(workspace, "*", "tests/_tmp_permission_glob")
     finally:
         (base / ".env").unlink()
         (base / "visible.txt").unlink()
@@ -300,7 +307,7 @@ def test_glob_hides_sensitive_paths(load_module) -> None:
     assert ".env" not in output
 
 
-def test_grep_sensitive_excludes_override_caller_glob(load_module, monkeypatch) -> None:
+def test_grep_sensitive_excludes_override_caller_glob(load_module, workspace, monkeypatch) -> None:
     tools = load_module("tools", "tools.py")
     captured = {}
 
@@ -311,7 +318,7 @@ def test_grep_sensitive_excludes_override_caller_glob(load_module, monkeypatch) 
     monkeypatch.setattr(tools.shutil, "which", lambda _name: "/usr/bin/rg")
     monkeypatch.setattr(tools.subprocess, "run", fake_run)
 
-    tools.run_grep("SECRET", glob=".env")
+    tools.run_grep(workspace, "SECRET", glob=".env")
 
     args = captured["args"]
     include_index = args.index(".env")
@@ -319,7 +326,7 @@ def test_grep_sensitive_excludes_override_caller_glob(load_module, monkeypatch) 
     assert final_exclude_index > include_index
 
 
-def test_approve_for_session_executes_and_covers_edit(load_module) -> None:
+def test_approve_for_session_executes_and_covers_edit(load_module, workspace) -> None:
     tools = load_module("tools", "tools.py")
     permissions = permission_module
     calls = 0
@@ -331,16 +338,17 @@ def test_approve_for_session_executes_and_covers_edit(load_module) -> None:
             return permissions.ApprovalResponse("approve_for_session")
 
     service = permissions.PermissionService(
-        permissions.PermissionManager(Path(tools.WORKDIR)),
+        permissions.PermissionManager(workspace.root),
         Handler(),
     )
-    tools.TOOL_REGISTRY["write_file"].execute = lambda _params: asyncio.sleep(0, result="wrote")
-    tools.TOOL_REGISTRY["edit_file"].execute = lambda _params: asyncio.sleep(0, result="edited")
+    registry = tools.build_tool_registry(workspace, tools.TodoManager())
+    registry["write_file"].execute = lambda _params: asyncio.sleep(0, result="wrote")
+    registry["edit_file"].execute = lambda _params: asyncio.sleep(0, result="edited")
 
     output, _ = asyncio.run(tools.execute_tool_calls_async([
         _fc("write_file", "w1", '{"path":"tmp/x.txt","content":"x"}'),
         _fc("edit_file", "e1", '{"path":"tmp/x.txt","old_text":"x","new_text":"y"}'),
-    ], permission_service=service))
+    ], registry, tools.TodoManager(), permission_service=service))
 
     assert [item["output"] for item in output] == ["wrote", "edited"]
     assert calls == 1

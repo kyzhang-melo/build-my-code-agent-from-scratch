@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import subprocess
 import types
-from pathlib import Path
-
 import pytest
 
 
@@ -16,14 +14,20 @@ def _fc(name: str, call_id: str, arguments: str):
     )
 
 
-def test_search_tools_are_registered(load_module) -> None:
+def _runtime(tools, workspace):
+    todo = tools.TodoManager()
+    return tools.build_tool_registry(workspace, todo), todo
+
+
+def test_search_tools_are_registered(load_module, workspace) -> None:
     tools = load_module("tools", "tools.py")
+    registry, _ = _runtime(tools, workspace)
 
     tool_names = {tool["name"] for tool in tools.TOOLS}
     assert "glob" in tool_names
     assert "grep" in tool_names
-    assert "glob" in tools.TOOL_REGISTRY
-    assert "grep" in tools.TOOL_REGISTRY
+    assert "glob" in registry
+    assert "grep" in registry
     glob_schema = next(tool for tool in tools.TOOLS if tool["name"] == "glob")
     grep_schema = next(tool for tool in tools.TOOLS if tool["name"] == "grep")
     assert "pass it as directory" in glob_schema["description"]
@@ -32,191 +36,111 @@ def test_search_tools_are_registered(load_module) -> None:
     assert "Put the search location in path" in grep_schema["description"]
 
 
-def test_run_glob_finds_sorted_relative_matches(load_module) -> None:
+def test_run_glob_finds_sorted_relative_matches(load_module, workspace) -> None:
     tools = load_module("tools", "tools.py")
-    base = Path(tools.WORKDIR / "tests" / "_tmp_glob")
-    try:
-        base.mkdir(parents=True, exist_ok=True)
-        (base / "b.py").write_text("b")
-        (base / "a.py").write_text("a")
-        (base / "notes.txt").write_text("notes")
-
-        output = tools.run_glob("*.py", "tests/_tmp_glob")
-
-        assert "Found 2 matches" in output
-        assert output.splitlines()[1:] == ["a.py", "b.py"]
-    finally:
-        for child in base.glob("*"):
-            child.unlink()
-        base.rmdir()
+    (workspace.root / "b.py").write_text("b")
+    (workspace.root / "a.py").write_text("a")
+    (workspace.root / "notes.txt").write_text("notes")
+    output = tools.run_glob(workspace, "*.py")
+    assert "Found 2 matches" in output
+    assert output.splitlines()[1:] == ["a.py", "b.py"]
 
 
-def test_run_glob_can_exclude_directories(load_module) -> None:
+def test_run_glob_can_exclude_directories(load_module, workspace) -> None:
     tools = load_module("tools", "tools.py")
-    base = Path(tools.WORKDIR / "tests" / "_tmp_glob_dirs")
-    try:
-        (base / "pkg").mkdir(parents=True, exist_ok=True)
-        (base / "file.py").write_text("file")
-
-        output = tools.run_glob("*", "tests/_tmp_glob_dirs", include_dirs=False)
-
-        assert "file.py" in output
-        assert "pkg" not in output.splitlines()[1:]
-    finally:
-        (base / "file.py").unlink()
-        (base / "pkg").rmdir()
-        base.rmdir()
+    (workspace.root / "pkg").mkdir()
+    (workspace.root / "file.py").write_text("file")
+    output = tools.run_glob(workspace, "*", include_dirs=False)
+    assert "file.py" in output
+    assert "pkg" not in output.splitlines()[1:]
 
 
-def test_run_glob_rejects_escape(load_module) -> None:
+def test_run_glob_rejects_escape(load_module, workspace) -> None:
     tools = load_module("tools", "tools.py")
 
-    assert tools.run_glob("*.py", "../").startswith("Error: Path escapes workspace")
+    assert tools.run_glob(workspace, "*.py", "../").startswith("Error: Path escapes workspace")
 
 
-def test_run_glob_broad_pattern_returns_top_level_listing(load_module) -> None:
+def test_run_glob_broad_pattern_returns_top_level_listing(load_module, workspace) -> None:
     tools = load_module("tools", "tools.py")
-    base = Path(tools.WORKDIR / "tests" / "_tmp_glob_broad")
-    try:
-        (base / "pkg").mkdir(parents=True, exist_ok=True)
-        (base / "__pycache__").mkdir(parents=True, exist_ok=True)
-        (base / "root.py").write_text("root")
-
-        output = tools.run_glob("**/*", "tests/_tmp_glob_broad")
-
-        assert output.startswith("Error: pattern `**/*` matches everything")
-        assert "pkg/" in output  # directories marked with a trailing slash
-        assert "root.py" in output
-        assert "__pycache__" not in output  # noisy dir omitted from the listing
-    finally:
-        (base / "root.py").unlink()
-        (base / "pkg").rmdir()
-        (base / "__pycache__").rmdir()
-        base.rmdir()
+    (workspace.root / "pkg").mkdir()
+    (workspace.root / "__pycache__").mkdir()
+    (workspace.root / "root.py").write_text("root")
+    output = tools.run_glob(workspace, "**/*")
+    assert output.startswith("Error: pattern `**/*` matches everything")
+    assert "pkg/" in output
+    assert "root.py" in output
+    assert "__pycache__" not in output
 
 
 @pytest.mark.parametrize("pattern", ["**", "**/", "**/**"])
-def test_run_glob_rejects_broad_recursive_variants(load_module, pattern) -> None:
+def test_run_glob_rejects_broad_recursive_variants(load_module, workspace, pattern) -> None:
     tools = load_module("tools", "tools.py")
-    base = Path(tools.WORKDIR / "tests" / "_tmp_glob_broad_variants")
-    try:
-        base.mkdir(parents=True, exist_ok=True)
-        (base / "root.py").write_text("root")
-
-        output = tools.run_glob(pattern, "tests/_tmp_glob_broad_variants")
-
-        assert output.startswith(f"Error: pattern `{pattern}` matches everything")
-        assert "`**/*.py`" in output
-        assert "pattern `*`" in output
-        assert "root.py" in output
-    finally:
-        (base / "root.py").unlink()
-        base.rmdir()
+    (workspace.root / "root.py").write_text("root")
+    output = tools.run_glob(workspace, pattern)
+    assert output.startswith(f"Error: pattern `{pattern}` matches everything")
+    assert "`**/*.py`" in output
+    assert "pattern `*`" in output
+    assert "root.py" in output
 
 
-def test_run_glob_allows_shallow_star_listing(load_module) -> None:
+def test_run_glob_allows_shallow_star_listing(load_module, workspace) -> None:
     tools = load_module("tools", "tools.py")
-    base = Path(tools.WORKDIR / "tests" / "_tmp_glob_star")
-    try:
-        (base / "pkg").mkdir(parents=True, exist_ok=True)
-        (base / "root.py").write_text("root")
-
-        output = tools.run_glob("*", "tests/_tmp_glob_star")
-
-        assert "Found 2 matches" in output
-        assert "pkg" in output
-        assert "root.py" in output
-    finally:
-        (base / "root.py").unlink()
-        (base / "pkg").rmdir()
-        base.rmdir()
+    (workspace.root / "pkg").mkdir()
+    (workspace.root / "root.py").write_text("root")
+    output = tools.run_glob(workspace, "*")
+    assert "Found 2 matches" in output
+    assert "pkg" in output
+    assert "root.py" in output
 
 
-def test_run_glob_recursive_finds_nested_and_root_level(load_module) -> None:
+def test_run_glob_recursive_finds_nested_and_root_level(load_module, workspace) -> None:
     tools = load_module("tools", "tools.py")
-    base = Path(tools.WORKDIR / "tests" / "_tmp_glob_deep")
-    try:
-        (base / "a" / "b").mkdir(parents=True, exist_ok=True)
-        (base / "config.json").write_text("root")  # depth 0
-        (base / "a" / "b" / "config.json").write_text("nested")  # depth 2
-
-        output = tools.run_glob("**/config.json", "tests/_tmp_glob_deep")
-
-        assert "Found 2 matches" in output
-        assert "config.json" in output
-        assert "a/b/config.json" in output
-    finally:
-        (base / "config.json").unlink()
-        (base / "a" / "b" / "config.json").unlink()
-        (base / "a" / "b").rmdir()
-        (base / "a").rmdir()
-        base.rmdir()
+    (workspace.root / "a" / "b").mkdir(parents=True)
+    (workspace.root / "config.json").write_text("root")
+    (workspace.root / "a" / "b" / "config.json").write_text("nested")
+    output = tools.run_glob(workspace, "**/config.json")
+    assert "Found 2 matches" in output
+    assert "config.json" in output
+    assert "a/b/config.json" in output
 
 
-def test_run_glob_recursive_prunes_excluded_dirs(load_module) -> None:
+def test_run_glob_recursive_prunes_excluded_dirs(load_module, workspace) -> None:
     tools = load_module("tools", "tools.py")
-    base = Path(tools.WORKDIR / "tests" / "_tmp_glob_prune")
-    try:
-        (base / "src").mkdir(parents=True, exist_ok=True)
-        (base / "node_modules" / "dep").mkdir(parents=True, exist_ok=True)
-        (base / "src" / "keep.py").write_text("keep")
-        (base / "node_modules" / "dep" / "skip.py").write_text("skip")
-
-        output = tools.run_glob("**/*.py", "tests/_tmp_glob_prune", include_dirs=False)
-
-        assert "Found 1 matches" in output
-        assert "src/keep.py" in output
-        assert "node_modules" not in output
-    finally:
-        (base / "src" / "keep.py").unlink()
-        (base / "node_modules" / "dep" / "skip.py").unlink()
-        (base / "node_modules" / "dep").rmdir()
-        (base / "node_modules").rmdir()
-        (base / "src").rmdir()
-        base.rmdir()
+    (workspace.root / "src").mkdir()
+    (workspace.root / "node_modules" / "dep").mkdir(parents=True)
+    (workspace.root / "src" / "keep.py").write_text("keep")
+    (workspace.root / "node_modules" / "dep" / "skip.py").write_text("skip")
+    output = tools.run_glob(workspace, "**/*.py", include_dirs=False)
+    assert "Found 1 matches" in output
+    assert "src/keep.py" in output
+    assert "node_modules" not in output
 
 
-def test_run_glob_allows_recursive_pattern_in_specific_directory(load_module) -> None:
+def test_run_glob_allows_recursive_pattern_in_specific_directory(load_module, workspace) -> None:
     tools = load_module("tools", "tools.py")
-    base = Path(tools.WORKDIR / "tests" / "_tmp_glob_recursive")
-    try:
-        (base / "pkg").mkdir(parents=True, exist_ok=True)
-        (base / "pkg" / "nested.py").write_text("nested")
-
-        output = tools.run_glob("**/*.py", "tests/_tmp_glob_recursive", include_dirs=False)
-
-        assert "Found 1 matches" in output
-        assert "pkg/nested.py" in output
-    finally:
-        (base / "pkg" / "nested.py").unlink()
-        (base / "pkg").rmdir()
-        base.rmdir()
+    (workspace.root / "pkg").mkdir()
+    (workspace.root / "pkg" / "nested.py").write_text("nested")
+    output = tools.run_glob(workspace, "**/*.py", include_dirs=False)
+    assert "Found 1 matches" in output
+    assert "pkg/nested.py" in output
 
 
-def test_run_glob_limits_results(load_module) -> None:
+def test_run_glob_limits_results(load_module, workspace) -> None:
     tools = load_module("tools", "tools.py")
-    base = Path(tools.WORKDIR / "tests" / "_tmp_glob_limit")
-    try:
-        base.mkdir(parents=True, exist_ok=True)
-        for index in range(3):
-            (base / f"{index}.txt").write_text(str(index))
-
-        output = tools.run_glob("*.txt", "tests/_tmp_glob_limit", limit=2)
-
-        assert "Found 3 matches" in output
-        assert "Showing first 2" in output
-        assert len(output.splitlines()) == 3
-    finally:
-        for child in base.glob("*"):
-            child.unlink()
-        base.rmdir()
+    for index in range(3):
+        (workspace.root / f"{index}.txt").write_text(str(index))
+    output = tools.run_glob(workspace, "*.txt", limit=2)
+    assert "Found 3 matches" in output
+    assert "Showing first 2" in output
+    assert len(output.splitlines()) == 3
 
 
-def test_run_grep_reports_missing_ripgrep(load_module, monkeypatch) -> None:
+def test_run_grep_reports_missing_ripgrep(load_module, monkeypatch, workspace) -> None:
     tools = load_module("tools", "tools.py")
     monkeypatch.setattr(tools.shutil, "which", lambda name: None)
 
-    output = tools.run_grep("needle")
+    output = tools.run_grep(workspace, "needle")
 
     assert output.startswith("Error: ripgrep (`rg`) is not installed")
 
@@ -232,6 +156,7 @@ def test_run_grep_reports_missing_ripgrep(load_module, monkeypatch) -> None:
 def test_run_grep_builds_safe_rg_command(
     load_module,
     monkeypatch,
+    workspace,
     output_mode,
     expected_flag,
 ) -> None:
@@ -241,13 +166,13 @@ def test_run_grep_builds_safe_rg_command(
     def fake_run(args, **kwargs):
         captured["args"] = args
         captured["kwargs"] = kwargs
-        return subprocess.CompletedProcess(args, 0, stdout=f"{tools.WORKDIR}/tools.py\n", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout=f"{workspace.root}/tools.py\n", stderr="")
 
     monkeypatch.setattr(tools.shutil, "which", lambda name: "/usr/bin/rg")
     monkeypatch.setattr(tools.subprocess, "run", fake_run)
 
     output = tools.run_grep(
-        "needle",
+        workspace, "needle",
         path=".",
         glob="*.py",
         output_mode=output_mode,
@@ -256,17 +181,17 @@ def test_run_grep_builds_safe_rg_command(
 
     assert output == "tools.py"
     assert captured["kwargs"]["shell"] is False
-    assert captured["kwargs"]["cwd"] == str(tools.WORKDIR)
+    assert captured["kwargs"]["cwd"] == str(workspace.root)
     assert captured["kwargs"]["timeout"] == 20
     assert expected_flag in captured["args"]
     assert "--ignore-case" in captured["args"]
     assert "--glob" in captured["args"]
     assert "*.py" in captured["args"]
     assert "!.env" in captured["args"]
-    assert captured["args"][-3:] == ["--", "needle", str(tools.WORKDIR)]
+    assert captured["args"][-3:] == ["--", "needle", str(workspace.root)]
 
 
-def test_run_grep_handles_no_matches_and_limits_output(load_module, monkeypatch) -> None:
+def test_run_grep_handles_no_matches_and_limits_output(load_module, monkeypatch, workspace) -> None:
     tools = load_module("tools", "tools.py")
 
     def no_match(args, **kwargs):
@@ -274,14 +199,14 @@ def test_run_grep_handles_no_matches_and_limits_output(load_module, monkeypatch)
 
     monkeypatch.setattr(tools.shutil, "which", lambda name: "/usr/bin/rg")
     monkeypatch.setattr(tools.subprocess, "run", no_match)
-    assert tools.run_grep("missing") == "No matches found."
+    assert tools.run_grep(workspace, "missing") == "No matches found."
 
     def many_matches(args, **kwargs):
-        stdout = "\n".join(f"{tools.WORKDIR}/file_{index}.py" for index in range(3))
+        stdout = "\n".join(f"{workspace.root}/file_{index}.py" for index in range(3))
         return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
 
     monkeypatch.setattr(tools.subprocess, "run", many_matches)
-    output = tools.run_grep("needle", head_limit=2)
+    output = tools.run_grep(workspace, "needle", head_limit=2)
 
     assert output.splitlines() == [
         "file_0.py",
@@ -290,11 +215,11 @@ def test_run_grep_handles_no_matches_and_limits_output(load_module, monkeypatch)
     ]
 
 
-def test_run_grep_rejects_workspace_escape(load_module, monkeypatch) -> None:
+def test_run_grep_rejects_workspace_escape(load_module, monkeypatch, workspace) -> None:
     tools = load_module("tools", "tools.py")
     monkeypatch.setattr(tools.shutil, "which", lambda name: "/usr/bin/rg")
 
-    output = tools.run_grep("needle", path="../")
+    output = tools.run_grep(workspace, "needle", path="../")
 
     assert output.startswith("Error: Path escapes workspace")
 
@@ -309,28 +234,26 @@ def test_run_grep_rejects_workspace_escape(load_module, monkeypatch) -> None:
         (_fc("glob", "gb2", '{"pattern":"*.py","limit":0}'), "Input should be greater than or equal to 1"),
     ],
 )
-def test_search_tools_validate_with_pydantic(load_module, item, expected_substring) -> None:
+def test_search_tools_validate_with_pydantic(load_module, workspace, item, expected_substring) -> None:
     tools = load_module("tools", "tools.py")
-    out, used_todo = tools.execute_tool_calls([item])
+    registry, todo = _runtime(tools, workspace)
+    out, used_todo = tools.execute_tool_calls([item], registry, todo)
 
     assert used_todo is False
     assert f"Error: invalid arguments for tool '{item.name}':" in out[0]["output"]
     assert expected_substring in out[0]["output"]
 
 
-def test_execute_tool_calls_sanitizes_search_arguments(load_module) -> None:
+def test_execute_tool_calls_sanitizes_search_arguments(load_module, workspace) -> None:
     tools = load_module("tools", "tools.py")
-    tools.run_glob = lambda pattern, directory, include_dirs, limit: f"{pattern}:{directory}"
-    tools.TOOL_REGISTRY["glob"].execute = tools.async_tool(lambda params: tools.run_glob(
-        params.pattern,
-        params.directory,
-        params.include_dirs,
-        params.limit,
+    registry, todo = _runtime(tools, workspace)
+    registry["glob"].execute = tools.async_tool(lambda params: (
+        f"{params.pattern}:{params.directory}"
     ))
 
     out, used_todo = tools.execute_tool_calls([
         _fc("glob", "gb1", '{"pattern":" >  *.py","directory":" $#  tests"}'),
-    ])
+    ], registry, todo)
 
     assert used_todo is False
     assert out[0]["output"] == "*.py:tests"

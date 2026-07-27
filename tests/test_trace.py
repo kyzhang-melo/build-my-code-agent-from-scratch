@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import json
 from pathlib import Path
 import sys
@@ -78,16 +77,19 @@ def test_emit_trace_isolates_broken_sink() -> None:
     runtime_trace.emit_trace(context, "tool.completed", status="success")
 
 
-def test_dispatcher_traces_success_and_safe_write_metadata(load_module) -> None:
+def test_dispatcher_traces_success_and_safe_write_metadata(load_module, workspace) -> None:
     tools = load_module("tools", "tools.py")
     sink = runtime_trace.MemoryTraceSink()
     context = runtime_trace.TraceContext(sink=sink, run_id="test")
-    tools.TOOL_REGISTRY["write_file"].execute = lambda _params: asyncio.sleep(
+    registry = tools.build_tool_registry(workspace, tools.TodoManager())
+    registry["write_file"].execute = lambda _params: asyncio.sleep(
         0, result="wrote"
     )
 
     asyncio.run(tools.execute_tool_calls_async(
         [_fc("write_file", "w1", '{"path":"x.txt","content":"SECRET","mode":"append"}')],
+        registry,
+        tools.TodoManager(),
         trace_context=context,
     ))
 
@@ -103,15 +105,16 @@ def test_dispatcher_traces_success_and_safe_write_metadata(load_module) -> None:
     assert completed["success"] is True
 
 
-def test_dispatcher_traces_failure_statuses(load_module) -> None:
+def test_dispatcher_traces_failure_statuses(load_module, workspace) -> None:
     tools = load_module("tools", "tools.py")
     sink = runtime_trace.MemoryTraceSink()
     context = runtime_trace.TraceContext(sink=sink)
+    registry = tools.build_tool_registry(workspace, tools.TodoManager())
 
     asyncio.run(tools.execute_tool_calls_async([
         _fc("missing", "c1", "{}"),
         _fc("bash", "c2", "{bad-json"),
-    ], trace_context=context))
+    ], registry, tools.TodoManager(), trace_context=context))
 
     completed = sink.by_type("tool.completed")
     assert [(event["call_id"], event["status"]) for event in completed] == [
@@ -120,18 +123,21 @@ def test_dispatcher_traces_failure_statuses(load_module) -> None:
     ]
 
 
-def test_dispatcher_traces_permission_denial(load_module) -> None:
+def test_dispatcher_traces_permission_denial(load_module, workspace) -> None:
     tools = load_module("tools", "tools.py")
     permissions = runtime_permissions
     sink = runtime_trace.MemoryTraceSink()
     context = runtime_trace.TraceContext(sink=sink)
     service = permissions.PermissionService(
-        permissions.PermissionManager(Path(tools.WORKDIR)),
+        permissions.PermissionManager(workspace.root),
         permissions.TerminalApprovalHandler(interactive=False),
     )
+    registry = tools.build_tool_registry(workspace, tools.TodoManager())
 
     asyncio.run(tools.execute_tool_calls_async(
         [_fc("bash", "b1", '{"command":"echo hi"}')],
+        registry,
+        tools.TodoManager(),
         permission_service=service,
         trace_context=context,
     ))
@@ -140,7 +146,7 @@ def test_dispatcher_traces_permission_denial(load_module) -> None:
     assert sink.by_type("tool.completed")[0]["status"] == "permission_denied"
 
 
-def test_dispatcher_traces_cancellation_and_reraises(load_module) -> None:
+def test_dispatcher_traces_cancellation_and_reraises(load_module, workspace) -> None:
     tools = load_module("tools", "tools.py")
     sink = runtime_trace.MemoryTraceSink()
     context = runtime_trace.TraceContext(sink=sink)
@@ -148,11 +154,14 @@ def test_dispatcher_traces_cancellation_and_reraises(load_module) -> None:
     async def cancel(_params):
         raise asyncio.CancelledError
 
-    tools.TOOL_REGISTRY["read_file"].execute = cancel
+    registry = tools.build_tool_registry(workspace, tools.TodoManager())
+    registry["read_file"].execute = cancel
 
     async def scenario():
         await tools.execute_tool_calls_async(
             [_fc("read_file", "r1", '{"path":"README.md"}')],
+            registry,
+            tools.TodoManager(),
             trace_context=context,
         )
 
@@ -166,15 +175,17 @@ def test_dispatcher_traces_cancellation_and_reraises(load_module) -> None:
     assert sink.by_type("tool.completed")[0]["status"] == "cancelled"
 
 
-def test_dispatcher_traces_todo_transitions(load_module) -> None:
+def test_dispatcher_traces_todo_transitions(load_module, workspace) -> None:
     tools = load_module("tools", "tools.py")
     sink = runtime_trace.MemoryTraceSink()
     context = runtime_trace.TraceContext(sink=sink)
+    todo = tools.TodoManager()
+    registry = tools.build_tool_registry(workspace, todo)
 
     tools.execute_tool_calls([
         _fc("todo", "t1", '{"items":[{"content":"step","status":"in_progress"}]}'),
         _fc("todo", "t2", '{"items":[{"content":"step","status":"completed"}]}'),
-    ], trace_context=context)
+    ], registry, todo, trace_context=context)
 
     changed = sink.by_type("todo.changed")
     assert changed[0]["transitions"] == [
@@ -212,12 +223,23 @@ def test_permission_trace_distinguishes_policy_and_approval() -> None:
     assert event["decision"] == "allow"
 
 
-def test_stop_gate_trace_records_block_and_give_up(load_module, monkeypatch) -> None:
+def test_stop_gate_trace_records_block_and_give_up(load_module, monkeypatch, workspace) -> None:
     main_module = load_module("main", "main.py")
     sink = runtime_trace.MemoryTraceSink()
     context = runtime_trace.TraceContext(sink=sink)
     tools_module = sys.modules["tools"]
-    main_module.TODO.update(tools_module.TodoParams.model_validate({
+
+    class DenyHandler:
+        async def request(self, _request):
+            return runtime_permissions.ApprovalResponse("deny")
+
+    session = main_module.create_parent_session(
+        workspace.root,
+        approval_handler=DenyHandler(),
+        trace_context=context,
+        on_text=None,
+    )
+    session.todo.update(tools_module.TodoParams.model_validate({
         "items": [{"content": "unfinished", "status": "in_progress"}],
     }))
     response = types.SimpleNamespace(output=[], output_text="Done.", usage=None)
@@ -230,15 +252,10 @@ def test_stop_gate_trace_records_block_and_give_up(load_module, monkeypatch) -> 
         "client",
         types.SimpleNamespace(responses=types.SimpleNamespace(create=create)),
     )
-    config = dataclasses.replace(
-        main_module.PARENT_CONFIG,
-        trace_context=context,
-        on_text=None,
-    )
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
-    assert asyncio.run(main_module.run_one_turn(state, config)) is None
+    assert asyncio.run(main_module.run_one_turn(state, session)) is None
     state.nudges = main_module.TODO_CONTRACT_MAX_NUDGES
-    assert asyncio.run(main_module.run_one_turn(state, config)) is not None
+    assert asyncio.run(main_module.run_one_turn(state, session)) is not None
 
     assert [event["decision"] for event in sink.by_type("stop_gate.checked")] == [
         "block",

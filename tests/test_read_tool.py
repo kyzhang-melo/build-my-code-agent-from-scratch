@@ -130,9 +130,9 @@ def test_large_file_guidance(load_module, workspace) -> None:
     assert "grep" in out.lower()
 
 
-def test_concurrency_safe_flags(load_module) -> None:
+def test_concurrency_safe_flags(load_module, workspace) -> None:
     tools = load_module("tools", "tools.py")
-    registry = tools.TOOL_REGISTRY
+    registry = tools.build_tool_registry(workspace, tools.TodoManager())
     for name in ("read_file", "glob", "grep", "task"):
         assert registry[name].concurrency_safe is True, name
     for name in ("bash", "write_file", "edit_file", "todo"):

@@ -29,7 +29,6 @@ from trace import TraceContext, emit_trace
 from workspace import Workspace
 
 
-WORKDIR = Path.cwd()
 TOOL_OUTPUT_PREVIEW_CHARS = 500
 READ_ONLY_TOOL_NAMES = {"read_file", "glob", "grep"}
 # Noisy/sensitive directories pruned from glob traversal and results, keeping
@@ -530,9 +529,6 @@ class TodoManager:
         return "\n".join(lines)
 
 
-TODO = TodoManager()
-
-
 class BashParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -747,10 +743,10 @@ def _resolve_bash_executable() -> str:
     raise FileNotFoundError(f"Bash executable not found. Checked: {checked}")
 
 
-async def run_bash(command: str) -> str:
+async def run_bash(workspace: Workspace, command: str) -> str:
     """Run one foreground Bash command with bounded, merged output."""
     started_at = time.monotonic()
-    deny_reason = bash_hard_deny_reason(command, WORKDIR)
+    deny_reason = bash_hard_deny_reason(command, workspace.root)
     if deny_reason:
         return BashResult(
             status="blocked",
@@ -772,7 +768,7 @@ async def run_bash(command: str) -> str:
             bash_path,
             "-c",
             command,
-            cwd=str(WORKDIR),
+            cwd=str(workspace.root),
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -858,13 +854,6 @@ async def run_bash(command: str) -> str:
         if collector_task is not None and not collector_task.done():
             collector_task.cancel()
             await asyncio.gather(collector_task, return_exceptions=True)
-
-
-def safe_path(path: str) -> Path:
-    resolved = (WORKDIR / path).resolve()
-    if not resolved.is_relative_to(WORKDIR):
-        raise ValueError(f"Path escapes workspace: {path}")
-    return resolved
 
 
 # Common non-text extensions, rejected early with a clear message. The null-byte
@@ -1344,9 +1333,15 @@ def _glob_walk(base: Path, tail: str, include_dirs: bool) -> list[Path]:
     return matches
 
 
-def _format_glob_matches(pattern: str, base: Path, matches: list[Path], limit: int) -> str:
+def _format_glob_matches(
+    workspace: Workspace,
+    pattern: str,
+    base: Path,
+    matches: list[Path],
+    limit: int,
+) -> str:
     matches = [path for path in matches if not _glob_excluded(path.relative_to(base))]
-    matches = [path for path in matches if not is_sensitive_path(path.resolve(), WORKDIR)]
+    matches = [path for path in matches if not is_sensitive_path(path.resolve(), workspace.root)]
     matches.sort()
     total = len(matches)
     if total == 0:
@@ -1360,13 +1355,14 @@ def _format_glob_matches(pattern: str, base: Path, matches: list[Path], limit: i
 
 
 def run_glob(
+    workspace: Workspace,
     pattern: str,
     directory: str | None = None,
     include_dirs: bool = True,
     limit: int = 1000,
 ) -> str:
     try:
-        base = safe_path(directory or ".")
+        base = workspace.resolve(directory or ".")
         if not base.exists():
             return f"Error: Directory not found: {directory or '.'}"
         if not base.is_dir():
@@ -1385,13 +1381,13 @@ def run_glob(
             if not include_dirs:
                 matches = [path for path in matches if path.is_file()]
 
-        return _format_glob_matches(pattern, base, matches, limit)
+        return _format_glob_matches(workspace, pattern, base, matches, limit)
     except Exception as e:
         return f"Error: {e}"
 
 
-def _strip_workdir_prefix(output: str) -> str:
-    prefix = str(WORKDIR) + "/"
+def _strip_workdir_prefix(workspace: Workspace, output: str) -> str:
+    prefix = str(workspace.root) + "/"
     return "\n".join(
         line[len(prefix) :] if line.startswith(prefix) else line
         for line in output.splitlines()
@@ -1399,6 +1395,7 @@ def _strip_workdir_prefix(output: str) -> str:
 
 
 def run_grep(
+    workspace: Workspace,
     pattern: str,
     path: str = ".",
     glob: str | None = None,
@@ -1412,7 +1409,7 @@ def run_grep(
         return "Error: ripgrep (`rg`) is not installed. Install it with `brew install ripgrep`."
 
     try:
-        search_path = safe_path(path)
+        search_path = workspace.resolve(path)
         if not search_path.exists():
             return f"Error: Path not found: {path}"
 
@@ -1452,7 +1449,7 @@ def run_grep(
         result = subprocess.run(
             args,
             shell=False,
-            cwd=str(WORKDIR),
+            cwd=str(workspace.root),
             capture_output=True,
             text=True,
             timeout=20,
@@ -1462,7 +1459,7 @@ def run_grep(
     except Exception as e:
         return f"Error: {e}"
 
-    output = _strip_workdir_prefix(result.stdout.strip())
+    output = _strip_workdir_prefix(workspace, result.stdout.strip())
     stderr = result.stderr.strip()
     if result.returncode == 1:
         return "No matches found."
@@ -1484,7 +1481,7 @@ class ToolRuntimeSpec:
     # True when the tool only reads state and is safe to run concurrently with
     # other tool calls in the same turn. Consumed by the threaded executor; the
     # read-only tools and the explore-only `task` subagent qualify, while tools
-    # that mutate the workspace or the global TODO do not.
+        # that mutate the workspace or session TODO do not.
     concurrency_safe: bool = False
 
 
@@ -1571,24 +1568,31 @@ async def unavailable_task_runner(prompt: str, description: str) -> str:
 
 
 def build_tool_registry(
+    workspace: Workspace,
+    todo: TodoManager,
     tool_names: set[str] | None = None,
     *,
     task_runner: Callable[[str, str], Awaitable[str]] | None = None,
 ) -> dict[str, ToolRuntimeSpec]:
+    """Build a tool registry bound to one workspace.
+
+    The workspace is captured here rather than looked up per call, so a tool can
+    never operate on a directory other than the one its registry was built for.
+    """
     runner = task_runner or unavailable_task_runner
     registry = {
         "bash": ToolRuntimeSpec(
             name="bash",
             params_model=BashParams,
             sanitize_args=sanitize_bash_args,
-            execute=lambda params: run_bash(params.command),
+            execute=lambda params: run_bash(workspace, params.command),
         ),
         "read_file": ToolRuntimeSpec(
             name="read_file",
             params_model=ReadFileParams,
             sanitize_args=sanitize_file_args,
             execute=async_tool(lambda params: run_read(
-                Workspace(WORKDIR), params.path, params.offset, params.limit,
+                workspace, params.path, params.offset, params.limit,
             )),
             concurrency_safe=True,
         ),
@@ -1597,7 +1601,7 @@ def build_tool_registry(
             params_model=WriteFileParams,
             sanitize_args=sanitize_file_args,
             execute=async_tool(lambda params: run_write(
-                Workspace(WORKDIR), params.path, params.content, params.mode,
+                workspace, params.path, params.content, params.mode,
             )),
         ),
         "edit_file": ToolRuntimeSpec(
@@ -1605,7 +1609,7 @@ def build_tool_registry(
             params_model=EditFileParams,
             sanitize_args=sanitize_edit_args,
             execute=async_tool(lambda params: run_edit(
-                Workspace(WORKDIR), params.path, params.edits,
+                workspace, params.path, params.edits,
             )),
         ),
         "glob": ToolRuntimeSpec(
@@ -1613,6 +1617,7 @@ def build_tool_registry(
             params_model=GlobParams,
             sanitize_args=sanitize_search_args,
             execute=async_tool(lambda params: run_glob(
+                workspace,
                 params.pattern,
                 params.directory,
                 params.include_dirs,
@@ -1625,6 +1630,7 @@ def build_tool_registry(
             params_model=GrepParams,
             sanitize_args=sanitize_search_args,
             execute=async_tool(lambda params: run_grep(
+                workspace,
                 params.pattern,
                 params.path,
                 params.glob,
@@ -1639,7 +1645,7 @@ def build_tool_registry(
             name="todo",
             params_model=TodoParams,
             sanitize_args=sanitize_passthrough,
-            execute=async_tool(lambda params: TODO.update(params)),
+            execute=async_tool(lambda params: todo.update(params)),
         ),
         "task": ToolRuntimeSpec(
             name="task",
@@ -1654,13 +1660,7 @@ def build_tool_registry(
     return registry
 
 
-TOOL_REGISTRY = build_tool_registry()
-EXPLORE_TOOL_REGISTRY = build_tool_registry(READ_ONLY_TOOL_NAMES)
 EXPLORE_TOOLS = [tool for tool in TOOLS if tool["name"] in READ_ONLY_TOOL_NAMES]
-
-
-def configure_task_runner(task_runner: Callable[[str, str], Awaitable[str]]) -> None:
-    TOOL_REGISTRY["task"] = build_tool_registry(task_runner=task_runner)["task"]
 
 
 def parse_tool_args(raw_arguments) -> tuple[dict, str | None]:
@@ -1762,10 +1762,10 @@ def _safe_trace_arguments(tool_name: str, args: dict) -> dict:
         return {"argument_keys": sorted(str(key) for key in args)}
 
 
-def _todo_items_snapshot() -> list[dict]:
+def _todo_items_snapshot(todo: TodoManager) -> list[dict]:
     return [
         item.model_dump(by_alias=True)
-        for item in TODO.state.items
+        for item in todo.state.items
     ]
 
 
@@ -1793,7 +1793,8 @@ def _tool_reported_error(tool_name: str, output: str) -> bool:
 
 async def run_tool_call_async(
     item,
-    registry: dict[str, ToolRuntimeSpec] | None = None,
+    registry: dict[str, ToolRuntimeSpec],
+    todo: TodoManager,
     permission_service: PermissionService | None = None,
     permission_source: str = "parent",
     trace_context: TraceContext | None = None,
@@ -1801,8 +1802,7 @@ async def run_tool_call_async(
     started_at = time.monotonic()
     used_todo = item.name == "todo"
     args, parse_error = parse_tool_args(item.arguments)
-    active_registry = registry or TOOL_REGISTRY
-    spec = active_registry.get(item.name)
+    spec = registry.get(item.name)
     status = "success"
     error_type = None
     normalized_args = args
@@ -1847,7 +1847,7 @@ async def run_tool_call_async(
             emit_requested()
             if item.name == "todo":
                 try:
-                    todo_before = _todo_items_snapshot()
+                    todo_before = _todo_items_snapshot(todo)
                 except Exception:
                     todo_before = None
             decision = None
@@ -1898,7 +1898,7 @@ async def run_tool_call_async(
                         error_type = "tool_reported_error"
                     if item.name == "todo" and status == "success":
                         try:
-                            todo_after = _todo_items_snapshot()
+                            todo_after = _todo_items_snapshot(todo)
                             transitions = _todo_transitions(todo_before or [], todo_after)
                         except Exception:
                             pass
@@ -1953,7 +1953,8 @@ async def run_tool_call_async(
 
 def run_tool_call(
     item,
-    registry: dict[str, ToolRuntimeSpec] | None = None,
+    registry: dict[str, ToolRuntimeSpec],
+    todo: TodoManager,
     permission_service: PermissionService | None = None,
     permission_source: str = "parent",
     trace_context: TraceContext | None = None,
@@ -1962,6 +1963,7 @@ def run_tool_call(
         run_tool_call_async(
             item,
             registry,
+            todo,
             permission_service,
             permission_source,
             trace_context,
@@ -1998,16 +2000,16 @@ def _partition_tool_calls(
 
 async def execute_tool_calls_async(
     tool_calls,
-    registry: dict[str, ToolRuntimeSpec] | None = None,
+    registry: dict[str, ToolRuntimeSpec],
+    todo: TodoManager,
     permission_service: PermissionService | None = None,
     permission_source: str = "parent",
     trace_context: TraceContext | None = None,
 ) -> tuple[list[dict], bool]:
-    active_registry = registry or TOOL_REGISTRY
     results = []
     used_todo = False
 
-    for is_safe, batch in _partition_tool_calls(tool_calls, active_registry):
+    for is_safe, batch in _partition_tool_calls(tool_calls, registry):
         if is_safe and len(batch) > 1:
             for start in range(0, len(batch), MAX_PARALLEL_TOOL_CALLS):
                 chunk = batch[start:start + MAX_PARALLEL_TOOL_CALLS]
@@ -2015,7 +2017,8 @@ async def execute_tool_calls_async(
                     *(
                         run_tool_call_async(
                             item,
-                            active_registry,
+                            registry,
+                            todo,
                             permission_service,
                             permission_source,
                             trace_context,
@@ -2031,7 +2034,8 @@ async def execute_tool_calls_async(
             for item in batch:
                 tool_result, called_todo = await run_tool_call_async(
                     item,
-                    active_registry,
+                    registry,
+                    todo,
                     permission_service,
                     permission_source,
                     trace_context,
@@ -2044,7 +2048,8 @@ async def execute_tool_calls_async(
 
 def execute_tool_calls(
     tool_calls,
-    registry: dict[str, ToolRuntimeSpec] | None = None,
+    registry: dict[str, ToolRuntimeSpec],
+    todo: TodoManager,
     permission_service: PermissionService | None = None,
     permission_source: str = "parent",
     trace_context: TraceContext | None = None,
@@ -2053,6 +2058,7 @@ def execute_tool_calls(
         execute_tool_calls_async(
             tool_calls,
             registry,
+            todo,
             permission_service,
             permission_source,
             trace_context,

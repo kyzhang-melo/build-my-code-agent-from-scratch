@@ -22,7 +22,7 @@ import asyncio
 import json
 import shutil
 import sys
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -33,22 +33,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import main  # noqa: E402  (path setup must happen first)
-import tools  # noqa: E402
-from prompts import build_explore_system, build_parent_system  # noqa: E402
 from trace import MemoryTraceSink, TraceContext  # noqa: E402
 from permissions import (  # noqa: E402
     ApprovalRequest,
     ApprovalResponse,
-    PermissionManager,
-    PermissionMode,
-    PermissionService,
 )
 
 SCENARIOS_DIR = Path(__file__).resolve().parent / "scenarios"
 RUNS_DIR = Path(__file__).resolve().parent / ".runs"
-
-ORIGINAL_EXPLORE_CONFIG = main.EXPLORE_SUBAGENT_CONFIG
-
 
 class AutoApproveHandler:
     """Headless approval handler that approves every ASK request.
@@ -273,14 +265,9 @@ async def run_scenario(scenario_dir: Path, run_root: Path) -> ScenarioResult:
     name = config.get("name", scenario_dir.name)
     workspace = prepare_workspace(scenario_dir, run_root)
 
-    # Isolate this scenario: point the tools' module-level WORKDIR at the fresh
-    # workspace, reset the shared todo singleton, and build a scenario-scoped
-    # permission service so session approvals never leak across scenarios.
+    # Every scenario receives a fresh session, including its workspace, todo,
+    # permission service, registry, prompt, and trace context.
     workspace_root = workspace.resolve()
-    tools.WORKDIR = workspace_root
-    tools.TODO.state = tools.PlanningState()
-    manager = PermissionManager(workspace_root, mode=PermissionMode.DEFAULT)
-    service = PermissionService(manager=manager, handler=AutoApproveHandler())
     trace_sink = MemoryTraceSink()
     trace_context = TraceContext(
         sink=trace_sink,
@@ -288,19 +275,11 @@ async def run_scenario(scenario_dir: Path, run_root: Path) -> ScenarioResult:
         agent_id="parent",
     )
 
-    # Render both system prompts against this scenario's workspace so the parent
-    # and the explore subagent advertise the directory their tools actually use.
-    agent_config = replace(
-        main.PARENT_CONFIG,
-        system=build_parent_system(workspace_root),
-        permission_service=service,
+    session = main.create_parent_session(
+        workspace_root,
+        approval_handler=AutoApproveHandler(),
         trace_context=trace_context,
         on_text=None,
-    )
-    main.EXPLORE_SUBAGENT_CONFIG = replace(
-        ORIGINAL_EXPLORE_CONFIG,
-        system=build_explore_system(workspace_root),
-        permission_service=service,
     )
 
     state = main.LoopState(messages=[{"role": "user", "content": config["prompt"]}])
@@ -308,7 +287,7 @@ async def run_scenario(scenario_dir: Path, run_root: Path) -> ScenarioResult:
 
     try:
         timeout = config.get("timeout")
-        coro = main.agent_loop(state, agent_config)
+        coro = main.agent_loop(state, session)
         outcome = await (asyncio.wait_for(coro, timeout) if timeout else coro)
     except asyncio.TimeoutError:
         result.error = f"timed out after {config.get('timeout')}s"

@@ -1,9 +1,7 @@
 """Focused tests for the upgraded write_file and edit_file tools.
 
-Tests that call ``run_write``/``run_edit`` directly take an isolated ``workspace``
-fixture backed by ``tmp_path``.  Tests that go through the dispatcher still write
-inside the repository checkout because the tool registry is bound to
-``tools.WORKDIR`` at import time; they clean up via the ``tmp_dir`` fixture.
+All direct and dispatcher paths use an isolated ``workspace`` fixture backed by
+``tmp_path``.
 """
 
 from __future__ import annotations
@@ -22,16 +20,12 @@ import permissions as permission_module
 # Helpers
 # ---------------------------------------------------------------------------
 
-_TMP_DIR = "tests/_tmp_write_edit"
-
-
-def _tmp(tools, *parts: str) -> Path:
-    """Return an absolute path inside the shared temp directory."""
-    return tools.WORKDIR / _TMP_DIR / Path(*parts)
+def _tmp(workspace, *parts: str) -> Path:
+    return workspace.root / Path(*parts)
 
 
 def _rel(*parts: str) -> str:
-    return f"{_TMP_DIR}/{Path(*parts).as_posix()}"
+    return Path(*parts).as_posix()
 
 
 @pytest.fixture
@@ -39,29 +33,17 @@ def tools(load_module):
     return load_module("tools", "tools.py")
 
 
-@pytest.fixture
-def tmp_dir(tools):
-    directory = _tmp(tools)
-    directory.mkdir(parents=True, exist_ok=True)
-    yield directory
-    # Best-effort cleanup of the whole temp tree.
-    import shutil
-
-    shutil.rmtree(directory, ignore_errors=True)
-
-
-def _write_file(tools, rel: str, content: str) -> Path:
-    fp = tools.WORKDIR / rel
-    fp.parent.mkdir(parents=True, exist_ok=True)
-    fp.write_text(content, encoding="utf-8", newline="")
-    return fp
-
-
 def _seed(workspace, rel: str, content: str) -> Path:
     fp = workspace.root / rel
     fp.parent.mkdir(parents=True, exist_ok=True)
     fp.write_text(content, encoding="utf-8", newline="")
     return fp
+
+
+@pytest.fixture
+def runtime(tools, workspace):
+    todo = tools.TodoManager()
+    return tools.build_tool_registry(workspace, todo), todo
 
 
 # ---------------------------------------------------------------------------
@@ -305,46 +287,50 @@ def _fc(name: str, call_id: str, arguments: str):
 class TestDispatcherSchemaTolerance:
     """Exercise the full dispatcher path: sanitize → validate → execute."""
 
-    def test_standard_edits_array(self, tools, tmp_dir):
+    def test_standard_edits_array(self, tools, workspace, runtime):
+        registry, todo = runtime
         rel = _rel("disp_standard.txt")
-        _write_file(tools, rel, "alpha beta")
+        _seed(workspace, rel, "alpha beta")
         out, _ = tools.execute_tool_calls([
             _fc("edit_file", "e1", json.dumps({
                 "path": rel,
                 "edits": [{"old_text": "alpha", "new_text": "ALPHA"}],
             })),
-        ])
+        ], registry, todo)
         assert "Edited" in out[0]["output"]
-        assert "ALPHA beta" == (_tmp(tools, "disp_standard.txt")).read_text(encoding="utf-8")
+        assert "ALPHA beta" == _tmp(workspace, "disp_standard.txt").read_text(encoding="utf-8")
 
-    def test_legacy_top_level_params(self, tools, tmp_dir):
+    def test_legacy_top_level_params(self, tools, workspace, runtime):
+        registry, todo = runtime
         rel = _rel("disp_legacy.txt")
-        _write_file(tools, rel, "alpha beta")
+        _seed(workspace, rel, "alpha beta")
         out, _ = tools.execute_tool_calls([
             _fc("edit_file", "e1", json.dumps({
                 "path": rel,
                 "old_text": "alpha",
                 "new_text": "ALPHA",
             })),
-        ])
+        ], registry, todo)
         assert "Edited" in out[0]["output"]
-        assert "ALPHA beta" == (_tmp(tools, "disp_legacy.txt")).read_text(encoding="utf-8")
+        assert "ALPHA beta" == _tmp(workspace, "disp_legacy.txt").read_text(encoding="utf-8")
 
-    def test_edits_as_json_string(self, tools, tmp_dir):
+    def test_edits_as_json_string(self, tools, workspace, runtime):
+        registry, todo = runtime
         rel = _rel("disp_jsonstr.txt")
-        _write_file(tools, rel, "alpha beta")
+        _seed(workspace, rel, "alpha beta")
         out, _ = tools.execute_tool_calls([
             _fc("edit_file", "e1", json.dumps({
                 "path": rel,
                 "edits": json.dumps([{"old_text": "alpha", "new_text": "ALPHA"}]),
             })),
-        ])
+        ], registry, todo)
         assert "Edited" in out[0]["output"]
-        assert "ALPHA beta" == (_tmp(tools, "disp_jsonstr.txt")).read_text(encoding="utf-8")
+        assert "ALPHA beta" == _tmp(workspace, "disp_jsonstr.txt").read_text(encoding="utf-8")
 
-    def test_new_and_legacy_params_merged(self, tools, tmp_dir):
+    def test_new_and_legacy_params_merged(self, tools, workspace, runtime):
+        registry, todo = runtime
         rel = _rel("disp_merged.txt")
-        _write_file(tools, rel, "alpha beta gamma")
+        _seed(workspace, rel, "alpha beta gamma")
         out, _ = tools.execute_tool_calls([
             _fc("edit_file", "e1", json.dumps({
                 "path": rel,
@@ -352,55 +338,61 @@ class TestDispatcherSchemaTolerance:
                 "old_text": "gamma",
                 "new_text": "GAMMA",
             })),
-        ])
+        ], registry, todo)
         assert "Edited" in out[0]["output"]
         assert "2 replacement" in out[0]["output"]
-        assert "ALPHA beta GAMMA" == (_tmp(tools, "disp_merged.txt")).read_text(encoding="utf-8")
+        assert "ALPHA beta GAMMA" == _tmp(workspace, "disp_merged.txt").read_text(encoding="utf-8")
 
-    def test_empty_edits_rejected(self, tools, tmp_dir):
+    def test_empty_edits_rejected(self, tools, runtime):
+        registry, todo = runtime
         out, _ = tools.execute_tool_calls([
             _fc("edit_file", "e1", json.dumps({"path": _rel("x.txt"), "edits": []})),
-        ])
+        ], registry, todo)
         assert "Error" in out[0]["output"]
 
-    def test_invalid_json_string_edits_rejected(self, tools, tmp_dir):
+    def test_invalid_json_string_edits_rejected(self, tools, runtime):
+        registry, todo = runtime
         out, _ = tools.execute_tool_calls([
             _fc("edit_file", "e1", json.dumps({
                 "path": _rel("x.txt"),
                 "edits": "not-valid-json",
             })),
-        ])
+        ], registry, todo)
         assert "Error" in out[0]["output"]
 
-    def test_wrong_type_edits_rejected(self, tools, tmp_dir):
+    def test_wrong_type_edits_rejected(self, tools, runtime):
+        registry, todo = runtime
         out, _ = tools.execute_tool_calls([
             _fc("edit_file", "e1", json.dumps({
                 "path": _rel("x.txt"),
                 "edits": 42,
             })),
-        ])
+        ], registry, todo)
         assert "Error" in out[0]["output"]
 
-    def test_half_legacy_pair_rejected(self, tools, tmp_dir):
+    def test_half_legacy_pair_rejected(self, tools, runtime):
+        registry, todo = runtime
         # old_text without new_text should not trigger legacy conversion.
         out, _ = tools.execute_tool_calls([
             _fc("edit_file", "e1", json.dumps({
                 "path": _rel("x.txt"),
                 "old_text": "something",
             })),
-        ])
+        ], registry, todo)
         assert "Error" in out[0]["output"]
 
-    def test_extra_nested_field_rejected(self, tools, tmp_dir):
+    def test_extra_nested_field_rejected(self, tools, runtime):
+        registry, todo = runtime
         out, _ = tools.execute_tool_calls([
             _fc("edit_file", "e1", json.dumps({
                 "path": _rel("x.txt"),
                 "edits": [{"old_text": "a", "new_text": "b", "extra": 1}],
             })),
-        ])
+        ], registry, todo)
         assert "Error" in out[0]["output"]
 
-    def test_write_mode_validation(self, tools, tmp_dir):
+    def test_write_mode_validation(self, tools, runtime):
+        registry, todo = runtime
         rel = _rel("mode_valid.txt")
         out, _ = tools.execute_tool_calls([
             _fc("write_file", "w1", json.dumps({
@@ -408,17 +400,18 @@ class TestDispatcherSchemaTolerance:
                 "content": "ok",
                 "mode": "overwrite",
             })),
-        ])
+        ], registry, todo)
         assert "Wrote" in out[0]["output"]
 
-    def test_write_invalid_mode_rejected(self, tools, tmp_dir):
+    def test_write_invalid_mode_rejected(self, tools, runtime):
+        registry, todo = runtime
         out, _ = tools.execute_tool_calls([
             _fc("write_file", "w1", json.dumps({
                 "path": _rel("bad.txt"),
                 "content": "ok",
                 "mode": "bogus",
             })),
-        ])
+        ], registry, todo)
         assert "Error" in out[0]["output"]
 
 
@@ -430,26 +423,22 @@ class TestDispatcherSchemaTolerance:
 class TestApprovalBlocking:
     """Verify that denied permissions cause zero filesystem mutation."""
 
-    def test_denied_write_creates_no_parent_dir(self, tools, tmp_dir):
+    def test_denied_write_creates_no_parent_dir(self, tools, workspace, runtime):
+        registry, todo = runtime
         permissions = permission_module
         service = permissions.PermissionService(
-            permissions.PermissionManager(Path(tools.WORKDIR)),
+            permissions.PermissionManager(workspace.root),
             permissions.TerminalApprovalHandler(interactive=False),
         )
-        nested = _tmp(tools, "denied/sub/dir.txt")
-        # Ensure clean slate.
-        nested_parent = _tmp(tools, "denied")
-        if nested_parent.exists():
-            import shutil
-
-            shutil.rmtree(nested_parent, ignore_errors=True)
+        nested = _tmp(workspace, "denied/sub/dir.txt")
+        nested_parent = _tmp(workspace, "denied")
 
         out, _ = asyncio.run(tools.execute_tool_calls_async([
             _fc("write_file", "w1", json.dumps({
                 "path": _rel("denied/sub/dir.txt"),
                 "content": "x",
             })),
-        ], permission_service=service))
+        ], registry, todo, permission_service=service))
 
         payload = json.loads(out[0]["output"])
         assert payload["error"] == "permission_denied"
@@ -457,12 +446,13 @@ class TestApprovalBlocking:
         assert not nested.exists()
         assert not nested_parent.exists()
 
-    def test_denied_edit_leaves_file_unchanged(self, tools, tmp_dir):
+    def test_denied_edit_leaves_file_unchanged(self, tools, workspace, runtime):
+        registry, todo = runtime
         permissions = permission_module
         rel = _rel("denied_edit.txt")
-        _write_file(tools, rel, "original content")
+        _seed(workspace, rel, "original content")
         service = permissions.PermissionService(
-            permissions.PermissionManager(Path(tools.WORKDIR)),
+            permissions.PermissionManager(workspace.root),
             permissions.TerminalApprovalHandler(interactive=False),
         )
 
@@ -471,23 +461,24 @@ class TestApprovalBlocking:
                 "path": rel,
                 "edits": [{"old_text": "original", "new_text": "CHANGED"}],
             })),
-        ], permission_service=service))
+        ], registry, todo, permission_service=service))
 
         payload = json.loads(out[0]["output"])
         assert payload["error"] == "permission_denied"
-        assert (_tmp(tools, "denied_edit.txt")).read_text(encoding="utf-8") == "original content"
+        assert _tmp(workspace, "denied_edit.txt").read_text(encoding="utf-8") == "original content"
 
-    def test_approved_append_executes(self, tools, tmp_dir):
+    def test_approved_append_executes(self, tools, workspace, runtime):
+        registry, todo = runtime
         permissions = permission_module
         rel = _rel("approved_append.txt")
-        _write_file(tools, rel, "line1\n")
+        _seed(workspace, rel, "line1\n")
 
         class Handler:
             async def request(self, _request):
                 return permissions.ApprovalResponse("approve")
 
         service = permissions.PermissionService(
-            permissions.PermissionManager(Path(tools.WORKDIR)),
+            permissions.PermissionManager(workspace.root),
             Handler(),
         )
 
@@ -497,22 +488,23 @@ class TestApprovalBlocking:
                 "content": "line2\n",
                 "mode": "append",
             })),
-        ], permission_service=service))
+        ], registry, todo, permission_service=service))
 
         assert "Appended" in out[0]["output"]
-        assert (_tmp(tools, "approved_append.txt")).read_text(encoding="utf-8") == "line1\nline2\n"
+        assert _tmp(workspace, "approved_append.txt").read_text(encoding="utf-8") == "line1\nline2\n"
 
-    def test_session_approval_covers_write_and_edit(self, tools, tmp_dir):
+    def test_session_approval_covers_write_and_edit(self, tools, workspace, runtime):
+        registry, todo = runtime
         permissions = permission_module
         rel = _rel("session_cover.txt")
-        _write_file(tools, rel, "hello world")
+        _seed(workspace, rel, "hello world")
 
         class Handler:
             async def request(self, _request):
                 return permissions.ApprovalResponse("approve_for_session")
 
         service = permissions.PermissionService(
-            permissions.PermissionManager(Path(tools.WORKDIR)),
+            permissions.PermissionManager(workspace.root),
             Handler(),
         )
 
@@ -525,18 +517,19 @@ class TestApprovalBlocking:
                 "path": rel,
                 "edits": [{"old_text": "hello", "new_text": "HELLO"}],
             })),
-        ], permission_service=service))
+        ], registry, todo, permission_service=service))
 
         assert "Wrote" in out[0]["output"]
         assert "Edited" in out[1]["output"]
-        assert (_tmp(tools, "session_cover.txt")).read_text(encoding="utf-8") == "HELLO earth"
+        assert _tmp(workspace, "session_cover.txt").read_text(encoding="utf-8") == "HELLO earth"
 
-    def test_plan_mode_blocks_write_and_edit(self, tools, tmp_dir):
+    def test_plan_mode_blocks_write_and_edit(self, tools, workspace, runtime):
+        registry, todo = runtime
         permissions = permission_module
         rel = _rel("plan_blocked.txt")
-        _write_file(tools, rel, "original")
+        _seed(workspace, rel, "original")
 
-        manager = permissions.PermissionManager(Path(tools.WORKDIR))
+        manager = permissions.PermissionManager(workspace.root)
         manager.set_mode("plan")
         service = permissions.PermissionService(manager, None)
 
@@ -549,10 +542,10 @@ class TestApprovalBlocking:
                 "path": rel,
                 "edits": [{"old_text": "original", "new_text": "modified"}],
             })),
-        ], permission_service=service))
+        ], registry, todo, permission_service=service))
 
         for item in out:
             payload = json.loads(item["output"])
             assert payload["error"] == "permission_denied"
         # File unchanged.
-        assert (_tmp(tools, "plan_blocked.txt")).read_text(encoding="utf-8") == "original"
+        assert _tmp(workspace, "plan_blocked.txt").read_text(encoding="utf-8") == "original"

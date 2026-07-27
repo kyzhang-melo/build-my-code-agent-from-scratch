@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from message_utils import normalize_messages
-from tools import TODO
+from tools import TodoManager
 
 TEMPLATE_PATH = Path(__file__).parent / "templates" / "compact.md"
 TRANSCRIPT_DIR = Path(__file__).parent / ".transcripts"
@@ -212,11 +212,11 @@ async def summarize_async(
     return summary
 
 
-def reinject_todo(summary: str) -> str:
+def reinject_todo(summary: str, todo: TodoManager) -> str:
     """Append the live TODO list deterministically (not LLM-reconstructed)."""
-    if not TODO.has_active_plan():
+    if not todo.has_active_plan():
         return summary
-    return f"{summary}\n\n## Current TODO state\n{TODO.render()}"
+    return f"{summary}\n\n## Current TODO state\n{todo.render()}"
 
 
 def write_transcript(messages: list) -> Path:
@@ -263,6 +263,7 @@ def prepare_compaction(messages: list) -> tuple[str | None, list[dict], list[dic
 async def compact_history_async(
     state,
     *,
+    todo: TodoManager,
     source: str,
     focus: str | None = None,
     client,
@@ -299,7 +300,7 @@ async def compact_history_async(
         print(f"[compact] summarization failed ({exc}); history left unchanged")
         return None
 
-    summary = reinject_todo(summary)
+    summary = reinject_todo(summary, todo)
     new_messages = build_compacted_history(summary, tail)
 
     state.messages[:] = new_messages
