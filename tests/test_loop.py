@@ -667,3 +667,148 @@ def test_normalize_messages_preserves_sanitized_arguments(load_module) -> None:
     assert json.loads(fc["arguments"]) == {}  # valid JSON
     fco = [m for m in cleaned if m.get("type") == "function_call_output"][0]
     assert "Expecting" in fco["output"]
+
+
+def test_agent_loop_recovers_from_malformed_then_succeeds(load_module, monkeypatch, tmp_path) -> None:
+    """Two-turn regression: malformed call -> normalized history -> corrected call -> done.
+
+    Turn 1: model emits edit_file with invalid JSON arguments.
+    Turn 2: model sees the sanitized function_call + error output, emits a
+            corrected edit_file call, which succeeds; then a no-tool final answer.
+
+    This directly verifies:
+    - agent_loop completes the full recovery (does not crash or exit early);
+    - the second API input contains no raw malformed arguments;
+    - the second API input's function_call has arguments="{}" and no id;
+    - the error function_call_output reaches the second turn.
+    """
+    main_module = load_module("main", "main.py")
+    session = _parent(main_module, tmp_path)
+
+    malformed_call = types.SimpleNamespace(
+        type="function_call",
+        call_id="c1",
+        id="fc_bad",
+        name="edit_file",
+        arguments='{broken',
+    )
+    corrected_call = types.SimpleNamespace(
+        type="function_call",
+        call_id="c2",
+        id="fc_good",
+        name="edit_file",
+        arguments='{"path":"tmp/x.txt","old_text":"a","new_text":"b"}',
+    )
+    responses = [
+        types.SimpleNamespace(output=[malformed_call], output_text=""),
+        types.SimpleNamespace(output=[corrected_call], output_text=""),
+        _no_tool_response("Done."),
+    ]
+    captured_inputs: list[list[dict]] = []
+
+    async def fake_create(**kwargs):
+        captured_inputs.append(kwargs["input"])
+        return responses.pop(0)
+
+    monkeypatch.setattr(
+        main_module,
+        "client",
+        types.SimpleNamespace(responses=types.SimpleNamespace(create=fake_create)),
+    )
+
+    async def fake_execute(tool_calls, *_args, **_kwargs):
+        outputs = []
+        for item in tool_calls:
+            if item.arguments == '{broken':
+                outputs.append({
+                    "type": "function_call_output",
+                    "call_id": item.call_id,
+                    "output": "Error: invalid arguments for tool 'edit_file': Expecting property name",
+                })
+            else:
+                outputs.append({
+                    "type": "function_call_output",
+                    "call_id": item.call_id,
+                    "output": "Edited tmp/x.txt",
+                })
+        return (outputs, False)
+
+    monkeypatch.setattr(main_module, "execute_tool_calls_async", fake_execute)
+
+    state = main_module.LoopState(messages=[{"role": "user", "content": "edit the file"}])
+    outcome = _run(main_module.agent_loop(state, session))
+
+    # agent_loop completed the full recovery and returned a final answer.
+    assert outcome.final_text == "Done."
+    assert outcome.api_calls == 3
+
+    # The second API input (turn 2) must not contain raw malformed arguments.
+    second_input = captured_inputs[1]
+    fc_items = [m for m in second_input if m.get("type") == "function_call"]
+    assert len(fc_items) == 1
+    assert fc_items[0]["arguments"] == "{}"  # sanitized, not '{broken'
+    assert "id" not in fc_items[0]  # Provider id dropped
+    assert fc_items[0]["call_id"] == "c1"
+    # The error output reached the second turn.
+    fco_items = [m for m in second_input if m.get("type") == "function_call_output"]
+    assert len(fco_items) == 1
+    assert "Expecting" in fco_items[0]["output"]
+    assert fco_items[0]["call_id"] == "c1"
+
+    # No raw malformed string anywhere in the second API input.
+    import json
+    assert "{broken" not in json.dumps(second_input)
+
+
+def test_agent_loop_repeated_malformed_stops_at_max_api_calls(load_module, monkeypatch, tmp_path) -> None:
+    """If the model keeps emitting malformed JSON, the loop ends via max_api_calls.
+
+    This verifies the recovery path is bounded and does not spin forever.
+    """
+    main_module = load_module("main", "main.py")
+    session = _parent(main_module, tmp_path)
+
+    def malformed_call(call_id: str):
+        return types.SimpleNamespace(
+            type="function_call",
+            call_id=call_id,
+            id=f"fc_{call_id}",
+            name="edit_file",
+            arguments='{always broken',
+        )
+
+    # Enough malformed responses to exceed max_api_calls.
+    responses = [
+        types.SimpleNamespace(output=[malformed_call(f"c{i}")], output_text="")
+        for i in range(session.max_api_calls + 2)
+    ]
+    captured_inputs: list[list[dict]] = []
+
+    async def fake_create(**kwargs):
+        captured_inputs.append(kwargs["input"])
+        return responses.pop(0)
+
+    monkeypatch.setattr(
+        main_module,
+        "client",
+        types.SimpleNamespace(responses=types.SimpleNamespace(create=fake_create)),
+    )
+
+    async def fake_execute(tool_calls, *_args, **_kwargs):
+        return ([{
+            "type": "function_call_output",
+            "call_id": item.call_id,
+            "output": "Error: invalid arguments for tool 'edit_file': Expecting property name",
+        } for item in tool_calls], False)
+
+    monkeypatch.setattr(main_module, "execute_tool_calls_async", fake_execute)
+
+    state = main_module.LoopState(messages=[{"role": "user", "content": "edit the file"}])
+    outcome = _run(main_module.agent_loop(state, session))
+
+    assert outcome.stop_reason == "max_api_calls"
+    assert outcome.api_calls == session.max_api_calls
+    # Every replayed input had sanitized arguments (no raw malformed string).
+    import json
+    for api_input in captured_inputs:
+        assert "{always broken" not in json.dumps(api_input)
