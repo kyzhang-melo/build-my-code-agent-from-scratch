@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from message_utils import normalize_messages, response_item_to_dict
 from permissions import PermissionManager, PermissionMode, PermissionService, TerminalApprovalHandler
-from prompts import EXPLORE_SUBAGENT_SYSTEM, GLOB_DISCOVERY_RULES, PARENT_SYSTEM
+from prompts import GLOB_DISCOVERY_RULES, build_explore_system, build_parent_system
 from tools import (
     EXPLORE_TOOL_REGISTRY,
     EXPLORE_TOOLS,
@@ -291,7 +291,7 @@ class ReportStopGate:
 
 PARENT_CONFIG = AgentConfig(
     name="parent",
-    system=PARENT_SYSTEM,
+    system=build_parent_system(WORKDIR),
     tools=TOOLS,
     max_api_calls=MAX_API_CALLS_PER_USER_TURN,
     stop_gate=TodoStopGate(TODO, TODO_CONTRACT_MAX_NUDGES),
@@ -301,7 +301,7 @@ PARENT_CONFIG = AgentConfig(
 
 EXPLORE_SUBAGENT_CONFIG = AgentConfig(
     name="subagent:explore",
-    system=EXPLORE_SUBAGENT_SYSTEM,
+    system=build_explore_system(WORKDIR),
     tools=EXPLORE_TOOLS,
     registry=EXPLORE_TOOL_REGISTRY,
     permission_service=PERMISSION_SERVICE,

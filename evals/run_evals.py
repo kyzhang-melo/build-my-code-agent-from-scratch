@@ -34,6 +34,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import main  # noqa: E402  (path setup must happen first)
 import tools  # noqa: E402
+from prompts import build_explore_system, build_parent_system  # noqa: E402
 from trace import MemoryTraceSink, TraceContext  # noqa: E402
 from permissions import (  # noqa: E402
     ApprovalRequest,
@@ -46,12 +47,6 @@ from permissions import (  # noqa: E402
 SCENARIOS_DIR = Path(__file__).resolve().parent / "scenarios"
 RUNS_DIR = Path(__file__).resolve().parent / ".runs"
 
-# The system prompts bake WORKDIR in at import time (project root). We capture
-# the pristine originals here so each scenario can rewrite that path to its own
-# workspace -- otherwise the prompt advertises the wrong directory and the agent
-# wastes calls (or fails) discovering where it actually is.
-ORIGINAL_WORKDIR = str(tools.WORKDIR)
-ORIGINAL_PARENT_SYSTEM = main.PARENT_CONFIG.system
 ORIGINAL_EXPLORE_CONFIG = main.EXPLORE_SUBAGENT_CONFIG
 
 
@@ -281,10 +276,10 @@ async def run_scenario(scenario_dir: Path, run_root: Path) -> ScenarioResult:
     # Isolate this scenario: point the tools' module-level WORKDIR at the fresh
     # workspace, reset the shared todo singleton, and build a scenario-scoped
     # permission service so session approvals never leak across scenarios.
-    workspace_str = str(workspace.resolve())
-    tools.WORKDIR = workspace.resolve()
+    workspace_root = workspace.resolve()
+    tools.WORKDIR = workspace_root
     tools.TODO.state = tools.PlanningState()
-    manager = PermissionManager(workspace.resolve(), mode=PermissionMode.DEFAULT)
+    manager = PermissionManager(workspace_root, mode=PermissionMode.DEFAULT)
     service = PermissionService(manager=manager, handler=AutoApproveHandler())
     trace_sink = MemoryTraceSink()
     trace_context = TraceContext(
@@ -293,20 +288,18 @@ async def run_scenario(scenario_dir: Path, run_root: Path) -> ScenarioResult:
         agent_id="parent",
     )
 
-    # Rewrite the baked-in workspace path (derived from the pristine originals,
-    # never a previously-patched value) so both the parent and the explore
-    # subagent advertise this scenario's workspace.
-    parent_system = ORIGINAL_PARENT_SYSTEM.replace(ORIGINAL_WORKDIR, workspace_str)
+    # Render both system prompts against this scenario's workspace so the parent
+    # and the explore subagent advertise the directory their tools actually use.
     agent_config = replace(
         main.PARENT_CONFIG,
-        system=parent_system,
+        system=build_parent_system(workspace_root),
         permission_service=service,
         trace_context=trace_context,
         on_text=None,
     )
     main.EXPLORE_SUBAGENT_CONFIG = replace(
         ORIGINAL_EXPLORE_CONFIG,
-        system=ORIGINAL_EXPLORE_CONFIG.system.replace(ORIGINAL_WORKDIR, workspace_str),
+        system=build_explore_system(workspace_root),
         permission_service=service,
     )
 
