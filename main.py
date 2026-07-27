@@ -365,15 +365,36 @@ async def run_one_turn(state: LoopState, session: AgentSession) -> StepOutcome |
             continue
 
         if item_type == "function_call":
+            raw_arguments = _response_item_attr(item, "arguments", "{}")
+            # Provider-facing history must only contain valid JSON arguments;
+            # a malformed function_call replayed to the Provider causes a 400
+            # that kills the agent loop before the model ever sees the tool
+            # error output. Normalize here: the tool layer still receives the
+            # original SDK item (via tool_calls below) so it can report the
+            # exact parse error; only the replayed history is sanitized.
+            try:
+                parsed = json.loads(raw_arguments)
+            except (json.JSONDecodeError, TypeError):
+                replay_arguments = "{}"
+                malformed = True
+            else:
+                replay_arguments = json.dumps(parsed)
+                malformed = False
             function_call = {
                 "type": "function_call",
                 "call_id": _response_item_attr(item, "call_id", ""),
                 "name": _response_item_attr(item, "name", ""),
-                "arguments": _response_item_attr(item, "arguments", "{}"),
+                "arguments": replay_arguments,
             }
-            item_id = _response_item_attr(item, "id")
-            if item_id:
-                function_call["id"] = item_id
+            # Drop the Provider-assigned item id when arguments were malformed.
+            # The id may be paired with the original malformed record on the
+            # Provider side; replaying it with sanitized arguments can violate
+            # pairing constraints. call_id is retained so the function_call
+            # still pairs with its function_call_output.
+            if not malformed:
+                item_id = _response_item_attr(item, "id")
+                if item_id:
+                    function_call["id"] = item_id
             state.messages.append(function_call)
 
             tool_calls.append(item)

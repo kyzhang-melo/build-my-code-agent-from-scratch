@@ -525,3 +525,145 @@ def test_run_one_turn_budget_exhausted_returns_max_api_calls_outcome(load_module
     assert outcome.stop_reason == "max_api_calls"
     assert "stopped after max_api_calls" in outcome.final_text
     assert state.messages[-1]["content"] == outcome.final_text
+
+
+def test_malformed_json_arguments_normalized_in_history(load_module, monkeypatch, tmp_path) -> None:
+    """A malformed function_call must not be replayed to the Provider as-is.
+
+    The replayed history gets arguments="{}"; the tool layer still receives
+    the original SDK item so it can report the exact parse error; the
+    Provider-assigned id is dropped to avoid pairing conflicts.
+    """
+    main_module = load_module("main", "main.py")
+    session = _parent(main_module, tmp_path)
+
+    function_call = types.SimpleNamespace(
+        type="function_call",
+        call_id="c1",
+        id="fc_abc",
+        name="edit_file",
+        arguments='{bad json',
+    )
+    fake_response = types.SimpleNamespace(output=[function_call], output_text="")
+    monkeypatch.setattr(main_module, "client", _client_for_response(fake_response))
+
+    captured_tool_calls: list = []
+
+    async def fake_execute(tool_calls, *_args, **_kwargs):
+        captured_tool_calls.extend(tool_calls)
+        return ([{
+            "type": "function_call_output",
+            "call_id": "c1",
+            "output": "Error: invalid arguments for tool 'edit_file': Expecting property name enclosed in double quotes",
+        }], False)
+
+    monkeypatch.setattr(main_module, "execute_tool_calls_async", fake_execute)
+
+    state = main_module.LoopState(messages=[{"role": "user", "content": "edit the file"}])
+    outcome = _run(main_module.run_one_turn(state, session))
+
+    assert outcome is None  # loop continues
+    # Tool layer received the original SDK item with malformed arguments.
+    assert len(captured_tool_calls) == 1
+    assert captured_tool_calls[0].arguments == '{bad json'
+    # Replayed history has sanitized arguments.
+    fc_records = [m for m in state.messages if m.get("type") == "function_call"]
+    assert len(fc_records) == 1
+    assert fc_records[0]["arguments"] == "{}"
+    assert "id" not in fc_records[0]
+    assert fc_records[0]["call_id"] == "c1"
+    # Error output preserved with parse error detail.
+    fco_records = [m for m in state.messages if m.get("type") == "function_call_output"]
+    assert len(fco_records) == 1
+    assert "Expecting" in fco_records[0]["output"]
+
+
+def test_valid_json_arguments_preserved_with_id(load_module, monkeypatch, tmp_path) -> None:
+    """Valid JSON arguments are normalized (re-dumped) but id is retained."""
+    main_module = load_module("main", "main.py")
+    session = _parent(main_module, tmp_path)
+
+    function_call = types.SimpleNamespace(
+        type="function_call",
+        call_id="c1",
+        id="fc_abc",
+        name="bash",
+        arguments='{"command":"echo hi"}',
+    )
+    fake_response = types.SimpleNamespace(output=[function_call], output_text="")
+    monkeypatch.setattr(main_module, "client", _client_for_response(fake_response))
+
+    async def fake_execute(_tool_calls, *_args, **_kwargs):
+        return ([{"type": "function_call_output", "call_id": "c1", "output": "ok"}], False)
+
+    monkeypatch.setattr(main_module, "execute_tool_calls_async", fake_execute)
+
+    state = main_module.LoopState(messages=[{"role": "user", "content": "run"}])
+    _run(main_module.run_one_turn(state, session))
+
+    fc = [m for m in state.messages if m.get("type") == "function_call"][0]
+    import json
+    assert json.loads(fc["arguments"]) == {"command": "echo hi"}
+    assert fc["id"] == "fc_abc"
+    assert fc["call_id"] == "c1"
+
+
+def test_mixed_batch_valid_and_malformed(load_module, monkeypatch, tmp_path) -> None:
+    """A batch with one valid and one malformed call: valid keeps id, malformed drops id."""
+    main_module = load_module("main", "main.py")
+    session = _parent(main_module, tmp_path)
+
+    valid_call = types.SimpleNamespace(
+        type="function_call", call_id="c1", id="fc_valid",
+        name="bash", arguments='{"command":"echo hi"}',
+    )
+    malformed_call = types.SimpleNamespace(
+        type="function_call", call_id="c2", id="fc_bad",
+        name="edit_file", arguments='{broken',
+    )
+    fake_response = types.SimpleNamespace(
+        output=[valid_call, malformed_call], output_text="",
+    )
+    monkeypatch.setattr(main_module, "client", _client_for_response(fake_response))
+
+    async def fake_execute(_tool_calls, *_args, **_kwargs):
+        return ([
+            {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+            {"type": "function_call_output", "call_id": "c2",
+             "output": "Error: invalid arguments for tool 'edit_file': Expecting property name"},
+        ], False)
+
+    monkeypatch.setattr(main_module, "execute_tool_calls_async", fake_execute)
+
+    state = main_module.LoopState(messages=[{"role": "user", "content": "do both"}])
+    _run(main_module.run_one_turn(state, session))
+
+    fc_records = {m["call_id"]: m for m in state.messages if m.get("type") == "function_call"}
+    assert fc_records["c1"]["id"] == "fc_valid"
+    import json
+    json.loads(fc_records["c1"]["arguments"])  # valid JSON
+    assert "id" not in fc_records["c2"]
+    assert fc_records["c2"]["arguments"] == "{}"
+
+    fco_call_ids = {m["call_id"] for m in state.messages if m.get("type") == "function_call_output"}
+    assert fco_call_ids == {"c1", "c2"}
+
+
+def test_normalize_messages_preserves_sanitized_arguments(load_module) -> None:
+    """normalize_messages must not break already-sanitized arguments."""
+    import json
+    main_module = load_module("main", "main.py")
+    from message_utils import normalize_messages
+
+    messages = [
+        {"role": "user", "content": "task"},
+        {"type": "function_call", "call_id": "c1", "name": "edit_file", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1",
+         "output": "Error: invalid arguments for tool 'edit_file': Expecting ',' delimiter"},
+    ]
+    cleaned = normalize_messages(messages)
+    fc = [m for m in cleaned if m.get("type") == "function_call"][0]
+    assert fc["arguments"] == "{}"
+    assert json.loads(fc["arguments"]) == {}  # valid JSON
+    fco = [m for m in cleaned if m.get("type") == "function_call_output"][0]
+    assert "Expecting" in fco["output"]
