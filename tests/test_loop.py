@@ -47,6 +47,7 @@ def _explore(main_module, parent):
         parent.workspace,
         parent.permission_service,
         parent.trace_context,
+        parent.session_id,
     )
 
 
@@ -812,3 +813,166 @@ def test_agent_loop_repeated_malformed_stops_at_max_api_calls(load_module, monke
     import json
     for api_input in captured_inputs:
         assert "{always broken" not in json.dumps(api_input)
+
+
+def test_repl_discards_interrupted_turn_and_todo_mutation(
+    load_module, monkeypatch, tmp_path,
+) -> None:
+    main_module = load_module("main", "main.py")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "do work")
+
+    async def interrupted_loop(state, session):
+        state.messages.append({
+            "type": "function_call",
+            "call_id": "unfinished",
+            "name": "write_file",
+            "arguments": "{}",
+        })
+        session.todo.update(_todo_params([
+            {"content": "unfinished", "status": "in_progress"},
+        ]))
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(main_module, "agent_loop", interrupted_loop)
+    _run(main_module.repl())
+
+    session_path = main_module.find_most_recent_session(
+        tmp_path / ".sessions", tmp_path.resolve(),
+    )
+    assert session_path is not None
+    reopened = main_module.SessionStore.open(
+        session_path,
+        main_module.Workspace(tmp_path),
+        main_module.MODEL_ID,
+        main_module.OPENROUTER_PROVIDER or "",
+    )
+    assert reopened.messages() == []
+    assert reopened.last_todo_items() == []
+
+
+def test_repl_no_session_does_not_claim_it_saved(
+    load_module, monkeypatch, tmp_path, capsys,
+) -> None:
+    main_module = load_module("main", "main.py")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "exit")
+
+    _run(main_module.repl(no_session=True))
+
+    output = capsys.readouterr().out
+    assert "persistence disabled" in output
+    assert "[session] saved" not in output
+    assert not (tmp_path / ".sessions").exists()
+
+
+def test_repl_prints_complete_resume_sanitization_diagnostics(
+    load_module, monkeypatch, tmp_path, capsys,
+) -> None:
+    main_module = load_module("main", "main.py")
+    monkeypatch.chdir(tmp_path)
+    workspace = main_module.Workspace(tmp_path)
+    store = main_module.SessionStore.create(
+        workspace,
+        "resume-diagnostics",
+        "old-model",
+        "old-provider",
+    )
+    store.sync([
+        {"role": "user", "content": "continue"},
+        {"type": "reasoning", "id": "r1", "summary": "provider state"},
+        {
+            "type": "function_call",
+            "id": "fc-paired",
+            "call_id": "paired",
+            "name": "bash",
+            "arguments": "{}",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "paired",
+            "output": "done",
+        },
+        {
+            "type": "function_call",
+            "id": "fc-orphan",
+            "call_id": "orphan-call",
+            "name": "read_file",
+            "arguments": "{}",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "orphan-output",
+            "output": "stray",
+        },
+    ])
+    with store.path.open("a", encoding="utf-8") as handle:
+        handle.write("{invalid-json}\n")
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: "exit")
+    _run(main_module.repl(resume=str(store.path)))
+
+    output = capsys.readouterr().out
+    assert "[session] resume sanitized:" in output
+    assert "reasoning=1" in output
+    assert "function_call ids=2" in output
+    assert "orphan calls=1" in output
+    assert "orphan outputs=1" in output
+    assert "invalid JSONL lines=1" in output
+
+
+def test_repl_warns_and_clears_invalid_restored_todo_state(
+    load_module, monkeypatch, tmp_path, capsys,
+) -> None:
+    main_module = load_module("main", "main.py")
+    monkeypatch.chdir(tmp_path)
+    workspace = main_module.Workspace(tmp_path)
+    store = main_module.SessionStore.create(
+        workspace,
+        "invalid-todo",
+        main_module.MODEL_ID,
+        main_module.OPENROUTER_PROVIDER or "",
+    )
+    store.sync([{"role": "user", "content": "continue"}])
+    store.sync_todo([{
+        "content": "broken item",
+        "status": "not-a-valid-status",
+    }])
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: "exit")
+    _run(main_module.repl(resume=str(store.path)))
+
+    output = capsys.readouterr().out
+    assert "[session] warning: could not restore todo state:" in output
+
+    reopened = main_module.SessionStore.open(
+        store.path,
+        workspace,
+        main_module.MODEL_ID,
+        main_module.OPENROUTER_PROVIDER or "",
+    )
+    assert reopened.last_todo_items() == []
+
+
+def test_repl_reports_session_lock_conflict_without_claiming_save(
+    load_module, monkeypatch, tmp_path, capsys,
+) -> None:
+    main_module = load_module("main", "main.py")
+    monkeypatch.chdir(tmp_path)
+    workspace = main_module.Workspace(tmp_path)
+    owner = main_module.SessionStore.create(
+        workspace,
+        "locked-repl",
+        main_module.MODEL_ID,
+        main_module.OPENROUTER_PROVIDER or "",
+        acquire_lock=True,
+    )
+    owner.sync([{"role": "user", "content": "hello"}])
+    try:
+        _run(main_module.repl(resume=str(owner.path)))
+    finally:
+        owner.close()
+
+    output = capsys.readouterr().out
+    assert "Error: Session is already open by process" in output
+    assert "[session] saved" not in output

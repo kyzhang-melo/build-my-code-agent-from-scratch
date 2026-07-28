@@ -25,6 +25,9 @@ dist/
 # Pre-compaction transcript snapshots
 .transcripts/
 
+# Session persistence files
+.sessions/
+
 # Eval run artifacts (workspaces kept on failure, reports)
 evals/.runs/
 evals/.runs_hybrid/

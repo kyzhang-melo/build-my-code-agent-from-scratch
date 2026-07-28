@@ -44,7 +44,15 @@ def test_default_and_plan_mode_matrix(load_module) -> None:
 
 @pytest.mark.parametrize(
     "path",
-    [".env", ".env.local", "secret.pem", "id_rsa", ".git/config"],
+    [
+        ".env",
+        ".env.local",
+        "secret.pem",
+        "id_rsa",
+        ".git/config",
+        ".sessions/run.jsonl",
+        ".transcripts/precompact.jsonl",
+    ],
 )
 def test_sensitive_reads_are_denied(load_module, path) -> None:
     permissions = permission_module
@@ -58,7 +66,15 @@ def test_sensitive_reads_are_denied(load_module, path) -> None:
 
 @pytest.mark.parametrize(
     "path",
-    [".env", ".git/config", ".ssh/config", "secret.key", "../outside.txt"],
+    [
+        ".env",
+        ".git/config",
+        ".ssh/config",
+        "secret.key",
+        ".sessions/run.jsonl",
+        ".transcripts/precompact.jsonl",
+        "../outside.txt",
+    ],
 )
 def test_protected_writes_are_hard_denied(load_module, path) -> None:
     permissions = permission_module
@@ -95,6 +111,8 @@ def test_symlink_write_escape_is_denied(load_module, tmp_path) -> None:
         ("cd .. && pwd", "outside"),
         ("echo x > ../outside.txt", "outside"),
         ("rm -rf ../outside", "outside"),
+        ("cat .sessions/run.jsonl", "session"),
+        ("echo x > .transcripts/precompact.jsonl", "session"),
     ],
 )
 def test_bash_hard_deny_checks(load_module, command, expected) -> None:

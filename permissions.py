@@ -344,6 +344,8 @@ def is_sensitive_path(path: Path, workdir: Path) -> bool:
         parts = tuple(part.lower() for part in path.relative_to(workdir).parts)
     except ValueError:
         return True
+    if ".sessions" in parts or ".transcripts" in parts:
+        return True
     return len(parts) >= 2 and parts[-2:] == (".git", "config")
 
 
@@ -354,10 +356,12 @@ def is_protected_write_path(path: Path, workdir: Path) -> bool:
         parts = tuple(part.lower() for part in path.relative_to(workdir).parts)
     except ValueError:
         return True
-    return ".git" in parts or ".ssh" in parts
+    return ".git" in parts or ".ssh" in parts or ".sessions" in parts
 
 
 def bash_hard_deny_reason(command: str, workdir: Path) -> str | None:
+    if re.search(r"(?:^|[\s/\\])\.(?:sessions|transcripts)(?:[/\\\s]|$)", command):
+        return "Access to agent session and transcript storage is blocked."
     if re.search(r"\bsudo\b", command):
         return "Privilege escalation with sudo is blocked."
     if re.search(r"\b(?:shutdown|reboot|halt|poweroff)\b", command):

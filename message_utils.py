@@ -1,5 +1,9 @@
 """Message protocol adapter helpers."""
 
+from __future__ import annotations
+
+from typing import NamedTuple
+
 
 def _json_safe(value):
     """Convert SDK response objects into JSON-compatible Python values."""
@@ -85,3 +89,139 @@ def normalize_messages(messages: list[dict]) -> list[dict]:
             })
 
     return cleaned
+
+
+# ---------------------------------------------------------------------------
+# Resume-time sanitization
+# ---------------------------------------------------------------------------
+
+def sanitize_resumed_message(msg: dict, *, same_model: bool) -> dict:
+    """Sanitize a single history dict loaded from a session file.
+
+    When the model/provider has changed (``same_model=False``):
+    - Drop ``reasoning`` items: they are provider-specific and replaying them
+      to a different provider causes 400 errors.
+    - Strip the provider-assigned ``id`` from ``function_call`` items: the id
+      may be paired with the original record on the provider side. ``call_id``
+      is retained because it is the pairing key with ``function_call_output``.
+
+    When the model is the same, the message is returned as-is (a shallow copy).
+    """
+    if not isinstance(msg, dict):
+        return {}
+
+    msg_type = msg.get("type")
+
+    if not same_model and msg_type == "reasoning":
+        return {}
+
+    if not same_model and msg_type == "function_call":
+        cleaned = dict(msg)
+        cleaned.pop("id", None)
+        return cleaned
+
+    return dict(msg)
+
+
+def drop_orphan_tool_calls(messages: list[dict]) -> list[dict]:
+    """Drop unpaired tool calls and outputs from resumed history.
+
+    Pairing is order-sensitive: an output is valid only after its call, and a
+    call is retained only if a later output completes it. This also handles a
+    partially completed parallel batch such as ``call A, call B, output A``.
+    """
+    cleaned, _, _ = _drop_orphan_tool_calls(messages)
+    return cleaned
+
+
+def _drop_orphan_tool_calls(
+    messages: list[dict],
+) -> tuple[list[dict], int, int]:
+    if not messages:
+        return [], 0, 0
+
+    filtered: list[dict] = []
+    open_calls: set[str] = set()
+    completed_calls: set[str] = set()
+    dropped_outputs = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        msg_type = msg.get("type")
+        call_id = str(msg.get("call_id", ""))
+        if msg_type == "function_call":
+            if call_id:
+                open_calls.add(call_id)
+            filtered.append(msg)
+            continue
+        if msg_type == "function_call_output":
+            if not call_id or call_id not in open_calls:
+                dropped_outputs += 1
+                continue
+            open_calls.remove(call_id)
+            completed_calls.add(call_id)
+        filtered.append(msg)
+
+    cleaned: list[dict] = []
+    dropped_calls = 0
+    for msg in filtered:
+        if msg.get("type") == "function_call":
+            call_id = str(msg.get("call_id", ""))
+            if not call_id or call_id not in completed_calls:
+                dropped_calls += 1
+                continue
+        cleaned.append(msg)
+    return cleaned, dropped_calls, dropped_outputs
+
+
+class ResumeSanitizeDiagnostics(NamedTuple):
+    dropped_reasoning: int = 0
+    stripped_function_call_ids: int = 0
+    dropped_orphan_calls: int = 0
+    dropped_orphan_outputs: int = 0
+    ignored_invalid_lines: int = 0
+
+    @property
+    def changed(self) -> bool:
+        return any((
+            self.dropped_reasoning,
+            self.stripped_function_call_ids,
+            self.dropped_orphan_calls,
+            self.dropped_orphan_outputs,
+            self.ignored_invalid_lines,
+        ))
+
+
+def sanitize_resumed_history(
+    messages: list[dict],
+    *,
+    same_runtime: bool,
+    invalid_lines: int = 0,
+) -> tuple[list[dict], ResumeSanitizeDiagnostics]:
+    """Sanitize provider history and return safe, content-free diagnostics."""
+    projected: list[dict] = []
+    dropped_reasoning = 0
+    stripped_ids = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if not same_runtime and msg.get("type") == "reasoning":
+            dropped_reasoning += 1
+        if (
+            not same_runtime
+            and msg.get("type") == "function_call"
+            and msg.get("id")
+        ):
+            stripped_ids += 1
+        sanitized = sanitize_resumed_message(msg, same_model=same_runtime)
+        if sanitized:
+            projected.append(sanitized)
+
+    cleaned, dropped_calls, dropped_outputs = _drop_orphan_tool_calls(projected)
+    return cleaned, ResumeSanitizeDiagnostics(
+        dropped_reasoning=dropped_reasoning,
+        stripped_function_call_ids=stripped_ids,
+        dropped_orphan_calls=dropped_calls,
+        dropped_orphan_outputs=dropped_outputs,
+        ignored_invalid_lines=invalid_lines,
+    )
