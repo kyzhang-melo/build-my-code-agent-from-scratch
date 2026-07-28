@@ -42,6 +42,8 @@ EXCLUDE_DIRS = {
     "__pycache__",
     ".pytest_cache",
     ".claude",
+    ".sessions",
+    ".transcripts",
 }
 SENSITIVE_GLOB_PATTERNS = (
     ".env",
@@ -58,6 +60,10 @@ SENSITIVE_GLOB_PATTERNS = (
     "id_ecdsa",
     "id_ed25519",
     "id_rsa",
+    ".sessions",
+    ".sessions/**",
+    ".transcripts",
+    ".transcripts/**",
 )
 
 # Budget for a single tool output handed back to the model. Char-based (chars
@@ -1367,6 +1373,8 @@ def run_glob(
             return f"Error: Directory not found: {directory or '.'}"
         if not base.is_dir():
             return f"Error: Not a directory: {directory or '.'}"
+        if is_sensitive_path(base, workspace.root):
+            return f"Error: Access to sensitive directory is blocked: {directory or '.'}"
 
         if pattern in BROAD_GLOB_PATTERNS:
             return _glob_listing(pattern, base)
@@ -1412,6 +1420,8 @@ def run_grep(
         search_path = workspace.resolve(path)
         if not search_path.exists():
             return f"Error: Path not found: {path}"
+        if is_sensitive_path(search_path, workspace.root):
+            return f"Error: Access to sensitive path is blocked: {path}"
 
         args = [
             rg_path,

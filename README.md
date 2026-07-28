@@ -9,7 +9,11 @@ A learning project that refactors a monolithic code-agent loop into a multi-file
 - `permissions.py`: workspace safety policy and approval handling.
 - `trace.py`: lightweight runtime trace events and in-memory/JSONL sinks.
 - `prompts.py`: system prompt definition.
-- `message_utils.py`: message protocol adapter helpers.
+- `message_utils.py`: message protocol adapter helpers and resume sanitization.
+- `session.py`: `AgentSession` dataclass and stop-gate implementations.
+- `session_store.py`: append-only JSONL session persistence and resume.
+- `workspace.py`: `Workspace` value object with path-escape check.
+- `context_compact.py`: token estimation and conversation-history compaction.
 - `evals/`: live-model behavioral scenarios, assertions, and reports.
 
 ## Requirements
@@ -83,6 +87,56 @@ Type your request at `s01 >>`.
 
 - `q`, `exit`, or empty input will quit.
 
+### Session Persistence
+
+By default, each session is persisted as a logically append-only JSONL log in
+`.sessions/<session_id>.jsonl` within the workspace. The file records every
+completed turn's history and todo state; physical writes use atomic file
+replacement so compaction and crashes cannot leave a half-rewritten file.
+
+CLI flags:
+
+```bash
+python main.py                    # new session (default)
+python main.py --name kevin       # new session with a human-readable name
+python main.py --continue         # resume the most recent session
+python main.py --resume <target>  # resume by name, id, or path
+python main.py --list-sessions    # list saved sessions and exit
+python main.py --no-session       # disable persistence for this run
+```
+
+In-session command:
+
+- `/sessions` — list saved sessions in the current workspace.
+
+Resume behavior:
+
+- The session's cwd must match the current working directory. A mismatch is
+  rejected (the session header's cwd is not adopted, since that would let a
+  disk file determine the workspace and permission boundary).
+- Permission mode and session-level approvals are not restored.
+- When the model or pinned provider has changed, `reasoning` items and
+  provider-assigned `function_call.id` values are dropped during load.
+  `call_id` is retained so tool-call/output pairing stays intact.
+- Unpaired function calls and outputs, including partially completed parallel
+  tool batches, are removed before replay. A safe diagnostic count is printed
+  whenever resume sanitization changes the loaded history.
+- Todo state, including an explicitly cleared plan, is restored so
+  `TodoStopGate` remains consistent after resume.
+- A turn interrupted before `agent_loop` completes is discarded; resume starts
+  from the last completed turn, avoiding accidental replay of tool side
+  effects.
+- A per-session lock enforces one CLI writer at a time. A second process trying
+  to resume the same active session is rejected.
+
+Session names are optional, case-insensitively unique within the workspace, and
+do not replace the immutable session id. `last`, `continue`, and `new` are
+reserved names.
+
+Session and pre-compaction transcript files are treated as sensitive runtime
+state: file reads/writes and shell access are blocked, and search tools exclude
+their directories.
+
 ## Testing
 
 Run the default fast suite:
@@ -100,10 +154,11 @@ pytest -m "integration or slow or not (integration or slow)"
 ### Runtime Trace and Behavioral Evals
 
 The runtime trace records structured facts at the agent's execution boundaries.
-It captures requested and completed tool calls, permission decisions, todo
-transitions, and stop-gate decisions. Trace events contain safe metadata such
-as paths, modes, counts, durations, and statuses; they do not retain full file
-contents, shell commands, edit text, task prompts, or tool output.
+It captures session start/end, requested and completed tool calls, permission
+decisions, todo transitions, and stop-gate decisions. Trace events contain safe
+metadata such as paths, modes, counts, durations, and statuses; they do not
+retain full file contents, shell commands, edit text, task prompts, or tool
+output.
 
 Normal CLI runs use a no-op trace sink and do not create trace files. The eval
 runner executes the real parent agent in-process and injects an in-memory trace

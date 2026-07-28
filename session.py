@@ -2,14 +2,27 @@
 
 from __future__ import annotations
 
+import time
+import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from permissions import PermissionService
+from session_store import NullSessionStore, SessionStoreProtocol
 from tools import TodoManager, ToolRuntimeSpec
 from trace import TraceContext
 from workspace import Workspace
+
+
+def generate_session_id() -> str:
+    """Sortable timestamp prefix + short uuid suffix.
+
+    Replaces pi's uuidv7: keeps lexicographic ordering for ``--continue`` and
+    ``--list-sessions`` without adding a dependency.
+    """
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    return f"{stamp}-{uuid.uuid4().hex[:8]}"
 
 
 class StopGate(Protocol):
@@ -74,6 +87,7 @@ class AgentSession:
     """
 
     name: str
+    session_id: str
     workspace: Workspace
     todo: TodoManager
     system: str
@@ -84,4 +98,5 @@ class AgentSession:
     trace_context: TraceContext
     max_api_calls: int
     stop_gate: StopGate
+    store: SessionStoreProtocol = field(default_factory=NullSessionStore)
     on_text: Callable[[str], None] | None = None

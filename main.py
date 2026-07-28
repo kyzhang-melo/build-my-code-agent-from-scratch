@@ -5,6 +5,7 @@ Split version of the code-agent loop.
 """
 
 import asyncio
+import copy
 import json
 import os
 import re
@@ -21,12 +22,20 @@ from openai import AsyncOpenAI
 from message_utils import normalize_messages, response_item_to_dict
 from permissions import PermissionManager, PermissionMode, PermissionService, TerminalApprovalHandler
 from prompts import GLOB_DISCOVERY_RULES, build_explore_system, build_parent_system
-from session import AgentSession, ReportStopGate, TodoStopGate
+from session import AgentSession, ReportStopGate, TodoStopGate, generate_session_id
+from session_store import (
+    NullSessionStore,
+    SessionStore,
+    SessionStoreProtocol,
+    find_most_recent_session,
+    list_session_headers,
+)
 from tools import (
     EXPLORE_TOOLS,
     READ_ONLY_TOOL_NAMES,
     TOOLS,
     TodoManager,
+    TodoParams,
     build_tool_registry,
     execute_tool_calls_async,
 )
@@ -219,12 +228,14 @@ def create_explore_session(
     workspace: Workspace,
     permission_service: PermissionService,
     trace_context: TraceContext,
+    session_id: str,
 ) -> AgentSession:
     """Create an isolated read-only exploration session."""
     todo = TodoManager()
     child_trace = replace(trace_context, agent_id="subagent:explore")
     return AgentSession(
         name="subagent:explore",
+        session_id=session_id,
         workspace=workspace,
         todo=todo,
         system=build_explore_system(workspace.root),
@@ -248,6 +259,8 @@ def create_parent_session(
     approval_handler,
     trace_context: TraceContext | None = None,
     on_text: Callable[[str], None] | None = emit_assistant_text,
+    session_id: str | None = None,
+    store: SessionStoreProtocol | None = None,
 ) -> AgentSession:
     """Build one fully isolated parent-agent session."""
     workspace = Workspace(Path(workdir))
@@ -256,14 +269,22 @@ def create_parent_session(
         manager=PermissionManager(workspace.root),
         handler=approval_handler,
     )
+    sid = session_id or generate_session_id()
     trace = trace_context or TraceContext()
+    # Only fill run_id when the caller did not set one (e.g. evals pass their
+    # own run_id for attribution). This keeps subagent traces under the same
+    # run_id as the parent via replace(trace_context, agent_id=...).
+    if not trace.run_id:
+        trace = replace(trace, run_id=sid)
+    session_store = store if store is not None else NullSessionStore()
 
     async def task_runner(prompt: str, description: str) -> str:
-        explore = create_explore_session(workspace, permission_service, trace)
+        explore = create_explore_session(workspace, permission_service, trace, sid)
         return await run_subagent(prompt, description, explore)
 
     return AgentSession(
         name="parent",
+        session_id=sid,
         workspace=workspace,
         todo=todo,
         system=build_parent_system(workspace.root),
@@ -278,6 +299,7 @@ def create_parent_session(
         trace_context=trace,
         max_api_calls=MAX_API_CALLS_PER_USER_TURN,
         stop_gate=TodoStopGate(todo, TODO_CONTRACT_MAX_NUDGES),
+        store=session_store,
         on_text=on_text,
     )
 
@@ -577,7 +599,7 @@ async def cmd_help(arg: str, history: list, session: AgentSession) -> None:
     del arg, history, session
     print(
         "commands: /compact [focus]  |  /mode <default|plan>  |  "
-        "/permissions  |  /help   (q or exit to quit)"
+        "/permissions  |  /sessions  |  /help   (q or exit to quit)"
     )
 
 
@@ -608,11 +630,28 @@ async def cmd_permissions(arg: str, history: list, session: AgentSession) -> Non
         print(f"  {path}")
 
 
+async def cmd_sessions(arg: str, history: list, session: AgentSession) -> None:
+    del arg, history, session
+    sessions_dir = Path.cwd() / ".sessions"
+    headers = list_session_headers(sessions_dir)
+    if not headers:
+        print("[sessions] no saved sessions in this workspace")
+        return
+    print(f"[sessions] {len(headers)} session(s) in {sessions_dir}:")
+    for h in headers:
+        sid = h.get("session_id", "?")
+        display = h.get("session_name") or sid
+        updated = (h.get("updated_at") or h.get("created_at", "?"))[:19]
+        model = h.get("model_id", "?")
+        print(f"  {display}  id={sid}  updated={updated}  model={model}")
+
+
 COMMANDS = {
     "compact": cmd_compact,
     "help": cmd_help,
     "mode": cmd_mode,
     "permissions": cmd_permissions,
+    "sessions": cmd_sessions,
 }
 
 
@@ -631,47 +670,295 @@ async def handle_command(query: str, history: list, session: AgentSession) -> bo
     return True
 
 
-async def repl() -> None:
-    history = []
-    session = create_parent_session(
-        Path.cwd(),
-        approval_handler=TerminalApprovalHandler(interactive=sys.stdin.isatty()),
-    )
-    while True:
+def _resolve_session_path(session_arg: str) -> Path | None:
+    """Resolve a --resume argument to a session file path.
+
+    Accepts a bare session id (looked up in .sessions/), a relative path, or
+    an absolute path.
+    """
+    sessions_dir = Path.cwd() / ".sessions"
+    # Bare session id: look for <id>.jsonl in .sessions/
+    candidate = sessions_dir / f"{session_arg}.jsonl"
+    if candidate.is_file():
+        return candidate
+    # Human-readable session name (case-insensitive within this workspace).
+    folded = session_arg.casefold()
+    matches = [
+        Path(str(header["_path"]))
+        for header in list_session_headers(sessions_dir)
+        if str(header.get("session_name", "")).casefold() == folded
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    # Relative or absolute path
+    path = Path(session_arg).resolve()
+    if path.is_file():
+        return path
+    return None
+
+
+def _print_session_list() -> None:
+    sessions_dir = Path.cwd() / ".sessions"
+    headers = list_session_headers(sessions_dir)
+    if not headers:
+        print("No saved sessions in this workspace.")
+        return
+    print(f"Sessions in {sessions_dir}:")
+    for h in headers:
+        sid = h.get("session_id", "?")
+        display = h.get("session_name") or sid
+        updated = (h.get("updated_at") or h.get("created_at", "?"))[:19]
+        model = h.get("model_id", "?")
+        print(f"  {display}  id={sid}  updated={updated}  model={model}")
+
+
+def _print_resume_diagnostics(store: SessionStoreProtocol) -> None:
+    diagnostics = store.resume_diagnostics
+    details = [
+        ("reasoning", diagnostics.dropped_reasoning),
+        ("function_call ids", diagnostics.stripped_function_call_ids),
+        ("orphan calls", diagnostics.dropped_orphan_calls),
+        ("orphan outputs", diagnostics.dropped_orphan_outputs),
+        ("invalid JSONL lines", diagnostics.ignored_invalid_lines),
+    ]
+    changed = [f"{label}={count}" for label, count in details if count]
+    if changed:
+        print(f"[session] resume sanitized: {', '.join(changed)}")
+
+
+async def repl(
+    *,
+    resume: str | None = None,
+    continue_recent: bool = False,
+    list_only: bool = False,
+    no_session: bool = False,
+    session_name: str | None = None,
+) -> None:
+    if list_only:
+        if session_name:
+            print("Error: --name cannot be combined with --list-sessions")
+            return
+        _print_session_list()
+        return
+
+    cwd = Path.cwd()
+    workspace = Workspace(cwd)
+    sessions_dir = cwd / ".sessions"
+
+    # Determine session store: resume, continue, new, or null.
+    store: SessionStoreProtocol = NullSessionStore()
+    resumed_history: list[dict] = []
+    session_id = generate_session_id()
+
+    if no_session:
+        if session_name:
+            print("Error: --name requires session persistence")
+            return
+        print("[session] persistence disabled (--no-session)")
+    elif resume is not None:
+        if session_name:
+            print("Error: --name cannot be combined with --resume")
+            return
+        path = _resolve_session_path(resume)
+        if path is None:
+            print(f"Error: session not found: {resume}")
+            return
         try:
-            query = input(INPUT_PROMPT)
-            print(f"[debug] query: {query!r}")
-        except (EOFError, KeyboardInterrupt):
-            break
-        if query.strip().lower() in ("q", "exit", ""):
-            break
-        if await handle_command(query, history, session):
-            continue
-        user_prompt_received_at = datetime.now()
-        user_prompt_started = time.perf_counter()
-        print(
-            "[debug] user_prompt_received_at="
-            f"{user_prompt_received_at.isoformat(timespec='seconds')}"
-        )
-        history.append({
-            "role": "user",
-            "content": query,
-        })
+            store = SessionStore.open(
+                path,
+                workspace,
+                MODEL_ID,
+                OPENROUTER_PROVIDER or "",
+                acquire_lock=True,
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            return
+        resumed_history = store.messages()
+        session_id = store.session_id
+        print(f"[session] resumed {session_id} ({len(resumed_history)} messages)")
+        _print_resume_diagnostics(store)
+        store.sync(resumed_history)  # re-sync to capture sanitized state
+    elif continue_recent:
+        if session_name:
+            print("Error: --name cannot be combined with --continue")
+            return
+        path = find_most_recent_session(sessions_dir, workspace.root)
+        if path is None:
+            print("[session] no recent session found; starting new")
+            store = SessionStore.create(
+                workspace,
+                session_id,
+                MODEL_ID,
+                OPENROUTER_PROVIDER or "",
+                acquire_lock=True,
+            )
+            session_id = store.session_id
+        else:
+            try:
+                store = SessionStore.open(
+                    path,
+                    workspace,
+                    MODEL_ID,
+                    OPENROUTER_PROVIDER or "",
+                    acquire_lock=True,
+                )
+            except ValueError as exc:
+                print(f"Error resuming {path}: {exc}")
+                return
+            resumed_history = store.messages()
+            session_id = store.session_id
+            print(f"[session] continued {session_id} ({len(resumed_history)} messages)")
+            _print_resume_diagnostics(store)
+            store.sync(resumed_history)
+    else:
+        try:
+            store = SessionStore.create(
+                workspace,
+                session_id,
+                MODEL_ID,
+                OPENROUTER_PROVIDER or "",
+                session_name,
+                acquire_lock=True,
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            return
+        session_id = store.session_id
 
-        state = LoopState(history)
-        outcome = await agent_loop(state, session)
-        final_result_at = datetime.now()
-        elapsed = time.perf_counter() - user_prompt_started
-        print(
-            "[debug] final_result_at="
-            f"{final_result_at.isoformat(timespec='seconds')} "
-            f"elapsed={elapsed:.3f}s"
-        )
+    history = list(resumed_history)
+    session = create_parent_session(
+        cwd,
+        approval_handler=TerminalApprovalHandler(interactive=sys.stdin.isatty()),
+        session_id=session_id,
+        store=store,
+    )
 
-        if outcome.final_text:
-            print(outcome.final_text)
-        print()
+    # Restore todo state if the session had an active plan.
+    if store.is_persistent:
+        saved_items = store.last_todo_items()
+        if saved_items is not None:
+            try:
+                session.todo.update(TodoParams.model_validate({"items": saved_items}))
+                if saved_items:
+                    print(f"[session] restored todo plan ({len(saved_items)} items)")
+            except Exception as exc:
+                print(f"[session] warning: could not restore todo state: {exc}")
+
+    def _todo_snapshot() -> list[dict]:
+        return [
+            item.model_dump(by_alias=True)
+            for item in session.todo.state.items
+        ]
+
+    committed_history = copy.deepcopy(history)
+    committed_todo = copy.deepcopy(_todo_snapshot())
+    end_reason = "error"
+    completed_turns = 0
+    total_api_calls = 0
+    emit_trace(
+        session.trace_context,
+        "session.started",
+        source="parent",
+        session_id=session.session_id,
+        workspace_root=str(session.workspace.root),
+        model_id=MODEL_ID,
+        resumed=bool(resumed_history),
+    )
+
+    try:
+        while True:
+            try:
+                query = input(INPUT_PROMPT)
+                print(f"[debug] query: {query!r}")
+            except EOFError:
+                end_reason = "eof"
+                break
+            except KeyboardInterrupt:
+                end_reason = "interrupt"
+                break
+            if query.strip().lower() in ("q", "exit", ""):
+                end_reason = "user_exit"
+                break
+            if await handle_command(query, history, session):
+                store.sync(history)
+                store.sync_todo(_todo_snapshot())
+                committed_history = copy.deepcopy(history)
+                committed_todo = copy.deepcopy(_todo_snapshot())
+                continue
+            user_prompt_received_at = datetime.now()
+            user_prompt_started = time.perf_counter()
+            print(
+                "[debug] user_prompt_received_at="
+                f"{user_prompt_received_at.isoformat(timespec='seconds')}"
+            )
+            history.append({
+                "role": "user",
+                "content": query,
+            })
+
+            state = LoopState(history)
+            try:
+                outcome = await agent_loop(state, session)
+            except KeyboardInterrupt:
+                end_reason = "interrupt"
+                history[:] = copy.deepcopy(committed_history)
+                break
+            final_result_at = datetime.now()
+            elapsed = time.perf_counter() - user_prompt_started
+            print(
+                "[debug] final_result_at="
+                f"{final_result_at.isoformat(timespec='seconds')} "
+                f"elapsed={elapsed:.3f}s"
+            )
+
+            if outcome.final_text:
+                print(outcome.final_text)
+            print()
+
+            # Persist at the turn boundary: history is well-formed (no orphaned
+            # tool calls) and the next iteration starts a fresh user turn.
+            store.sync(history)
+            store.sync_todo(_todo_snapshot())
+            committed_history = copy.deepcopy(history)
+            committed_todo = copy.deepcopy(_todo_snapshot())
+            completed_turns += 1
+            total_api_calls += outcome.api_calls
+    except KeyboardInterrupt:
+        end_reason = "interrupt"
+        history[:] = copy.deepcopy(committed_history)
+    finally:
+        store.sync(committed_history)
+        store.sync_todo(committed_todo)
+        emit_trace(
+            session.trace_context,
+            "session.ended",
+            source="parent",
+            session_id=session.session_id,
+            reason=end_reason,
+            turns=completed_turns,
+            agent_api_calls=total_api_calls,
+        )
+        store.close()
+        if store.is_persistent:
+            print(f"[session] saved {session_id}")
+
+
+def parse_args() -> dict:
+    import argparse
+    parser = argparse.ArgumentParser(description="Code agent CLI")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--resume",
+        metavar="TARGET",
+        help="Resume a session by name, id, or file path",
+    )
+    group.add_argument("--continue", action="store_true", dest="continue_recent", help="Continue the most recent session")
+    group.add_argument("--list-sessions", action="store_true", dest="list_only", help="List saved sessions and exit")
+    group.add_argument("--no-session", action="store_true", dest="no_session", help="Disable session persistence")
+    parser.add_argument("--name", dest="session_name", help="Optional name for a new session")
+    return vars(parser.parse_args())
 
 
 if __name__ == "__main__":
-    asyncio.run(repl())
+    asyncio.run(repl(**parse_args()))

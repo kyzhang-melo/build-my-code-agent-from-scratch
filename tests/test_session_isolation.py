@@ -180,6 +180,7 @@ def test_create_explore_session_is_isolated_from_parent(load_module, workspace) 
     )
     child = main.create_explore_session(
         parent.workspace, parent.permission_service, parent.trace_context,
+        parent.session_id,
     )
 
     # Shared by design (read-only subagent inherits parent's safety boundary).
@@ -194,3 +195,69 @@ def test_create_explore_session_is_isolated_from_parent(load_module, workspace) 
     assert child.trace_context.agent_id == "subagent:explore"
     # The explore registry is restricted to read-only tools.
     assert set(child.registry.keys()) <= set(main.READ_ONLY_TOOL_NAMES)
+
+
+def test_two_parent_sessions_have_distinct_session_ids(load_module) -> None:
+    main = load_module("main", "main.py")
+
+    with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+        sa = main.create_parent_session(Path(a), approval_handler=_StubHandler())
+        sb = main.create_parent_session(Path(b), approval_handler=_StubHandler())
+
+    assert sa.session_id != sb.session_id
+    assert sa.session_id and sb.session_id
+
+
+def test_two_parent_sessions_have_distinct_default_stores(load_module) -> None:
+    main = load_module("main", "main.py")
+
+    with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+        sa = main.create_parent_session(Path(a), approval_handler=_StubHandler())
+        sb = main.create_parent_session(Path(b), approval_handler=_StubHandler())
+
+    assert sa.store is not sb.store
+
+
+def test_session_id_fills_empty_run_id(load_module) -> None:
+    """When the caller does not supply a run_id, the session id fills it so
+    that CLI traces can be attributed to a session."""
+    main = load_module("main", "main.py")
+
+    with tempfile.TemporaryDirectory() as a:
+        sa = main.create_parent_session(Path(a), approval_handler=_StubHandler())
+
+    assert sa.trace_context.run_id == sa.session_id
+
+
+def test_explicit_run_id_is_not_overwritten(load_module) -> None:
+    """When the caller supplies a run_id (e.g. evals), the session id must not
+    overwrite it. This is the regression guard for eval attribution."""
+    main = load_module("main", "main.py")
+    ctx = runtime_trace.TraceContext(
+        sink=runtime_trace.MemoryTraceSink(),
+        run_id="eval-scenario-01",
+        agent_id="parent",
+    )
+
+    with tempfile.TemporaryDirectory() as a:
+        sa = main.create_parent_session(
+            Path(a), approval_handler=_StubHandler(), trace_context=ctx,
+        )
+
+    assert sa.trace_context.run_id == "eval-scenario-01"
+    assert sa.session_id != "eval-scenario-01"
+
+
+def test_explore_session_inherits_parent_run_id(load_module, workspace) -> None:
+    """An explore subagent's trace context should share the parent's run_id
+    (so subagent traces group with the parent) but have a different agent_id."""
+    main = load_module("main", "main.py")
+    parent = main.create_parent_session(
+        workspace.root, approval_handler=_StubHandler(),
+    )
+    child = main.create_explore_session(
+        parent.workspace, parent.permission_service, parent.trace_context,
+        parent.session_id,
+    )
+    assert child.trace_context.run_id == parent.trace_context.run_id
+    assert child.trace_context.agent_id == "subagent:explore"
