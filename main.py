@@ -261,6 +261,8 @@ def create_parent_session(
     on_text: Callable[[str], None] | None = emit_assistant_text,
     session_id: str | None = None,
     store: SessionStoreProtocol | None = None,
+    max_api_calls: int = MAX_API_CALLS_PER_USER_TURN,
+    system_addendum: str | None = None,
 ) -> AgentSession:
     """Build one fully isolated parent-agent session."""
     workspace = Workspace(Path(workdir))
@@ -282,12 +284,16 @@ def create_parent_session(
         explore = create_explore_session(workspace, permission_service, trace, sid)
         return await run_subagent(prompt, description, explore)
 
+    system = build_parent_system(workspace.root)
+    if system_addendum:
+        system = f"{system}\n\n{system_addendum.strip()}"
+
     return AgentSession(
         name="parent",
         session_id=sid,
         workspace=workspace,
         todo=todo,
-        system=build_parent_system(workspace.root),
+        system=system,
         tools=TOOLS,
         registry=build_tool_registry(
             workspace,
@@ -297,7 +303,7 @@ def create_parent_session(
         permission_service=permission_service,
         permission_source="parent",
         trace_context=trace,
-        max_api_calls=MAX_API_CALLS_PER_USER_TURN,
+        max_api_calls=max_api_calls,
         stop_gate=TodoStopGate(todo, TODO_CONTRACT_MAX_NUDGES),
         store=session_store,
         on_text=on_text,

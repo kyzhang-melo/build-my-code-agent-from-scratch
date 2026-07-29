@@ -203,6 +203,27 @@ Reports are written to `evals/.runs/<timestamp>/report.json` and
 `summary.md`. See [`evals/README.md`](evals/README.md) for the scenario format,
 trace-backed assertions, and implementation notes.
 
+### SWE-bench
+
+The SWE-bench adapter runs the real parent agent in isolated host-side Git
+worktrees, exports its changes as official prediction patches, and delegates
+grading to an unmodified SWE-bench Docker harness:
+
+```bash
+./.venv/bin/python evals/swebench/run_swebench.py generate \
+  --run-id verified-smoke-001 \
+  --subset evals/swebench/subsets/smoke.json
+./.venv/bin/python evals/swebench/run_swebench.py evaluate \
+  --run-id verified-smoke-001
+./.venv/bin/python evals/swebench/run_swebench.py report \
+  --run-id verified-smoke-001
+```
+
+This workflow calls a live model and may clone large repositories or run
+resource-intensive Docker evaluations. It is never included in pytest. See
+[`evals/swebench/README.md`](evals/swebench/README.md) for prerequisites,
+artifacts, budgets, and recovery behavior.
+
 ### Testing Conventions
 
 - Write tests with `pytest` only; do not add standalone `if __name__ == "__main__"` test scripts.

@@ -1,0 +1,8 @@
+{
+  "dataset": "SWE-bench/SWE-bench_Verified",
+  "split": "test",
+  "selection": "Curated smoke set for pipeline validation; not a representative benchmark sample.",
+  "instance_ids": [
+    "astropy__astropy-12907"
+  ]
+}
