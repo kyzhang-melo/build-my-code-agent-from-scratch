@@ -206,7 +206,7 @@ def _generate_args(parser: argparse.ArgumentParser) -> None:
 
 def _evaluate_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--namespace", default="swebench")
-    parser.add_argument("--max-workers", type=int, default=1)
+    parser.add_argument("--max-workers", type=int, default=4)
 
 
 def build_parser() -> argparse.ArgumentParser:

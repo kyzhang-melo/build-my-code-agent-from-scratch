@@ -46,6 +46,9 @@ when at least one prediction exists, and then writes the merged report. It
 stops at the failed stage while preserving all artifacts, so the same command
 can be run again after correcting an infrastructure problem.
 
+Official evaluation runs with four workers by default. Override the concurrency
+for a particular machine with `--max-workers`.
+
 The individual phase commands remain available for recovery and debugging.
 
 Generate a prediction:

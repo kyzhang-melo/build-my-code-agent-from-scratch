@@ -203,6 +203,20 @@ def test_load_subset_validates_duplicates(tmp_path) -> None:
         core.load_subset(path)
 
 
+def test_small_subset_has_five_distinct_repositories_and_smoke_control() -> None:
+    subsets = core.PROJECT_ROOT / "evals" / "swebench" / "subsets"
+    dataset, split, instance_ids, selection = core.load_subset(subsets / "small.json")
+    _, _, smoke_ids, _ = core.load_subset(subsets / "smoke.json")
+
+    repositories = {instance_id.split("__", 1)[0] for instance_id in instance_ids}
+    assert dataset == "SWE-bench/SWE-bench_Verified"
+    assert split == "test"
+    assert len(instance_ids) == 5
+    assert len(repositories) == 5
+    assert set(smoke_ids) <= set(instance_ids)
+    assert "not a representative benchmark sample" in selection
+
+
 def test_parent_session_accepts_per_session_api_budget(load_module, tmp_path) -> None:
     main = load_module("main_swebench_budget", "main.py")
     session = main.create_parent_session(
@@ -310,6 +324,18 @@ def test_run_parser_combines_generation_and_evaluation_options() -> None:
     assert args.max_api_calls == 7
     assert args.max_workers == 2
     assert args.namespace == "swebench"
+
+
+def test_evaluation_defaults_to_four_workers() -> None:
+    from evals.swebench import cli
+
+    evaluate = cli.build_parser().parse_args(["evaluate", "--run-id", "pipeline"])
+    pipeline = cli.build_parser().parse_args(
+        ["run", "--run-id", "pipeline", "--subset", "small.json"]
+    )
+
+    assert evaluate.max_workers == 4
+    assert pipeline.max_workers == 4
 
 
 def test_swebench_python_keeps_venv_symlink(tmp_path) -> None:

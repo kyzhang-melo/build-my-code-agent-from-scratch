@@ -1,0 +1,12 @@
+{
+  "dataset": "SWE-bench/SWE-bench_Verified",
+  "split": "test",
+  "selection": "Five-repository batch set selected without gold fields; includes the smoke control and is not a representative benchmark sample.",
+  "instance_ids": [
+    "astropy__astropy-12907",
+    "django__django-10097",
+    "pytest-dev__pytest-10051",
+    "scikit-learn__scikit-learn-10297",
+    "sympy__sympy-11618"
+  ]
+}
