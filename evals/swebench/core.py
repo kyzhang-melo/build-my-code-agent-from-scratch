@@ -134,19 +134,44 @@ def ensure_mirror(task: Task, cache_dir: Path) -> Path:
     return mirror
 
 
-def create_worktree(mirror: Path, workspace: Path, base_commit: str) -> Path:
+def create_isolated_workspace(
+    mirror: Path,
+    workspace: Path,
+    base_commit: str,
+) -> Path:
+    """Create a repository whose visible history ends at ``base_commit``.
+
+    The full mirror is only a download cache. Fetching the base commit into a
+    new repository preserves its ancestors without exposing the mirror's
+    branches, pull-request refs, or descendant commit objects to the agent.
+    """
     if workspace.exists():
         raise FileExistsError(f"attempt workspace already exists: {workspace}")
     workspace.parent.mkdir(parents=True, exist_ok=True)
-    run_command(["git", "--git-dir", str(mirror), "worktree", "prune"])
+    run_command(["git", "init", "--quiet", str(workspace)])
     run_command(
-        ["git", "--git-dir", str(mirror), "worktree", "add", "--detach", str(workspace), base_commit]
+        [
+            "git",
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            mirror.resolve().as_uri(),
+            base_commit,
+        ],
+        cwd=workspace,
     )
+    run_command(["git", "checkout", "--quiet", "--detach", "FETCH_HEAD"], cwd=workspace)
+    (workspace / ".git" / "FETCH_HEAD").unlink(missing_ok=True)
+
     head = git_output(["rev-parse", "HEAD"], cwd=workspace)
     if head != base_commit:
-        raise RuntimeError(f"worktree HEAD {head} does not match base_commit {base_commit}")
+        raise RuntimeError(f"workspace HEAD {head} does not match base_commit {base_commit}")
     if git_output(["status", "--porcelain"], cwd=workspace):
-        raise RuntimeError("new task worktree is not clean")
+        raise RuntimeError("new task workspace is not clean")
+    if git_output(["remote"], cwd=workspace):
+        raise RuntimeError("isolated task repository unexpectedly has a remote")
+    if (workspace / ".git" / "objects" / "info" / "alternates").exists():
+        raise RuntimeError("isolated task repository unexpectedly shares Git objects")
     return workspace
 
 
@@ -221,17 +246,28 @@ def validate_patch(mirror: Path, base_commit: str, patch: str) -> None:
     if not patch.strip():
         raise ValueError("agent produced an empty patch")
     with tempfile.TemporaryDirectory(prefix="swebench-patch-check-") as temp:
-        workspace = Path(temp) / "workspace"
-        create_worktree(mirror, workspace, base_commit)
+        index_path = Path(temp) / "index"
         patch_path = Path(temp) / "patch.diff"
         patch_path.write_text(patch, encoding="utf-8")
-        try:
-            run_command(["git", "apply", "--check", "--binary", str(patch_path)], cwd=workspace)
-        finally:
-            run_command(
-                ["git", "--git-dir", str(mirror), "worktree", "remove", "--force", str(workspace)],
-                check=False,
-            )
+        env = os.environ.copy()
+        env["GIT_INDEX_FILE"] = str(index_path)
+        run_command(
+            ["git", "--git-dir", str(mirror), "read-tree", base_commit],
+            env=env,
+        )
+        run_command(
+            [
+                "git",
+                "--git-dir",
+                str(mirror),
+                "apply",
+                "--check",
+                "--cached",
+                "--binary",
+                str(patch_path),
+            ],
+            env=env,
+        )
 
 
 def atomic_write_json(path: Path, value: object) -> None:
@@ -359,7 +395,11 @@ async def run_agent_attempt(
     import main
     from trace import JsonlTraceSink, TraceContext
 
-    workspace = create_worktree(mirror, attempt_dir / "workspace", task.base_commit)
+    workspace = create_isolated_workspace(
+        mirror,
+        attempt_dir / "workspace",
+        task.base_commit,
+    )
     attempt = int(attempt_dir.name.split("-", 1)[1])
     result = AgentResult(task.instance_id, attempt, "error", "not_exported")
     started = time.monotonic()

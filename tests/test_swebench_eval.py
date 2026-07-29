@@ -58,7 +58,7 @@ def test_build_prompt_contains_issue_but_not_gold_fields() -> None:
 def test_patch_export_includes_modify_add_delete_binary_and_preserves_index(tmp_path) -> None:
     _, mirror, commit = make_repo(tmp_path)
     workspace = tmp_path / "workspace"
-    core.create_worktree(mirror, workspace, commit)
+    core.create_isolated_workspace(mirror, workspace, commit)
     (workspace / "change.txt").write_text("after\n", encoding="utf-8")
     (workspace / "delete.txt").unlink()
     (workspace / "new.txt").write_text("new\n", encoding="utf-8")
@@ -73,6 +73,71 @@ def test_patch_export_includes_modify_add_delete_binary_and_preserves_index(tmp_
     assert "binary.bin" in patch
     assert git(workspace, "diff", "--cached") == before_index == ""
     core.validate_patch(mirror, commit, patch)
+
+
+def test_isolated_workspace_preserves_ancestors_but_hides_future(tmp_path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    git(source, "init")
+    git(source, "config", "user.email", "test@example.com")
+    git(source, "config", "user.name", "Test")
+
+    history = source / "history.txt"
+    history.write_text("ancestor\n", encoding="utf-8")
+    git(source, "add", "history.txt")
+    git(source, "commit", "-m", "ancestor")
+    ancestor = git(source, "rev-parse", "HEAD")
+
+    history.write_text("ancestor\nbase\n", encoding="utf-8")
+    git(source, "add", "history.txt")
+    git(source, "commit", "-m", "base")
+    base = git(source, "rev-parse", "HEAD")
+
+    history.write_text("ancestor\nbase\nfuture\n", encoding="utf-8")
+    git(source, "add", "history.txt")
+    git(source, "commit", "-m", "future")
+    future = git(source, "rev-parse", "HEAD")
+
+    mirror = tmp_path / "mirror.git"
+    subprocess.run(["git", "clone", "--mirror", str(source), str(mirror)], check=True)
+    workspace = tmp_path / "workspace"
+    core.create_isolated_workspace(mirror, workspace, base)
+
+    visible_history = git(workspace, "log", "--all", "--format=%H").splitlines()
+    assert git(workspace, "rev-parse", "HEAD") == base
+    assert visible_history == [base, ancestor]
+    assert git(workspace, "show", "HEAD~1:history.txt") == "ancestor"
+    assert ancestor in git(workspace, "blame", "--porcelain", "history.txt")
+    assert git(workspace, "remote") == ""
+    refs = subprocess.run(
+        ["git", "show-ref"],
+        cwd=workspace,
+        text=True,
+        capture_output=True,
+    )
+    assert refs.returncode == 1
+    assert refs.stdout == ""
+    assert not (workspace / ".git" / "FETCH_HEAD").exists()
+    assert not (workspace / ".git" / "objects" / "info" / "alternates").exists()
+    assert str(mirror.resolve()) not in (
+        workspace / ".git" / "config"
+    ).read_text(encoding="utf-8")
+
+    future_lookup = subprocess.run(
+        ["git", "cat-file", "-e", f"{future}^{{commit}}"],
+        cwd=workspace,
+        text=True,
+        capture_output=True,
+    )
+    assert future_lookup.returncode != 0
+    fsck = subprocess.run(
+        ["git", "fsck", "--unreachable", "--no-reflogs"],
+        cwd=workspace,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    assert future not in fsck.stdout
 
 
 def test_upsert_prediction_replaces_duplicate_atomically(tmp_path) -> None:

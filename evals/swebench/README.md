@@ -1,7 +1,8 @@
 # SWE-bench eval
 
 This adapter runs the real `myCodeAgent-v0` parent agent in host-side Git
-worktrees, exports the resulting repository changes, and delegates grading to
+repositories whose history ends at each task's base commit, exports the
+resulting repository changes, and delegates grading to
 the unmodified official SWE-bench Docker harness.
 
 Live runs call a model, clone GitHub repositories, and may consume substantial

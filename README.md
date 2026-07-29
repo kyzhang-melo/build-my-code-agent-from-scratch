@@ -206,7 +206,7 @@ trace-backed assertions, and implementation notes.
 ### SWE-bench
 
 The SWE-bench adapter runs the real parent agent in isolated host-side Git
-worktrees, exports its changes as official prediction patches, and delegates
+repositories, exports its changes as official prediction patches, and delegates
 grading to an unmodified SWE-bench Docker harness:
 
 ```bash
