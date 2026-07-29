@@ -161,6 +161,30 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_run(args: argparse.Namespace) -> int:
+    """Run prediction generation, official evaluation, and reporting in order."""
+    print("[pipeline] generate")
+    generate_status = await cmd_generate(args)
+    if generate_status:
+        return generate_status
+
+    predictions = run_dir(args) / "predictions.jsonl"
+    if not predictions.exists() or not any(
+        line.strip() for line in predictions.read_text(encoding="utf-8").splitlines()
+    ):
+        raise SystemExit(
+            "generation produced no predictions; official evaluation was not started"
+        )
+
+    print("[pipeline] evaluate")
+    evaluate_status = cmd_evaluate(args)
+    if evaluate_status:
+        return evaluate_status
+
+    print("[pipeline] report")
+    return cmd_report(args)
+
+
 def _shared_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--runs-dir", default=str(DEFAULT_RUNS_DIR))
@@ -171,6 +195,20 @@ def _swebench_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--swebench-python")
 
 
+def _generate_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--subset", required=True)
+    parser.add_argument("--model")
+    parser.add_argument("--repo-cache", default=str(DEFAULT_CACHE_DIR))
+    parser.add_argument("--max-api-calls", type=int, default=30)
+    parser.add_argument("--instance-timeout", type=int, default=1800)
+    parser.add_argument("--rerun-failed", action="store_true")
+
+
+def _evaluate_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--namespace", default="swebench")
+    parser.add_argument("--max-workers", type=int, default=1)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run myCodeAgent against SWE-bench.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -178,24 +216,28 @@ def build_parser() -> argparse.ArgumentParser:
     generate = sub.add_parser("generate", help="run the agent and produce predictions")
     _shared_run_args(generate)
     _swebench_args(generate)
-    generate.add_argument("--subset", required=True)
-    generate.add_argument("--model")
-    generate.add_argument("--repo-cache", default=str(DEFAULT_CACHE_DIR))
-    generate.add_argument("--max-api-calls", type=int, default=30)
-    generate.add_argument("--instance-timeout", type=int, default=1800)
-    generate.add_argument("--rerun-failed", action="store_true")
+    _generate_args(generate)
     generate.set_defaults(func=cmd_generate)
 
     evaluate = sub.add_parser("evaluate", help="run the official Docker evaluator")
     _shared_run_args(evaluate)
     _swebench_args(evaluate)
-    evaluate.add_argument("--namespace", default="swebench")
-    evaluate.add_argument("--max-workers", type=int, default=1)
+    _evaluate_args(evaluate)
     evaluate.set_defaults(func=cmd_evaluate)
 
     report = sub.add_parser("report", help="merge agent and official results")
     _shared_run_args(report)
     report.set_defaults(func=cmd_report)
+
+    pipeline = sub.add_parser(
+        "run",
+        help="generate predictions, evaluate them, and produce a report",
+    )
+    _shared_run_args(pipeline)
+    _swebench_args(pipeline)
+    _generate_args(pipeline)
+    _evaluate_args(pipeline)
+    pipeline.set_defaults(func=cmd_run)
     return parser
 
 

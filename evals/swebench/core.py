@@ -24,13 +24,13 @@ TERMINAL_AGENT_STATUSES = {"completed", "max_api_calls", "timeout", "error"}
 FAILED_AGENT_STATUSES = {"max_api_calls", "timeout", "error"}
 SWEBENCH_SYSTEM_ADDENDUM = (
     "SWE-bench evaluation mode: solve the issue by producing the smallest correct "
-    "source patch. Do not install dependencies, create virtual environments, "
-    "download packages, or attempt to repair the host environment. Tests are "
-    "optional. Run only lightweight checks that work in the existing environment. "
-    "If a check cannot run because dependencies or environment support are missing, "
-    "stop investigating the environment and continue through code inspection and "
-    "reasoning. Do not commit changes. The resulting patch will be evaluated later "
-    "by the official SWE-bench Docker harness."
+    "source patch. The host workspace is provided only for source inspection and "
+    "editing. Do not install dependencies, create virtual environments, download "
+    "packages, run the project's tests, or execute or import project code to "
+    "validate the change. Do not attempt to repair the host environment. Use source "
+    "inspection, static reasoning, and review of the final diff instead. Do not "
+    "commit changes. The patch will be tested later by the official SWE-bench Docker "
+    "harness."
 )
 
 
@@ -184,12 +184,15 @@ def should_run(instance_dir: Path, rerun_failed: bool) -> bool:
 def build_prompt(task: Task) -> str:
     return (
         "Resolve the following issue in the current repository.\n\n"
-        "Inspect the repository and implement the smallest general fix. You may run "
-        "lightweight tests that already work in the current environment, but testing "
-        "is not required. Do not install dependencies or repair the environment. "
-        "Do not commit changes. Do not modify tests merely to make them pass. Work "
-        "only inside the current workspace.\n\n"
-        "When finished, summarize the implementation and tests run.\n\n"
+        "Inspect the repository, locate the relevant source code, and implement the "
+        "smallest general fix. Do not install dependencies, create virtual "
+        "environments, download packages, run the project's tests, or execute or "
+        "import project code for validation. The official SWE-bench Docker "
+        "environment will test the resulting patch separately. Do not commit "
+        "changes. Do not modify tests merely to make them pass. Work only inside "
+        "the current workspace.\n\n"
+        "Before finishing, review the final diff for correctness and unintended "
+        "changes. Then summarize what you changed and why.\n\n"
         f"Issue:\n{task.problem_statement}"
     )
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import asyncio
 import json
 import os
 import subprocess
@@ -46,8 +48,11 @@ def test_build_prompt_contains_issue_but_not_gold_fields() -> None:
     assert "FAIL_TO_PASS" not in prompt
     assert "test_patch" not in prompt
     assert "gold" not in prompt.lower()
-    assert "testing is not required" in prompt
     assert "Do not install dependencies" in prompt
+    assert "run the project's tests" in prompt
+    assert "execute or import project code" in prompt
+    assert "review the final diff" in prompt
+    assert "tests run" not in prompt
 
 
 def test_patch_export_includes_modify_add_delete_binary_and_preserves_index(tmp_path) -> None:
@@ -226,7 +231,85 @@ def test_parent_session_system_addendum_is_per_session(load_module, tmp_path) ->
     assert "SWE-bench evaluation mode" not in regular.system
     assert "SWE-bench evaluation mode" in swebench.system
     assert "Do not install dependencies" in swebench.system
-    assert "Tests are optional" in swebench.system
+    assert "run the project's tests" in swebench.system
+    assert "execute or import project code" in swebench.system
+    assert "review of the final diff" in swebench.system
+
+
+def test_run_command_executes_all_pipeline_phases(monkeypatch, tmp_path) -> None:
+    from evals.swebench import cli
+
+    calls = []
+    args = argparse.Namespace(run_id="pipeline", runs_dir=str(tmp_path))
+
+    async def generate(_args):
+        calls.append("generate")
+        predictions = tmp_path / "pipeline" / "predictions.jsonl"
+        predictions.parent.mkdir(parents=True)
+        predictions.write_text('{"instance_id": "task"}\n', encoding="utf-8")
+        return 0
+
+    def evaluate(_args):
+        calls.append("evaluate")
+        return 0
+
+    def report(_args):
+        calls.append("report")
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_generate", generate)
+    monkeypatch.setattr(cli, "cmd_evaluate", evaluate)
+    monkeypatch.setattr(cli, "cmd_report", report)
+
+    assert asyncio.run(cli.cmd_run(args)) == 0
+    assert calls == ["generate", "evaluate", "report"]
+
+
+def test_run_command_stops_when_generation_has_no_predictions(
+    monkeypatch, tmp_path
+) -> None:
+    from evals.swebench import cli
+
+    calls = []
+    args = argparse.Namespace(run_id="pipeline", runs_dir=str(tmp_path))
+
+    async def generate(_args):
+        calls.append("generate")
+        return 0
+
+    def evaluate(_args):
+        calls.append("evaluate")
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_generate", generate)
+    monkeypatch.setattr(cli, "cmd_evaluate", evaluate)
+
+    with pytest.raises(SystemExit, match="no predictions"):
+        asyncio.run(cli.cmd_run(args))
+    assert calls == ["generate"]
+
+
+def test_run_parser_combines_generation_and_evaluation_options() -> None:
+    from evals.swebench import cli
+
+    args = cli.build_parser().parse_args(
+        [
+            "run",
+            "--run-id",
+            "pipeline",
+            "--subset",
+            "smoke.json",
+            "--max-api-calls",
+            "7",
+            "--max-workers",
+            "2",
+        ]
+    )
+
+    assert args.func is cli.cmd_run
+    assert args.max_api_calls == 7
+    assert args.max_workers == 2
+    assert args.namespace == "swebench"
 
 
 def test_swebench_python_keeps_venv_symlink(tmp_path) -> None:

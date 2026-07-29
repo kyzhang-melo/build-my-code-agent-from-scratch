@@ -33,6 +33,21 @@ the SWE-bench environment:
 
 ## Run the curated smoke set
 
+Run the complete pipeline:
+
+```bash
+./.venv/bin/python evals/swebench/run_swebench.py run \
+  --run-id verified-smoke-001 \
+  --subset evals/swebench/subsets/smoke.json
+```
+
+The command generates predictions, starts the official Docker evaluator only
+when at least one prediction exists, and then writes the merged report. It
+stops at the failed stage while preserving all artifacts, so the same command
+can be run again after correcting an infrastructure problem.
+
+The individual phase commands remain available for recovery and debugging.
+
 Generate a prediction:
 
 ```bash

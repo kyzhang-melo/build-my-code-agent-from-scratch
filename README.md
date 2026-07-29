@@ -210,13 +210,9 @@ worktrees, exports its changes as official prediction patches, and delegates
 grading to an unmodified SWE-bench Docker harness:
 
 ```bash
-./.venv/bin/python evals/swebench/run_swebench.py generate \
+./.venv/bin/python evals/swebench/run_swebench.py run \
   --run-id verified-smoke-001 \
   --subset evals/swebench/subsets/smoke.json
-./.venv/bin/python evals/swebench/run_swebench.py evaluate \
-  --run-id verified-smoke-001
-./.venv/bin/python evals/swebench/run_swebench.py report \
-  --run-id verified-smoke-001
 ```
 
 This workflow calls a live model and may clone large repositories or run
