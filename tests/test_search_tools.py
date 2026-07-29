@@ -34,6 +34,11 @@ def test_search_tools_are_registered(load_module, workspace) -> None:
     assert "CRITICAL GLOB RULE" in glob_schema["description"]
     assert "never use broad recursive patterns" in glob_schema["description"]
     assert "Put the search location in path" in grep_schema["description"]
+    assert (
+        "pattern, path, glob, output_mode, ignore_case, line_number, and head_limit"
+        in grep_schema["description"]
+    )
+    assert "Do not pass command-line flags such as -n, -A, -B, or -C" in grep_schema["description"]
 
 
 def test_run_glob_finds_sorted_relative_matches(load_module, workspace) -> None:
@@ -242,6 +247,25 @@ def test_search_tools_validate_with_pydantic(load_module, workspace, item, expec
     assert used_todo is False
     assert f"Error: invalid arguments for tool '{item.name}':" in out[0]["output"]
     assert expected_substring in out[0]["output"]
+
+
+def test_grep_rejects_cli_flags_with_corrective_guidance(load_module, workspace) -> None:
+    tools = load_module("tools", "tools.py")
+    registry, todo = _runtime(tools, workspace)
+    item = _fc(
+        "grep",
+        "g-flags",
+        '{"pattern":"needle","-n":"true","-A":"20"}',
+    )
+
+    out, used_todo = tools.execute_tool_calls([item], registry, todo)
+
+    assert used_todo is False
+    output = out[0]["output"]
+    assert "Valid grep arguments:" in output
+    assert "pattern, path, glob, output_mode, ignore_case, line_number, head_limit" in output
+    assert "CLI flags such as -n, -A, -B, and -C are not supported" in output
+    assert "Use line_number=true for line numbers" in output
 
 
 def test_execute_tool_calls_sanitizes_search_arguments(load_module, workspace) -> None:

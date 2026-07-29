@@ -313,7 +313,11 @@ TOOLS = [
         "name": "grep",
         "description": (
             "Search workspace file contents with ripgrep. "
-            "Put the search location in path, and use glob only to filter file names."
+            "Put the search location in path, and use glob only to filter file names. "
+            "The valid JSON arguments are pattern, path, glob, output_mode, ignore_case, "
+            "line_number, and head_limit. Do not pass command-line flags such as -n, -A, "
+            "-B, or -C. Use line_number=true for line numbers; use read_file with offset "
+            "and limit to inspect surrounding lines."
         ),
         "parameters": {
             "type": "object",
@@ -1851,6 +1855,13 @@ async def run_tool_call_async(
             status = "invalid_arguments"
             error_type = "validation"
             output = f"Error: invalid arguments for tool '{item.name}': {e}"
+            if item.name == "grep":
+                output += (
+                    "\nValid grep arguments: pattern, path, glob, output_mode, "
+                    "ignore_case, line_number, head_limit. CLI flags such as -n, -A, "
+                    "-B, and -C are not supported. Use line_number=true for line "
+                    "numbers; use read_file with offset and limit for surrounding lines."
+                )
         else:
             if hasattr(params, "model_dump"):
                 normalized_args = params.model_dump(by_alias=True)
