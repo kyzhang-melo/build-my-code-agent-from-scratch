@@ -252,6 +252,7 @@ def test_report_merges_agent_and_official_statuses(tmp_path) -> None:
     )
     report = core.generate_report(run_dir)
     assert report["resolved"] == 1
+    assert report["total_instances"] == 2
     assert report["evaluated"] == 2
     assert report["agent_status_counts"] == {"completed": 1, "max_api_calls": 1}
     assert [row["official_status"] for row in report["instances"]] == [
@@ -259,6 +260,58 @@ def test_report_merges_agent_and_official_statuses(tmp_path) -> None:
         "unresolved",
     ]
     assert (run_dir / "summary.md").is_file()
+
+
+def test_report_uses_planned_tasks_as_resolved_denominator(tmp_path) -> None:
+    """An unsubmitted empty patch must not disappear from the resolve rate."""
+    run_dir = tmp_path / "run"
+    instance_ids = ["resolved-a", "resolved-b", "resolved-c", "unresolved", "empty"]
+    core.atomic_write_json(
+        run_dir / "manifest.json",
+        {
+            "run_id": "historical-empty-patch",
+            "dataset": "verified",
+            "model": "vendor/model",
+            "instance_ids": instance_ids,
+        },
+    )
+    for instance_id in instance_ids:
+        patch_status = "empty" if instance_id == "empty" else "produced"
+        core.atomic_write_json(
+            run_dir / "instances" / instance_id / "attempt-1" / "result.json",
+            {
+                "instance_id": instance_id,
+                "attempt": 1,
+                "agent_status": "completed",
+                "patch_status": patch_status,
+                "api_calls": 2,
+                "duration_seconds": 3,
+            },
+        )
+    core.atomic_write_json(
+        run_dir / "official" / "vendor__model.historical-empty-patch.json",
+        {
+            "resolved_ids": ["resolved-a", "resolved-b", "resolved-c"],
+            "unresolved_ids": ["unresolved"],
+            "error_ids": [],
+            "empty_patch_ids": [],
+        },
+    )
+
+    report = core.generate_report(run_dir)
+
+    assert report["resolved"] == 3
+    assert report["total_instances"] == 5
+    assert report["evaluated"] == 4
+    assert report["official_status_counts"] == {
+        "not_submitted": 1,
+        "resolved": 3,
+        "unresolved": 1,
+    }
+    summary = (run_dir / "summary.md").read_text(encoding="utf-8")
+    assert "- Resolved: **3/5**" in summary
+    assert "- Evaluated: **4/5**" in summary
+    assert "- Resolved: **3/4**" not in summary
 
 
 def test_load_subset_validates_duplicates(tmp_path) -> None:

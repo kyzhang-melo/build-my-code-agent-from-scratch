@@ -155,7 +155,8 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
 def cmd_report(args: argparse.Namespace) -> int:
     report = generate_report(run_dir(args))
     print(
-        f"Resolved {report['resolved']}/{report['evaluated']}. "
+        f"Resolved {report['resolved']}/{report['total_instances']}. "
+        f"Evaluated {report['evaluated']}/{report['total_instances']}. "
         f"Report: {run_dir(args) / 'summary.md'}"
     )
     return 0
