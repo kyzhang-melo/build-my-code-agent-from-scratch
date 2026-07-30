@@ -116,6 +116,7 @@ CONTEXT_WINDOW_PATTERNS: list[tuple[re.Pattern[str], int]] = [
     (re.compile(r"^kimi-"), 262144),
     (re.compile(r"^deepseek-v4"), 1_000_000),
     (re.compile(r"^minimax-m3"), 524_288),
+    (re.compile(r"^glm-5\.2"), 1_000_000),
     (re.compile(r"^glm-5"), 202_800),
     (re.compile(r"^nemotron-3-ultra"), 1_048_576),
     (re.compile(r"^laguna-m"), 262_144),
