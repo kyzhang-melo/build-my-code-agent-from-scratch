@@ -1,5 +1,7 @@
 # Environment files
 .env
+.env.*
+!.env.example
 
 # Python cache
 __pycache__/
@@ -16,6 +18,16 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Local agent configuration
+.claude/settings.local.json
+.devin/config.local.json
+
+# Coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
 
 # Build artifacts
 build/
