@@ -470,12 +470,15 @@ def test_run_parser_combines_generation_and_evaluation_options() -> None:
             "7",
             "--max-workers",
             "2",
+            "--cache-level",
+            "env",
         ]
     )
 
     assert args.func is cli.cmd_run
     assert args.max_api_calls == 7
     assert args.max_workers == 2
+    assert args.cache_level == "env"
     assert args.namespace == "swebench"
 
 
@@ -489,6 +492,58 @@ def test_evaluation_defaults_to_four_workers() -> None:
 
     assert evaluate.max_workers == 4
     assert pipeline.max_workers == 4
+    assert evaluate.cache_level == "instance"
+    assert pipeline.cache_level == "instance"
+
+
+def test_official_evaluator_passes_cache_level_to_harness(
+    monkeypatch, tmp_path
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "dataset": "SWE-bench/SWE-bench_Verified",
+                "split": "test",
+                "run_id": "cache-test",
+                "model": "provider/model",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "predictions.jsonl").write_text(
+        json.dumps(
+            {
+                "instance_id": "owner__repo-1",
+                "model_name_or_path": "provider/model",
+                "model_patch": "patch",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        summary = run_dir / "official" / "provider__model.cache-test.json"
+        summary.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(core.subprocess, "run", fake_run)
+
+    core.run_official_evaluator(
+        swebench_python=Path("/swebench/python"),
+        swebench_repo=tmp_path / "SWE-bench",
+        run_dir=run_dir,
+        namespace="swebench",
+        max_workers=4,
+        cache_level="instance",
+    )
+
+    command = captured["command"]
+    cache_index = command.index("--cache_level")
+    assert command[cache_index + 1] == "instance"
 
 
 def test_swebench_python_keeps_venv_symlink(tmp_path) -> None:

@@ -474,6 +474,7 @@ def run_official_evaluator(
     run_dir: Path,
     namespace: str,
     max_workers: int,
+    cache_level: str,
 ) -> Path:
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     predictions = run_dir / "predictions.jsonl"
@@ -502,6 +503,8 @@ def run_official_evaluator(
         *ids,
         "--max_workers",
         str(max_workers),
+        "--cache_level",
+        cache_level,
         "--namespace",
         namespace,
         "--run_id",

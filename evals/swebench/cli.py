@@ -147,6 +147,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         run_dir=run_dir(args),
         namespace=args.namespace,
         max_workers=args.max_workers,
+        cache_level=args.cache_level,
     )
     print(f"Official report: {summary}")
     return 0
@@ -208,6 +209,12 @@ def _generate_args(parser: argparse.ArgumentParser) -> None:
 def _evaluate_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--namespace", default="swebench")
     parser.add_argument("--max-workers", type=int, default=4)
+    parser.add_argument(
+        "--cache-level",
+        choices=("none", "base", "env", "instance"),
+        default="instance",
+        help="Docker image cache level (default: retain instance images)",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:

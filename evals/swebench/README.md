@@ -56,6 +56,11 @@ can be run again after correcting an infrastructure problem.
 Official evaluation runs with four workers by default. Override the concurrency
 for a particular machine with `--max-workers`.
 
+Instance images are retained by default so later evaluations can reuse them
+without downloading them again. This can consume substantial Docker disk
+space. To discard newly downloaded instance images after an evaluation, use
+`--cache-level env` with either `run` or `evaluate`.
+
 The individual phase commands remain available for recovery and debugging.
 
 Generate a prediction:
