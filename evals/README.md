@@ -36,9 +36,16 @@ Requires the same environment as `main.py` (`OPENROUTER_API_KEY`,
 # Run one scenario, overriding the model
 ./.venv/bin/python evals/run_evals.py --scenario 01-create-file --model moonshotai/kimi-k2.5:exacto
 
+# Set an explicit output-token limit
+./.venv/bin/python evals/run_evals.py --max-output-tokens 8000
+
 # Keep workspaces for passing scenarios too (failures are always kept)
 ./.venv/bin/python evals/run_evals.py --keep-workspaces
 ```
+
+Reasoning effort and the output-token limit are omitted from model requests by
+default. Use `--reasoning-effort` or `--max-output-tokens` to set either field
+explicitly for a behavioral eval run.
 
 The process exits non-zero if any scenario fails. Reports are written to
 `evals/.runs/<timestamp>/` (`report.json` + `summary.md`).

@@ -176,11 +176,16 @@ def test_create_explore_session_is_isolated_from_parent(load_module, workspace) 
     and stop gate."""
     main = load_module("main", "main.py")
     parent = main.create_parent_session(
-        workspace.root, approval_handler=_StubHandler(),
+        workspace.root,
+        approval_handler=_StubHandler(),
+        reasoning_effort="high",
+        max_output_tokens=16000,
     )
     child = main.create_explore_session(
         parent.workspace, parent.permission_service, parent.trace_context,
         parent.session_id,
+        reasoning_effort=parent.reasoning_effort,
+        max_output_tokens=parent.max_output_tokens,
     )
 
     # Shared by design (read-only subagent inherits parent's safety boundary).
@@ -193,6 +198,8 @@ def test_create_explore_session_is_isolated_from_parent(load_module, workspace) 
     # Trace context is a new instance with a different agent_id.
     assert child.trace_context is not parent.trace_context
     assert child.trace_context.agent_id == "subagent:explore"
+    assert child.reasoning_effort == parent.reasoning_effort == "high"
+    assert child.max_output_tokens == parent.max_output_tokens == 16000
     # The explore registry is restricted to read-only tools.
     assert set(child.registry.keys()) <= set(main.READ_ONLY_TOOL_NAMES)
 
@@ -206,6 +213,25 @@ def test_two_parent_sessions_have_distinct_session_ids(load_module) -> None:
 
     assert sa.session_id != sb.session_id
     assert sa.session_id and sb.session_id
+
+
+def test_parent_generation_config_is_session_scoped(load_module) -> None:
+    main = load_module("main", "main.py")
+
+    with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+        sa = main.create_parent_session(
+            Path(a),
+            approval_handler=_StubHandler(),
+            reasoning_effort="high",
+            max_output_tokens=16000,
+        )
+        sb = main.create_parent_session(
+            Path(b),
+            approval_handler=_StubHandler(),
+        )
+
+    assert (sa.reasoning_effort, sa.max_output_tokens) == ("high", 16000)
+    assert (sb.reasoning_effort, sb.max_output_tokens) == (None, None)
 
 
 def test_two_parent_sessions_have_distinct_default_stores(load_module) -> None:

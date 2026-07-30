@@ -75,6 +75,8 @@ async def cmd_generate(args: argparse.Namespace) -> int:
         instance_ids=instance_ids,
         model=model,
         max_api_calls=args.max_api_calls,
+        reasoning_effort=args.reasoning_effort,
+        max_output_tokens=args.max_output_tokens,
         timeout=args.instance_timeout,
         swebench_repo=swebench_repo,
     )
@@ -106,6 +108,8 @@ async def cmd_generate(args: argparse.Namespace) -> int:
                 run_id=args.run_id,
                 model=model,
                 max_api_calls=args.max_api_calls,
+                reasoning_effort=args.reasoning_effort,
+                max_output_tokens=args.max_output_tokens,
                 timeout=args.instance_timeout,
             )
         except Exception as exc:  # noqa: BLE001 - isolate batch failures
@@ -202,7 +206,16 @@ def _generate_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model")
     parser.add_argument("--repo-cache", default=str(DEFAULT_CACHE_DIR))
     parser.add_argument("--max-api-calls", type=int, default=30)
-    parser.add_argument("--instance-timeout", type=int, default=1800)
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=("minimal", "low", "medium", "high", "xhigh"),
+    )
+    parser.add_argument("--max-output-tokens", type=_positive_int)
+    parser.add_argument(
+        "--instance-timeout",
+        type=_positive_int,
+        help="optional agent instance timeout in seconds (default: no limit)",
+    )
     parser.add_argument("--rerun-failed", action="store_true")
 
 
@@ -215,6 +228,13 @@ def _evaluate_args(parser: argparse.ArgumentParser) -> None:
         default="instance",
         help="Docker image cache level (default: retain instance images)",
     )
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 
 def test_eval_matches_legacy_and_precise_trace_expectations(load_module, tmp_path) -> None:
     runner = load_module("eval_runner", "evals/run_evals.py")
@@ -65,3 +67,16 @@ def test_eval_does_not_infer_tool_completion_from_messages(load_module, tmp_path
     )
 
     assert checks[0].passed is False
+
+
+def test_behavioral_eval_output_limit_is_opt_in(load_module, monkeypatch) -> None:
+    runner = load_module("eval_runner", "evals/run_evals.py")
+    monkeypatch.setattr(sys, "argv", ["run_evals.py"])
+    assert runner.parse_args().max_output_tokens is None
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_evals.py", "--max-output-tokens", "8000"],
+    )
+    assert runner.parse_args().max_output_tokens == 8000

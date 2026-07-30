@@ -127,7 +127,9 @@ DEFAULT_CONTEXT_WINDOW = 32000
 # Deliberate override, e.g. shrink the window in tests so auto-compaction is
 # easy to trigger. 0/unset -> resolve from MODEL_ID via the patterns above.
 CONTEXT_WINDOW_OVERRIDE = int(os.getenv("CONTEXT_WINDOW_OVERRIDE", "0"))
-RESERVED_OUTPUT_TOKENS = 8000      # mirrors max_output_tokens in run_one_turn
+DEFAULT_MAX_OUTPUT_TOKENS: int | None = None
+AUTO_MAX_OUTPUT_TOKEN_RESERVATION = 32768
+REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
 RESERVED_OVERHEAD_TOKENS = 4000    # system prompt + tool schemas
 COMPACT_TRIGGER_RATIO = 0.85
 # On by default; AUTO_COMPACT=0 disables automatic compaction (manual /compact
@@ -152,15 +154,53 @@ def context_window() -> int:
     return DEFAULT_CONTEXT_WINDOW
 
 
-def input_budget() -> int:
+def output_token_reservation(max_output_tokens: int | None) -> int:
+    return (
+        min(AUTO_MAX_OUTPUT_TOKEN_RESERVATION, context_window() // 2)
+        if max_output_tokens is None
+        else max_output_tokens
+    )
+
+
+def input_budget(
+    max_output_tokens: int | None = DEFAULT_MAX_OUTPUT_TOKENS,
+) -> int:
     # Tokens available for input once the response reservation and fixed overhead
     # are carved out. The trigger ratio applies to THIS, not the raw window, so
     # the output reservation can't be eaten away on small-context models.
-    return context_window() - RESERVED_OUTPUT_TOKENS - RESERVED_OVERHEAD_TOKENS
+    return (
+        context_window()
+        - output_token_reservation(max_output_tokens)
+        - RESERVED_OVERHEAD_TOKENS
+    )
 
 
-def should_auto_compact(state: "LoopState") -> bool:
-    return state.last_input_tokens >= COMPACT_TRIGGER_RATIO * input_budget()
+def should_auto_compact(
+    state: "LoopState",
+    max_output_tokens: int | None = DEFAULT_MAX_OUTPUT_TOKENS,
+) -> bool:
+    return (
+        state.last_input_tokens
+        >= COMPACT_TRIGGER_RATIO * input_budget(max_output_tokens)
+    )
+
+
+def validate_generation_config(
+    reasoning_effort: str | None,
+    max_output_tokens: int | None,
+) -> None:
+    if (
+        reasoning_effort is not None
+        and reasoning_effort not in REASONING_EFFORTS
+    ):
+        raise ValueError(f"unsupported reasoning_effort: {reasoning_effort}")
+    if max_output_tokens is not None and max_output_tokens <= 0:
+        raise ValueError("max_output_tokens must be positive")
+    if input_budget(max_output_tokens) <= 0:
+        raise ValueError(
+            "max_output_tokens plus reserved overhead must be smaller than "
+            f"the {context_window()}-token context window"
+        )
 
 
 @dataclass
@@ -231,8 +271,12 @@ def create_explore_session(
     permission_service: PermissionService,
     trace_context: TraceContext,
     session_id: str,
+    *,
+    reasoning_effort: str | None = None,
+    max_output_tokens: int | None = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> AgentSession:
     """Create an isolated read-only exploration session."""
+    validate_generation_config(reasoning_effort, max_output_tokens)
     todo = TodoManager()
     child_trace = replace(trace_context, agent_id="subagent:explore")
     return AgentSession(
@@ -247,6 +291,8 @@ def create_explore_session(
         permission_source="subagent:explore",
         trace_context=child_trace,
         max_api_calls=MAX_SUBAGENT_API_CALLS,
+        reasoning_effort=reasoning_effort,
+        max_output_tokens=max_output_tokens,
         stop_gate=ReportStopGate(
             SUMMARY_MIN_LENGTH,
             SUMMARY_CONTINUATION_ATTEMPTS,
@@ -264,10 +310,13 @@ def create_parent_session(
     session_id: str | None = None,
     store: SessionStoreProtocol | None = None,
     max_api_calls: int = MAX_API_CALLS_PER_USER_TURN,
+    reasoning_effort: str | None = None,
+    max_output_tokens: int | None = DEFAULT_MAX_OUTPUT_TOKENS,
     system_addendum: str | None = None,
     tool_names: set[str] | frozenset[str] | None = None,
 ) -> AgentSession:
     """Build one fully isolated parent-agent session."""
+    validate_generation_config(reasoning_effort, max_output_tokens)
     workspace = Workspace(Path(workdir))
     todo = TodoManager()
     permission_service = PermissionService(
@@ -284,7 +333,14 @@ def create_parent_session(
     session_store = store if store is not None else NullSessionStore()
 
     async def task_runner(prompt: str, description: str) -> str:
-        explore = create_explore_session(workspace, permission_service, trace, sid)
+        explore = create_explore_session(
+            workspace,
+            permission_service,
+            trace,
+            sid,
+            reasoning_effort=reasoning_effort,
+            max_output_tokens=max_output_tokens,
+        )
         return await run_subagent(prompt, description, explore)
 
     system = build_parent_system(workspace.root)
@@ -313,6 +369,8 @@ def create_parent_session(
         permission_source="parent",
         trace_context=trace,
         max_api_calls=max_api_calls,
+        reasoning_effort=reasoning_effort,
+        max_output_tokens=max_output_tokens,
         stop_gate=TodoStopGate(todo, TODO_CONTRACT_MAX_NUDGES),
         store=session_store,
         on_text=on_text,
@@ -364,14 +422,18 @@ async def run_one_turn(state: LoopState, session: AgentSession) -> StepOutcome |
         else:
             preview = str(content).replace("\n", " ")[:120]
         print(f"[debug]  [{i}] {role}: {preview}")
-    response = await client.responses.create(
+    request = dict(
         model=MODEL_ID,
         instructions=session.system,
         input=input_messages,
         tools=session.tools,
-        max_output_tokens=8000,
         extra_body=PROVIDER_EXTRA_BODY,
     )
+    if session.max_output_tokens is not None:
+        request["max_output_tokens"] = session.max_output_tokens
+    if session.reasoning_effort is not None:
+        request["reasoning"] = {"effort": session.reasoning_effort}
+    response = await client.responses.create(**request)
     debug_empty_output_text_response(response)
 
     # Track input-token load for the auto-compaction trigger. Prefer the API's
@@ -555,7 +617,9 @@ async def agent_loop(state: LoopState, session: AgentSession) -> TurnOutcome:
         # Each `None` outcome is a clean turn boundary: the turn's tool outputs
         # are already appended, so the history is well-formed (no orphaned tool
         # call) -- a safe point to compact.
-        if AUTO_COMPACT_ENABLED and should_auto_compact(state):
+        if AUTO_COMPACT_ENABLED and should_auto_compact(
+            state, session.max_output_tokens
+        ):
             result = await compact_history_async(
                 state, source="auto", focus=None, client=client, model=MODEL_ID,
                 extra_body=PROVIDER_EXTRA_BODY, todo=session.todo,
@@ -568,7 +632,9 @@ async def agent_loop(state: LoopState, session: AgentSession) -> TurnOutcome:
                 # If even a fresh summary still doesn't fit, the surviving user
                 # messages are the bulk: drop the oldest until we fit, rather
                 # than re-summarizing on every subsequent turn.
-                while should_auto_compact(state) and _drop_oldest_user_message(state):
+                while should_auto_compact(
+                    state, session.max_output_tokens
+                ) and _drop_oldest_user_message(state):
                     state.last_input_tokens = estimate_tokens(state.messages)
     return TurnOutcome(
         stop_reason=outcome.stop_reason,
@@ -748,6 +814,8 @@ async def repl(
     list_only: bool = False,
     no_session: bool = False,
     session_name: str | None = None,
+    reasoning_effort: str | None = None,
+    max_output_tokens: int | None = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> None:
     if list_only:
         if session_name:
@@ -847,6 +915,8 @@ async def repl(
         approval_handler=TerminalApprovalHandler(interactive=sys.stdin.isatty()),
         session_id=session_id,
         store=store,
+        reasoning_effort=reasoning_effort,
+        max_output_tokens=max_output_tokens,
     )
 
     # Restore todo state if the session had an active plan.
@@ -878,6 +948,8 @@ async def repl(
         session_id=session.session_id,
         workspace_root=str(session.workspace.root),
         model_id=MODEL_ID,
+        reasoning_effort=session.reasoning_effort,
+        max_output_tokens=session.max_output_tokens,
         resumed=bool(resumed_history),
     )
 
@@ -959,6 +1031,15 @@ async def repl(
             print(f"[session] saved {session_id}")
 
 
+def _positive_int(value: str) -> int:
+    import argparse
+
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def parse_args() -> dict:
     import argparse
     parser = argparse.ArgumentParser(description="Code agent CLI")
@@ -972,6 +1053,17 @@ def parse_args() -> dict:
     group.add_argument("--list-sessions", action="store_true", dest="list_only", help="List saved sessions and exit")
     group.add_argument("--no-session", action="store_true", dest="no_session", help="Disable session persistence")
     parser.add_argument("--name", dest="session_name", help="Optional name for a new session")
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=("minimal", "low", "medium", "high", "xhigh"),
+        help="reasoning effort sent to the Responses API",
+    )
+    parser.add_argument(
+        "--max-output-tokens",
+        type=_positive_int,
+        default=DEFAULT_MAX_OUTPUT_TOKENS,
+        help="maximum output tokens per agent call (default: provider limit)",
+    )
     return vars(parser.parse_args())
 
 

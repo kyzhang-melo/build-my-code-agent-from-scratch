@@ -98,10 +98,102 @@ def test_run_one_turn_full_iteration(load_module, monkeypatch, tmp_path) -> None
     assert captured["input"][0]["content"] == "task part 1"
     assert captured["input"][1]["role"] == "user"
     assert captured["input"][1]["content"] == "task part 2"
+    assert "max_output_tokens" not in captured
+    assert "reasoning" not in captured
     assert any(m.get("type") == "function_call" and m.get("call_id") == "c1" for m in state.messages)
     assert any(m.get("role") == "assistant" and m.get("content") == "Running command..." for m in state.messages)
     assert state.messages[-1]["type"] == "function_call_output"
     assert state.messages[-1]["output"] == "ok"
+
+
+def test_run_one_turn_uses_session_generation_config(
+    load_module, monkeypatch, tmp_path
+) -> None:
+    main_module = load_module("main", "main.py")
+    captured = {}
+    monkeypatch.setattr(
+        main_module,
+        "client",
+        _client_for_response(_no_tool_response("Done."), captured),
+    )
+    session = main_module.create_parent_session(
+        tmp_path,
+        approval_handler=None,
+        on_text=None,
+        reasoning_effort="high",
+        max_output_tokens=16000,
+    )
+    state = main_module.LoopState(
+        messages=[{"role": "user", "content": "task"}]
+    )
+
+    outcome = _run(main_module.run_one_turn(state, session))
+
+    assert outcome is not None
+    assert captured["reasoning"] == {"effort": "high"}
+    assert captured["max_output_tokens"] == 16000
+
+
+def test_run_one_turn_default_omits_max_output_tokens(
+    load_module, monkeypatch, tmp_path
+) -> None:
+    main_module = load_module("main", "main.py")
+    captured = {}
+    monkeypatch.setattr(
+        main_module,
+        "client",
+        _client_for_response(_no_tool_response("Done."), captured),
+    )
+    session = main_module.create_parent_session(
+        tmp_path,
+        approval_handler=None,
+        on_text=None,
+        max_output_tokens=None,
+    )
+    state = main_module.LoopState(
+        messages=[{"role": "user", "content": "task"}]
+    )
+
+    _run(main_module.run_one_turn(state, session))
+
+    assert "max_output_tokens" not in captured
+
+
+def test_main_cli_parses_generation_config(load_module, monkeypatch) -> None:
+    main_module = load_module("main", "main.py")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py",
+            "--reasoning-effort",
+            "high",
+            "--max-output-tokens",
+            "16000",
+        ],
+    )
+
+    args = main_module.parse_args()
+
+    assert args["reasoning_effort"] == "high"
+    assert args["max_output_tokens"] == 16000
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["main.py", "--reasoning-effort", "extreme"],
+        ["main.py", "--max-output-tokens", "0"],
+        ["main.py", "--max-output-tokens", "auto"],
+    ],
+)
+def test_main_cli_rejects_invalid_generation_config(
+    load_module, monkeypatch, argv
+) -> None:
+    main_module = load_module("main", "main.py")
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(SystemExit):
+        main_module.parse_args()
 
 
 def _no_tool_response(output_text: str):

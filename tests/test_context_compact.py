@@ -392,20 +392,38 @@ def test_input_budget_and_threshold(load_module) -> None:
     main.CONTEXT_WINDOW_OVERRIDE = 0
     main.MODEL_ID = "moonshotai/kimi-k2.5"
     assert main.context_window() == 262144
-    assert main.input_budget() == 262144 - main.RESERVED_OUTPUT_TOKENS - main.RESERVED_OVERHEAD_TOKENS
+    assert main.input_budget() == 262144 - main.AUTO_MAX_OUTPUT_TOKEN_RESERVATION - main.RESERVED_OVERHEAD_TOKENS
+    assert main.input_budget(16000) == 262144 - 16000 - main.RESERVED_OVERHEAD_TOKENS
+    assert main.input_budget(None) == 262144 - main.AUTO_MAX_OUTPUT_TOKEN_RESERVATION - main.RESERVED_OVERHEAD_TOKENS
 
     main.MODEL_ID = "nope/unknown"
     assert main.context_window() == main.DEFAULT_CONTEXT_WINDOW
-    assert main.input_budget() == 32000 - 12000  # = 20000
+    assert main.input_budget() == 32000 - 16000 - main.RESERVED_OVERHEAD_TOKENS
 
-    # The 8k response reservation must keep the trigger safe on a small window.
-    assert main.COMPACT_TRIGGER_RATIO * main.input_budget() + main.RESERVED_OUTPUT_TOKENS < main.context_window()
+    # Provider-default output mode reserves half of a small context window.
+    assert main.COMPACT_TRIGGER_RATIO * main.input_budget() + main.output_token_reservation(None) < main.context_window()
 
     state = main.LoopState(messages=[])
-    state.last_input_tokens = 17000  # 0.85 * 20000
+    state.last_input_tokens = 10200  # 0.85 * 12000
     assert main.should_auto_compact(state) is True
-    state.last_input_tokens = 16999
+    state.last_input_tokens = 10199
     assert main.should_auto_compact(state) is False
+
+
+def test_session_rejects_output_budget_that_consumes_context(
+    load_module, tmp_path
+) -> None:
+    main = load_module("main", "main.py")
+    main.CONTEXT_WINDOW_OVERRIDE = 20000
+    try:
+        with pytest.raises(ValueError, match="reserved overhead"):
+            main.create_parent_session(
+                tmp_path,
+                approval_handler=None,
+                max_output_tokens=16000,
+            )
+    finally:
+        main.CONTEXT_WINDOW_OVERRIDE = 0
 
 
 def test_context_window_normalizes_routing_and_quant_suffixes(load_module) -> None:

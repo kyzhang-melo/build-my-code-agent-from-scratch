@@ -234,6 +234,8 @@ def test_manifest_rejects_material_config_changes(tmp_path) -> None:
         "instance_ids": ["a"],
         "model": "m",
         "max_api_calls": 30,
+        "reasoning_effort": None,
+        "max_output_tokens": None,
         "instance_timeout_seconds": 10,
         "harness_commit": "h",
         "swebench_commit": "s",
@@ -241,6 +243,12 @@ def test_manifest_rejects_material_config_changes(tmp_path) -> None:
     core.ensure_manifest(path, base)
     changed = {**base, "model": "other"}
     with pytest.raises(ValueError, match="model"):
+        core.ensure_manifest(path, changed)
+    changed = {**base, "reasoning_effort": "high"}
+    with pytest.raises(ValueError, match="reasoning_effort"):
+        core.ensure_manifest(path, changed)
+    changed = {**base, "max_output_tokens": 8000}
+    with pytest.raises(ValueError, match="max_output_tokens"):
         core.ensure_manifest(path, changed)
 
 
@@ -470,6 +478,10 @@ def test_run_parser_combines_generation_and_evaluation_options() -> None:
             "7",
             "--max-workers",
             "2",
+            "--reasoning-effort",
+            "high",
+            "--max-output-tokens",
+            "16000",
             "--cache-level",
             "env",
         ]
@@ -478,6 +490,8 @@ def test_run_parser_combines_generation_and_evaluation_options() -> None:
     assert args.func is cli.cmd_run
     assert args.max_api_calls == 7
     assert args.max_workers == 2
+    assert args.reasoning_effort == "high"
+    assert args.max_output_tokens == 16000
     assert args.cache_level == "env"
     assert args.namespace == "swebench"
 
@@ -492,8 +506,63 @@ def test_evaluation_defaults_to_four_workers() -> None:
 
     assert evaluate.max_workers == 4
     assert pipeline.max_workers == 4
+    assert pipeline.reasoning_effort is None
+    assert pipeline.max_output_tokens is None
+    assert pipeline.instance_timeout is None
     assert evaluate.cache_level == "instance"
     assert pipeline.cache_level == "instance"
+
+
+def test_swebench_cli_rejects_nonpositive_output_tokens() -> None:
+    from evals.swebench import cli
+
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(
+            [
+                "generate",
+                "--run-id",
+                "invalid",
+                "--subset",
+                "small.json",
+                "--max-output-tokens",
+                "0",
+            ]
+        )
+
+
+def test_swebench_cli_accepts_optional_instance_timeout() -> None:
+    from evals.swebench import cli
+
+    args = cli.build_parser().parse_args(
+        [
+            "generate",
+            "--run-id",
+            "bounded",
+            "--subset",
+            "small.json",
+            "--instance-timeout",
+            "3600",
+        ]
+    )
+
+    assert args.instance_timeout == 3600
+
+
+def test_swebench_cli_rejects_auto_output_tokens() -> None:
+    from evals.swebench import cli
+
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(
+            [
+                "generate",
+                "--run-id",
+                "auto-output",
+                "--subset",
+                "small.json",
+                "--max-output-tokens",
+                "auto",
+            ]
+        )
 
 
 def test_official_evaluator_passes_cache_level_to_harness(

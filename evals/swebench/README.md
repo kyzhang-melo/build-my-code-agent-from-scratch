@@ -48,6 +48,32 @@ Run the complete pipeline:
   --subset evals/swebench/subsets/smoke.json
 ```
 
+Agent calls leave reasoning effort and the output-token limit unspecified by
+default. Set either field explicitly when a run needs a fixed generation
+configuration:
+
+```bash
+./.venv/bin/python evals/swebench/run_swebench.py run \
+  --run-id verified-small-glm-5.2-high-16k-001 \
+  --subset evals/swebench/subsets/small.json \
+  --reasoning-effort high \
+  --max-output-tokens 16000
+```
+
+The effective settings are recorded in the run manifest. Resuming the same run
+ID with different settings is rejected.
+
+Omitting `--max-output-tokens` omits the API field and records `null` in the
+manifest. Passing `--max-output-tokens 8000` sends and records an explicit
+8,000-token limit. Provider-default mode keeps a 32,768-token context
+reservation when the model context permits, capped at half of smaller context
+windows.
+
+Agent instances have no overall timeout by default. Use
+`--instance-timeout <seconds>` only when a run needs an explicit safety limit.
+This setting applies to the host-side agent loop, not the official Docker test
+timeout.
+
 The command generates predictions, starts the official Docker evaluator only
 when at least one prediction exists, and then writes the merged report. It
 stops at the failed stage while preserving all artifacts, so the same command

@@ -97,6 +97,8 @@ class AgentSession:
     permission_source: str
     trace_context: TraceContext
     max_api_calls: int
+    reasoning_effort: str | None
+    max_output_tokens: int | None
     stop_gate: StopGate
     store: SessionStoreProtocol = field(default_factory=NullSessionStore)
     on_text: Callable[[str], None] | None = None

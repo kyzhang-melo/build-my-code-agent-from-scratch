@@ -87,6 +87,23 @@ Type your request at `s01 >>`.
 
 - `q`, `exit`, or empty input will quit.
 
+Agent generation leaves both reasoning effort and the output-token limit
+unspecified by default, so the provider chooses them. Set either field
+explicitly for one CLI run:
+
+```bash
+python main.py --reasoning-effort high --max-output-tokens 16000
+```
+
+Omit `--reasoning-effort` to leave the reasoning effort unspecified. Supported
+explicit values are `minimal`, `low`, `medium`, `high`, and `xhigh`; the
+selected model and provider must support the chosen value.
+
+Omit `--max-output-tokens` to leave the API field unset. Passing
+`--max-output-tokens 8000` sends an explicit limit of 8,000. When the field is
+unset, context compaction reserves up to 32,768 output tokens, capped at half
+of the context window for smaller or unknown models.
+
 ### Session Persistence
 
 By default, each session is persisted as a logically append-only JSONL log in

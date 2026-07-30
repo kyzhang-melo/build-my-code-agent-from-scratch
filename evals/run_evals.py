@@ -14,6 +14,8 @@ ordinary `pytest` run never triggers it.
 
 Usage:
     python evals/run_evals.py [--scenario NAME] [--model ID]
+                              [--reasoning-effort LEVEL]
+                              [--max-output-tokens TOKENS]
                               [--keep-workspaces] [--list]
 """
 
@@ -260,7 +262,13 @@ def evaluate(expect: dict, workspace: Path, events: list[dict],
 
 # --- Scenario execution -----------------------------------------------------
 
-async def run_scenario(scenario_dir: Path, run_root: Path) -> ScenarioResult:
+async def run_scenario(
+    scenario_dir: Path,
+    run_root: Path,
+    *,
+    reasoning_effort: str | None = None,
+    max_output_tokens: int | None = None,
+) -> ScenarioResult:
     config = load_config(scenario_dir)
     name = config.get("name", scenario_dir.name)
     workspace = prepare_workspace(scenario_dir, run_root)
@@ -280,6 +288,8 @@ async def run_scenario(scenario_dir: Path, run_root: Path) -> ScenarioResult:
         approval_handler=AutoApproveHandler(),
         trace_context=trace_context,
         on_text=None,
+        reasoning_effort=reasoning_effort,
+        max_output_tokens=max_output_tokens,
     )
 
     state = main.LoopState(messages=[{"role": "user", "content": config["prompt"]}])
@@ -329,10 +339,18 @@ def print_scenario(result: ScenarioResult) -> None:
         print(line)
 
 
-def write_reports(results: list[ScenarioResult], run_root: Path) -> None:
+def write_reports(
+    results: list[ScenarioResult],
+    run_root: Path,
+    *,
+    reasoning_effort: str | None,
+    max_output_tokens: int | None,
+) -> None:
     report = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "model": main.MODEL_ID,
+        "reasoning_effort": reasoning_effort,
+        "max_output_tokens": max_output_tokens,
         "total": len(results),
         "passed": sum(1 for r in results if r.passed),
         "scenarios": [
@@ -355,6 +373,8 @@ def write_reports(results: list[ScenarioResult], run_root: Path) -> None:
         f"# Eval Report ({report['generated_at']})",
         "",
         f"- Model: `{report['model']}`",
+        f"- Reasoning effort: `{report['reasoning_effort']}`",
+        f"- Max output tokens: `{report['max_output_tokens']}`",
         f"- Passed: **{report['passed']}/{report['total']}**",
         "",
         "| Scenario | Result | api_calls |",
@@ -398,10 +418,22 @@ async def main_async(args: argparse.Namespace) -> int:
 
     results: list[ScenarioResult] = []
     for scenario_dir in scenario_dirs:
-        results.append(await run_scenario(scenario_dir, run_root))
+        results.append(
+            await run_scenario(
+                scenario_dir,
+                run_root,
+                reasoning_effort=args.reasoning_effort,
+                max_output_tokens=args.max_output_tokens,
+            )
+        )
         print_scenario(results[-1])
 
-    write_reports(results, run_root)
+    write_reports(
+        results,
+        run_root,
+        reasoning_effort=args.reasoning_effort,
+        max_output_tokens=args.max_output_tokens,
+    )
     cleanup_workspaces(results, args.keep_workspaces)
 
     passed = sum(1 for r in results if r.passed)
@@ -410,9 +442,25 @@ async def main_async(args: argparse.Namespace) -> int:
 
 
 def parse_args() -> argparse.Namespace:
+    def positive_int(value: str) -> int:
+        parsed = int(value)
+        if parsed <= 0:
+            raise argparse.ArgumentTypeError("must be a positive integer")
+        return parsed
+
     parser = argparse.ArgumentParser(description="Run mini-fixture behavioral evals.")
     parser.add_argument("--scenario", help="run only the named scenario directory")
     parser.add_argument("--model", help="override MODEL_ID for this run")
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=("minimal", "low", "medium", "high", "xhigh"),
+        help="reasoning effort sent to the Responses API",
+    )
+    parser.add_argument(
+        "--max-output-tokens",
+        type=positive_int,
+        help="maximum output tokens per agent call (default: provider limit)",
+    )
     parser.add_argument("--list", action="store_true", help="list scenarios and exit")
     parser.add_argument("--keep-workspaces", action="store_true",
                         help="retain workspaces for passing scenarios too")

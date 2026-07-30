@@ -338,7 +338,9 @@ def create_manifest(
     instance_ids: list[str],
     model: str,
     max_api_calls: int,
-    timeout: int,
+    reasoning_effort: str | None,
+    max_output_tokens: int | None,
+    timeout: int | None,
     swebench_repo: Path,
 ) -> dict:
     harness_commit, harness_dirty = repository_state(PROJECT_ROOT)
@@ -353,6 +355,8 @@ def create_manifest(
         "instance_ids": instance_ids,
         "model": model,
         "max_api_calls": max_api_calls,
+        "reasoning_effort": reasoning_effort,
+        "max_output_tokens": max_output_tokens,
         "instance_timeout_seconds": timeout,
         "harness_commit": harness_commit,
         "harness_worktree_dirty": harness_dirty,
@@ -374,6 +378,8 @@ def ensure_manifest(path: Path, proposed: dict) -> dict:
         "instance_ids",
         "model",
         "max_api_calls",
+        "reasoning_effort",
+        "max_output_tokens",
         "instance_timeout_seconds",
         "harness_commit",
         "swebench_commit",
@@ -401,7 +407,9 @@ async def run_agent_attempt(
     run_id: str,
     model: str,
     max_api_calls: int,
-    timeout: int,
+    reasoning_effort: str | None,
+    max_output_tokens: int | None,
+    timeout: int | None,
 ) -> AgentResult:
     import main
     from trace import JsonlTraceSink, TraceContext
@@ -427,6 +435,8 @@ async def run_agent_attempt(
         trace_context=trace,
         on_text=None,
         max_api_calls=max_api_calls,
+        reasoning_effort=reasoning_effort,
+        max_output_tokens=max_output_tokens,
         system_addendum=SWEBENCH_SYSTEM_ADDENDUM,
         tool_names=SWEBENCH_TOOL_NAMES,
     )
@@ -434,7 +444,13 @@ async def run_agent_attempt(
     log_path = attempt_dir / "agent.log"
     try:
         with log_path.open("w", encoding="utf-8") as log, contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
-            outcome = await asyncio.wait_for(main.agent_loop(state, session), timeout=timeout)
+            if timeout is None:
+                outcome = await main.agent_loop(state, session)
+            else:
+                outcome = await asyncio.wait_for(
+                    main.agent_loop(state, session),
+                    timeout=timeout,
+                )
         final_text = outcome.final_text
         result.agent_status = outcome.stop_reason
         result.stop_reason = outcome.stop_reason
