@@ -32,6 +32,16 @@ SWEBENCH_SYSTEM_ADDENDUM = (
     "commit changes. The patch will be tested later by the official SWE-bench Docker "
     "harness."
 )
+SWEBENCH_TOOL_NAMES = frozenset({
+    "read_file",
+    "write_file",
+    "edit_file",
+    "glob",
+    "grep",
+    "git_diff",
+    "todo",
+    "task",
+})
 
 
 def run_command(
@@ -216,8 +226,9 @@ def build_prompt(task: Task) -> str:
         "environment will test the resulting patch separately. Do not commit "
         "changes. Do not modify tests merely to make them pass. Work only inside "
         "the current workspace.\n\n"
-        "Before finishing, review the final diff for correctness and unintended "
-        "changes. Then summarize what you changed and why.\n\n"
+        "The shell tool is unavailable in this evaluation. Use git_diff to review "
+        "the final patch for correctness and unintended changes. Then summarize "
+        "what you changed and why.\n\n"
         f"Issue:\n{task.problem_statement}"
     )
 
@@ -417,6 +428,7 @@ async def run_agent_attempt(
         on_text=None,
         max_api_calls=max_api_calls,
         system_addendum=SWEBENCH_SYSTEM_ADDENDUM,
+        tool_names=SWEBENCH_TOOL_NAMES,
     )
     state = main.LoopState(messages=[{"role": "user", "content": build_prompt(task)}])
     log_path = attempt_dir / "agent.log"

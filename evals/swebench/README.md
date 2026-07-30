@@ -5,6 +5,12 @@ repositories whose history ends at each task's base commit, exports the
 resulting repository changes, and delegates grading to
 the unmodified official SWE-bench Docker harness.
 
+The host-side eval agent uses a restricted tool profile: workspace-bound file
+tools, `todo`, the read-only exploration subagent, and a parameter-free
+`git_diff`. It does not receive the general-purpose `bash` tool, so model tool
+calls cannot inspect other runs or host files. This is tool-capability
+isolation, not an operating-system sandbox.
+
 Live runs call a model, clone GitHub repositories, and may consume substantial
 time, tokens, disk, and Docker resources. They are separate from pytest.
 

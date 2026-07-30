@@ -16,7 +16,7 @@ from typing import Literal
 from trace import TraceContext, emit_trace
 
 
-READ_ONLY_TOOLS = {"read_file", "glob", "grep", "task", "todo"}
+READ_ONLY_TOOLS = {"read_file", "glob", "grep", "git_diff", "task", "todo"}
 CONTROLLED_TOOLS = {"write_file", "edit_file", "bash"}
 
 SENSITIVE_BASENAMES = {

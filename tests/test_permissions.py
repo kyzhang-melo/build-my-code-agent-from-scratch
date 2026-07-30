@@ -28,6 +28,7 @@ def test_default_and_plan_mode_matrix(load_module) -> None:
     assert manager.check("read_file", {"path": "README.md"}).behavior.value == "allow"
     assert manager.check("glob", {"pattern": "*.py"}).behavior.value == "allow"
     assert manager.check("grep", {"pattern": "needle"}).behavior.value == "allow"
+    assert manager.check("git_diff", {}).behavior.value == "allow"
     assert manager.check("task", {"prompt": "inspect"}).behavior.value == "allow"
     assert manager.check("todo", {"items": []}).behavior.value == "allow"
     assert manager.check("write_file", {"path": "tmp/x.txt"}).behavior.value == "ask"

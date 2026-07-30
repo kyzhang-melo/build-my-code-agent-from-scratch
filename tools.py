@@ -7,6 +7,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 import unicodedata
 from collections import deque
@@ -428,6 +429,32 @@ TASK_TOOL = {
 
 TOOLS.append(TASK_TOOL)
 
+GIT_DIFF_TOOL = {
+    "type": "function",
+    "name": "git_diff",
+    "description": (
+        "Review all current workspace changes relative to HEAD as a unified Git diff, "
+        "including untracked and binary files. This tool accepts no paths, revisions, "
+        "flags, or commands and cannot inspect Git history."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    },
+}
+
+ALL_TOOL_SCHEMAS = [*TOOLS, GIT_DIFF_TOOL]
+
+
+def select_tool_schemas(tool_names: set[str] | frozenset[str]) -> list[dict]:
+    """Return schemas for one session, rejecting unknown tool names."""
+    available = {tool["name"] for tool in ALL_TOOL_SCHEMAS}
+    unknown = sorted(tool_names - available)
+    if unknown:
+        raise ValueError(f"unknown tool names: {', '.join(unknown)}")
+    return [tool for tool in ALL_TOOL_SCHEMAS if tool["name"] in tool_names]
+
 
 class PlanItem(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
@@ -594,6 +621,10 @@ class GrepParams(BaseModel):
     ignore_case: bool = False
     line_number: bool = True
     head_limit: StrictInt = Field(default=250, ge=0)
+
+
+class GitDiffParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 
 class TaskParams(BaseModel):
@@ -1486,6 +1517,59 @@ def run_grep(
     return output if output else "No matches found."
 
 
+def run_git_diff(workspace: Workspace) -> str:
+    """Render every workspace change without exposing arbitrary Git commands."""
+    fd, index_name = tempfile.mkstemp(prefix="agent-git-diff-index-")
+    os.close(fd)
+    index_path = Path(index_name)
+    index_path.unlink()
+    env = os.environ.copy()
+    env.update({
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_INDEX_FILE": str(index_path),
+        "GIT_OPTIONAL_LOCKS": "0",
+    })
+
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args],
+            shell=False,
+            cwd=str(workspace.root),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+
+    try:
+        for args in (("read-tree", "HEAD"), ("add", "-A")):
+            result = git(*args)
+            if result.returncode != 0:
+                detail = result.stderr.strip() or result.stdout.strip()
+                return f"Error: git_diff failed. {detail}".strip()
+        result = git(
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--binary",
+            "--full-index",
+            "HEAD",
+            "--",
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            return f"Error: git_diff failed. {detail}".strip()
+        output = result.stdout.strip()
+        return truncate_middle(output) if output else "No changes found."
+    except subprocess.TimeoutExpired:
+        return "Error: git_diff timed out after 20s."
+    except Exception as exc:
+        return f"Error: git_diff failed. {exc}"
+    finally:
+        index_path.unlink(missing_ok=True)
+
+
 @dataclass
 class ToolRuntimeSpec:
     name: str
@@ -1653,6 +1737,13 @@ def build_tool_registry(
                 params.line_number,
                 params.head_limit,
             )),
+            concurrency_safe=True,
+        ),
+        "git_diff": ToolRuntimeSpec(
+            name="git_diff",
+            params_model=GitDiffParams,
+            sanitize_args=sanitize_passthrough,
+            execute=async_tool(lambda params: run_git_diff(workspace)),
             concurrency_safe=True,
         ),
         "todo": ToolRuntimeSpec(

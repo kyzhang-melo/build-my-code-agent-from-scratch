@@ -38,6 +38,7 @@ from tools import (
     TodoParams,
     build_tool_registry,
     execute_tool_calls_async,
+    select_tool_schemas,
 )
 from trace import TraceContext, emit_trace
 from workspace import Workspace
@@ -264,6 +265,7 @@ def create_parent_session(
     store: SessionStoreProtocol | None = None,
     max_api_calls: int = MAX_API_CALLS_PER_USER_TURN,
     system_addendum: str | None = None,
+    tool_names: set[str] | frozenset[str] | None = None,
 ) -> AgentSession:
     """Build one fully isolated parent-agent session."""
     workspace = Workspace(Path(workdir))
@@ -288,6 +290,11 @@ def create_parent_session(
     system = build_parent_system(workspace.root)
     if system_addendum:
         system = f"{system}\n\n{system_addendum.strip()}"
+    selected_names = (
+        frozenset(tool["name"] for tool in TOOLS)
+        if tool_names is None
+        else frozenset(tool_names)
+    )
 
     return AgentSession(
         name="parent",
@@ -295,10 +302,11 @@ def create_parent_session(
         workspace=workspace,
         todo=todo,
         system=system,
-        tools=TOOLS,
+        tools=select_tool_schemas(selected_names),
         registry=build_tool_registry(
             workspace,
             todo,
+            selected_names,
             task_runner=task_runner,
         ),
         permission_service=permission_service,

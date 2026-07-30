@@ -51,7 +51,8 @@ def test_build_prompt_contains_issue_but_not_gold_fields() -> None:
     assert "Do not install dependencies" in prompt
     assert "run the project's tests" in prompt
     assert "execute or import project code" in prompt
-    assert "review the final diff" in prompt
+    assert "shell tool is unavailable" in prompt
+    assert "Use git_diff to review the final patch" in prompt
     assert "tests run" not in prompt
 
 
@@ -73,6 +74,31 @@ def test_patch_export_includes_modify_add_delete_binary_and_preserves_index(tmp_
     assert "binary.bin" in patch
     assert git(workspace, "diff", "--cached") == before_index == ""
     core.validate_patch(mirror, commit, patch)
+
+
+def test_git_diff_tool_reviews_all_changes_without_touching_index(
+    load_module, tmp_path,
+) -> None:
+    tools = load_module("tools_swebench_git_diff", "tools.py")
+    _, mirror, commit = make_repo(tmp_path)
+    workspace = tmp_path / "workspace"
+    core.create_isolated_workspace(mirror, workspace, commit)
+    (workspace / "change.txt").write_text("after\n", encoding="utf-8")
+    (workspace / "delete.txt").unlink()
+    (workspace / "new.txt").write_text("new\n", encoding="utf-8")
+    (workspace / "binary.bin").write_bytes(b"\x00new")
+    before_index = git(workspace, "diff", "--cached")
+
+    output = tools.run_git_diff(tools.Workspace(workspace))
+
+    assert "change.txt" in output
+    assert "delete.txt" in output
+    assert "new.txt" in output
+    assert "binary.bin" in output
+    assert "GIT binary patch" in output
+    assert git(workspace, "diff", "--cached") == before_index == ""
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        tools.GitDiffParams.model_validate({"path": "../other-run"})
 
 
 def test_isolated_workspace_preserves_ancestors_but_hides_future(tmp_path) -> None:
@@ -358,6 +384,7 @@ def test_parent_session_system_addendum_is_per_session(load_module, tmp_path) ->
         approval_handler=None,
         on_text=None,
         system_addendum=core.SWEBENCH_SYSTEM_ADDENDUM,
+        tool_names=core.SWEBENCH_TOOL_NAMES,
     )
 
     assert "SWE-bench evaluation mode" not in regular.system
@@ -366,6 +393,14 @@ def test_parent_session_system_addendum_is_per_session(load_module, tmp_path) ->
     assert "run the project's tests" in swebench.system
     assert "execute or import project code" in swebench.system
     assert "review of the final diff" in swebench.system
+    regular_names = {tool["name"] for tool in regular.tools}
+    swebench_names = {tool["name"] for tool in swebench.tools}
+    assert "bash" in regular_names
+    assert "git_diff" not in regular_names
+    assert swebench_names == set(core.SWEBENCH_TOOL_NAMES)
+    assert set(swebench.registry) == set(core.SWEBENCH_TOOL_NAMES)
+    assert "bash" not in swebench_names
+    assert {"git_diff", "task", "todo"} <= swebench_names
 
 
 def test_run_command_executes_all_pipeline_phases(monkeypatch, tmp_path) -> None:
