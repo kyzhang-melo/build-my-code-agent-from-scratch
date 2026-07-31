@@ -369,6 +369,20 @@ def test_small_subset_has_five_distinct_repositories_and_smoke_control() -> None
     assert "not a representative benchmark sample" in selection
 
 
+def test_small_10_subset_extends_small_with_five_distinct_repositories() -> None:
+    subsets = core.PROJECT_ROOT / "evals" / "swebench" / "subsets"
+    dataset, split, small_ids, _ = core.load_subset(subsets / "small.json")
+    _, _, instance_ids, selection = core.load_subset(subsets / "small_10.json")
+
+    repositories = {instance_id.split("__", 1)[0] for instance_id in instance_ids}
+    assert dataset == "SWE-bench/SWE-bench_Verified"
+    assert split == "test"
+    assert instance_ids[: len(small_ids)] == small_ids
+    assert len(instance_ids) == 10
+    assert len(repositories) == 10
+    assert "not a representative benchmark sample" in selection
+
+
 def test_parent_session_accepts_per_session_api_budget(load_module, tmp_path) -> None:
     main = load_module("main_swebench_budget", "main.py")
     session = main.create_parent_session(
