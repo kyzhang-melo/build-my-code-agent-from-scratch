@@ -19,13 +19,21 @@ from evals.analyze.scanner import (
 # ---------------------------------------------------------------------------
 
 
-def _write_manifest(run_dir: Path, *, model: str, commit: str = "abcdef12", dirty: bool = True) -> None:
+def _write_manifest(
+    run_dir: Path,
+    *,
+    model: str,
+    commit: str = "abcdef12",
+    dirty: bool = True,
+    created_at: str = "2026-08-01T00:00:00+00:00",
+) -> None:
     (run_dir / "manifest.json").write_text(json.dumps({
         "schema_version": 1,
         "run_id": run_dir.name,
         "model": model,
         "harness_commit": commit,
         "harness_worktree_dirty": dirty,
+        "created_at": created_at,
         "instance_ids": [],
     }))
 
@@ -115,6 +123,7 @@ def _make_run(
     agent_status: str = "completed",
     patch_status: str = "produced",
     api_calls: int = 10,
+    created_at: str = "2026-08-01T00:00:00+00:00",
 ) -> Path:
     """Create a synthetic run with the given trace events per instance.
 
@@ -122,7 +131,13 @@ def _make_run(
     """
     run_dir = runs_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    _write_manifest(run_dir, model=model, commit=commit, dirty=dirty)
+    _write_manifest(
+        run_dir,
+        model=model,
+        commit=commit,
+        dirty=dirty,
+        created_at=created_at,
+    )
     for instance_id, events in instances.items():
         inst_dir = run_dir / "instances" / instance_id
         attempt_dir = inst_dir / "attempt-1"
@@ -168,7 +183,11 @@ def test_scanner_detects_phase0_fields(tmp_path: Path) -> None:
     _make_run(runs_dir, "run-old", "m", {"i": legacy_events})
     attempts = load_runs(runs_dir)
     by_run = {a.run_id: a for a in attempts}
-    assert by_run["run-new"].has_phase0_fields is True
+    assert by_run["run-new"].has_validation_issues is True
+    assert by_run["run-new"].has_raw_fingerprint is True
+    assert by_run["run-new"].has_api_step is True
+    assert by_run["run-new"].has_split_truncation is False
+    assert by_run["run-new"].has_phase0_fields is False
     assert by_run["run-old"].has_phase0_fields is False
 
 
@@ -193,6 +212,66 @@ def test_extract_tool_calls_matches_pairs(tmp_path: Path) -> None:
     assert calls[1].validation_issues == [{"path": "-n", "type": "extra_forbidden"}]
 
 
+def test_scanner_tracks_phase0_capabilities_independently(tmp_path: Path) -> None:
+    runs_dir = tmp_path / "runs"
+    legacy_completion = _tc_event("tool.completed", "c1", "grep", sequence=2)
+    legacy_completion.pop("api_call")
+    legacy_completion.pop("step_index")
+    events = [
+        _tc_event(
+            "tool.requested",
+            "c1",
+            "grep",
+            sequence=1,
+            validation_issues=[],
+            raw_arguments_sha256="abc",
+            raw_arguments_chars=10,
+            api_call=1,
+            step_index=0,
+        ),
+        # Legacy completion: api/step and split-truncation fields unavailable.
+        legacy_completion,
+    ]
+    _make_run(runs_dir, "run-partial", "m", {"i": events})
+
+    attempt = load_runs(runs_dir)[0]
+    assert attempt.has_validation_issues is True
+    assert attempt.has_raw_fingerprint is True
+    assert attempt.has_api_step is False
+    assert attempt.has_split_truncation is False
+    assert attempt.has_phase0_fields is False
+
+
+def test_incomplete_tool_call_is_not_classified_as_success(tmp_path: Path) -> None:
+    runs_dir = tmp_path / "runs"
+    _make_run(runs_dir, "run-incomplete", "m", {
+        "i": [_tc_event("tool.requested", "c1", "grep", sequence=1)],
+    })
+
+    attempt = load_runs(runs_dir)[0]
+    call = extract_tool_calls(attempt)[0]
+    assert call.completed is None
+    assert call.success is None
+    data = analyze(runs_dir)
+    assert data.incomplete_tool_calls == 1
+    assert data.failure_rows == []
+    assert any("no matching" in gap for gap in data.observation_gaps)
+
+
+def test_scanner_reports_malformed_trace_lines(tmp_path: Path) -> None:
+    runs_dir = tmp_path / "runs"
+    run_dir = _make_run(runs_dir, "run-bad-trace", "m", {
+        "i": [_tc_event("tool.requested", "c1", "grep", sequence=1)],
+    })
+    trace = run_dir / "instances" / "i" / "attempt-1" / "trace.jsonl"
+    with trace.open("a", encoding="utf-8") as handle:
+        handle.write("{not-json\n")
+
+    data = analyze(runs_dir)
+    assert data.malformed_trace_lines == 1
+    assert any("malformed trace" in gap for gap in data.observation_gaps)
+
+
 # ---------------------------------------------------------------------------
 # Report analysis tests
 # ---------------------------------------------------------------------------
@@ -214,6 +293,8 @@ def test_report_tool_failure_matrix(tmp_path: Path) -> None:
     events = [
         _tc_event("tool.requested", "c1", "grep", sequence=1),
         _tc_event("tool.completed", "c1", "grep", sequence=2, status="invalid_arguments", success=False, error_type="validation"),
+        _tc_event("tool.requested", "c3", "grep", sequence=5),
+        _tc_event("tool.completed", "c3", "grep", sequence=6, status="success"),
         _tc_event("tool.requested", "c2", "read_file", sequence=3),
         _tc_event("tool.completed", "c2", "read_file", sequence=4, status="success"),
     ]
@@ -223,7 +304,8 @@ def test_report_tool_failure_matrix(tmp_path: Path) -> None:
     grep_rows = [r for r in data.failure_rows if r.tool_name == "grep" and r.error_type == "validation"]
     assert len(grep_rows) == 1
     assert grep_rows[0].failed_calls == 1
-    assert grep_rows[0].total_calls == 1
+    assert grep_rows[0].total_calls == 2
+    assert grep_rows[0].failure_rate == 0.5
     assert grep_rows[0].model == "model-a"
 
 
@@ -244,7 +326,103 @@ def test_report_param_friction_with_phase0(tmp_path: Path) -> None:
     assert row.issue_type == "extra_forbidden"
     assert row.occurrences == 2
     assert row.affected_attempts == 1
-    assert row.affected_models == 1
+    assert row.model == "model-a"
+
+
+def test_affected_attempts_are_unique_across_runs(tmp_path: Path) -> None:
+    runs_dir = tmp_path / "runs"
+    events = [
+        _tc_event("tool.requested", "c1", "grep", sequence=1),
+        _tc_event(
+            "tool.completed",
+            "c1",
+            "grep",
+            sequence=2,
+            status="invalid_arguments",
+            success=False,
+            error_type="validation",
+        ),
+    ]
+    _make_run(runs_dir, "run-a", "model-a", {"same-instance": events})
+    _make_run(runs_dir, "run-b", "model-a", {"same-instance": events})
+
+    row = analyze(runs_dir).failure_rows[0]
+    assert row.failed_calls == 2
+    assert row.affected_attempts == 2
+
+
+def test_first_and_last_seen_use_created_at_and_include_provenance(tmp_path: Path) -> None:
+    runs_dir = tmp_path / "runs"
+    events = [
+        _tc_event("tool.requested", "c1", "grep", sequence=1),
+        _tc_event(
+            "tool.completed",
+            "c1",
+            "grep",
+            sequence=2,
+            status="invalid_arguments",
+            success=False,
+            error_type="validation",
+        ),
+    ]
+    # Lexicographic run order is the opposite of chronological order.
+    _make_run(
+        runs_dir,
+        "aaa-new",
+        "model-a",
+        {"i": events},
+        commit="newcommit",
+        dirty=False,
+        created_at="2026-08-02T00:00:00+00:00",
+    )
+    _make_run(
+        runs_dir,
+        "zzz-old",
+        "model-a",
+        {"i": events},
+        commit="oldcommit",
+        dirty=True,
+        created_at="2026-08-01T00:00:00+00:00",
+    )
+
+    data = analyze(runs_dir)
+    row = data.failure_rows[0]
+    assert row.first_seen.run_id == "zzz-old"
+    assert row.first_seen.harness_commit == "oldcommi"
+    assert row.first_seen.harness_dirty is True
+    assert row.last_seen.run_id == "aaa-new"
+    assert row.last_seen.harness_commit == "newcommi"
+    assert row.last_seen.harness_dirty is False
+    rendered = render_report(data)
+    assert "zzz-old (oldcommi, dirty)" in rendered
+    assert "aaa-new (newcommi, clean)" in rendered
+
+
+def test_parameter_friction_is_grouped_by_model(tmp_path: Path) -> None:
+    runs_dir = tmp_path / "runs"
+    events = [
+        _tc_event(
+            "tool.requested",
+            "c1",
+            "grep",
+            sequence=1,
+            validation_issues=[{"path": "-n", "type": "extra_forbidden"}],
+        ),
+        _tc_event(
+            "tool.completed",
+            "c1",
+            "grep",
+            sequence=2,
+            status="invalid_arguments",
+            success=False,
+            error_type="validation",
+        ),
+    ]
+    _make_run(runs_dir, "run-a", "model-a", {"i": events})
+    _make_run(runs_dir, "run-b", "model-b", {"i": events})
+
+    rows = analyze(runs_dir).friction_rows
+    assert [row.model for row in rows] == ["model-a", "model-b"]
 
 
 def test_report_param_friction_legacy_excluded(tmp_path: Path) -> None:
@@ -309,6 +487,108 @@ def test_report_exact_repeat_not_detected_without_hash(tmp_path: Path) -> None:
     assert len(repeats) == 0
 
 
+def test_exact_repeat_does_not_merge_different_tools(tmp_path: Path) -> None:
+    runs_dir = tmp_path / "runs"
+    events = [
+        _tc_event(
+            "tool.requested", "c1", "read_file", sequence=1,
+            raw_arguments_sha256="samehash", raw_arguments_chars=2,
+        ),
+        _tc_event("tool.completed", "c1", "read_file", sequence=2),
+        _tc_event(
+            "tool.requested", "c2", "git_diff", sequence=3,
+            raw_arguments_sha256="samehash", raw_arguments_chars=2,
+        ),
+        _tc_event("tool.completed", "c2", "git_diff", sequence=4),
+    ]
+    _make_run(runs_dir, "r1", "model-a", {"i": events})
+    repeats = [
+        row for row in analyze(runs_dir).anomaly_rows
+        if row.kind == "exact_repeat"
+    ]
+    assert repeats == []
+
+
+def test_exact_repeat_counts_accumulate_across_attempts(tmp_path: Path) -> None:
+    runs_dir = tmp_path / "runs"
+    events = [
+        _tc_event(
+            "tool.requested", "c1", "read_file", sequence=1,
+            raw_arguments_sha256="samehash", raw_arguments_chars=20,
+        ),
+        _tc_event("tool.completed", "c1", "read_file", sequence=2),
+        _tc_event(
+            "tool.requested", "c2", "read_file", sequence=3,
+            raw_arguments_sha256="samehash", raw_arguments_chars=20,
+        ),
+        _tc_event("tool.completed", "c2", "read_file", sequence=4),
+    ]
+    _make_run(runs_dir, "r1", "model-a", {"i1": events, "i2": events})
+    repeat = next(
+        row for row in analyze(runs_dir).anomaly_rows
+        if row.kind == "exact_repeat"
+    )
+    assert repeat.count == 2
+    assert repeat.affected_attempts == 2
+
+
+def test_permission_deny_requires_a_later_api_call(tmp_path: Path) -> None:
+    runs_dir = tmp_path / "runs"
+    denied = {
+        "event": "permission.decided",
+        "timestamp": "2026-08-01T00:00:00+00:00",
+        "run_id": "r",
+        "agent_id": "parent",
+        "sequence": 2,
+        "source": "parent",
+        "tool_name": "bash",
+        "call_id": "c1",
+        "decision": "deny",
+    }
+    same_api_events = [
+        _tc_event(
+            "tool.requested", "c1", "bash", sequence=1,
+            api_call=1, step_index=0,
+        ),
+        denied,
+        _tc_event(
+            "tool.completed", "c1", "bash", sequence=3,
+            status="permission_denied", success=False,
+            error_type="permission_denied", api_call=1, step_index=0,
+        ),
+        _tc_event(
+            "tool.requested", "c2", "bash", sequence=4,
+            api_call=1, step_index=1,
+        ),
+        _tc_event(
+            "tool.completed", "c2", "bash", sequence=5,
+            api_call=1, step_index=1,
+        ),
+    ]
+    _make_run(runs_dir, "same-api", "model-a", {"i": same_api_events})
+    assert not any(
+        row.kind == "permission_deny_loop"
+        for row in analyze(runs_dir).anomaly_rows
+    )
+
+    later_api_events = list(same_api_events)
+    later_api_events[3] = _tc_event(
+        "tool.requested", "c2", "bash", sequence=4,
+        api_call=2, step_index=0,
+    )
+    later_api_events[4] = _tc_event(
+        "tool.completed", "c2", "bash", sequence=5,
+        api_call=2, step_index=0,
+    )
+    _make_run(runs_dir, "later-api", "model-b", {"i": later_api_events})
+    loops = [
+        row for row in analyze(runs_dir).anomaly_rows
+        if row.kind == "permission_deny_loop"
+    ]
+    assert len(loops) == 1
+    assert loops[0].model == "model-b"
+
+
 def test_report_budget_bound_candidate(tmp_path: Path) -> None:
     runs_dir = tmp_path / "runs"
     events = [
@@ -345,7 +625,8 @@ def test_report_observation_gaps_legacy(tmp_path: Path) -> None:
     }]
     _make_run(runs_dir, "r1", "model-a", {"i1": legacy_events})
     data = analyze(runs_dir)
-    assert any("legacy" in g.lower() for g in data.observation_gaps)
+    assert any("validation_issues" in g for g in data.observation_gaps)
+    assert any("raw_arguments fingerprint" in g for g in data.observation_gaps)
 
 
 def test_report_renders_markdown(tmp_path: Path) -> None:
@@ -384,34 +665,82 @@ def test_acceptance_grep_friction_visible_in_failure_matrix(tmp_path: Path) -> N
     in specific models after a harness change.
     """
     runs_dir = tmp_path / "runs"
-    # Simulate two models: one with grep validation failures, one without
-    grep_fail_events = [
-        _tc_event("tool.requested", "c1", "grep", sequence=1),
-        _tc_event("tool.completed", "c1", "grep", sequence=2, status="invalid_arguments", success=False, error_type="validation"),
+    legacy_failure = [
+        {
+            "event": "tool.requested",
+            "timestamp": "2026-07-28T00:00:00+00:00",
+            "run_id": "pre",
+            "agent_id": "parent",
+            "sequence": 1,
+            "source": "parent",
+            "tool_name": "grep",
+            "call_id": "c1",
+            "arguments": {},
+            "argument_error": None,
+        },
+        _tc_event(
+            "tool.completed", "c1", "grep", sequence=2,
+            status="invalid_arguments", success=False, error_type="validation",
+        ),
     ]
-    ok_events = [
-        _tc_event("tool.requested", "c1", "grep", sequence=1),
-        _tc_event("tool.completed", "c1", "grep", sequence=2, status="success"),
+    post_fix_failure = [
+        _tc_event(
+            "tool.requested", "c1", "grep", sequence=1,
+            validation_issues=[{"path": "-n", "type": "extra_forbidden"}],
+        ),
+        _tc_event(
+            "tool.completed", "c1", "grep", sequence=2,
+            status="invalid_arguments", success=False, error_type="validation",
+        ),
     ]
-    _make_run(runs_dir, "run-longcat", "meituan/longcat-2.0", {"inst-1": grep_fail_events})
-    _make_run(runs_dir, "run-glm", "z-ai/glm-5.2", {"inst-2": ok_events})
+    for model, slug in (
+        ("meituan/longcat-2.0", "longcat"),
+        ("tencent/hy3:exacto", "hy3"),
+    ):
+        _make_run(
+            runs_dir,
+            f"pre-{slug}",
+            model,
+            {"inst": legacy_failure},
+            commit="before3d",
+            dirty=False,
+            created_at="2026-07-28T00:00:00+00:00",
+        )
+        _make_run(
+            runs_dir,
+            f"post-{slug}",
+            model,
+            {"inst": post_fix_failure},
+            commit="3d67a669",
+            dirty=True,
+            created_at="2026-07-30T00:00:00+00:00",
+        )
+
     data = analyze(runs_dir)
-
-    # The failure matrix must show grep/validation failures for longcat but not glm
-    longcat_grep = [
-        r for r in data.failure_rows
-        if r.model == "meituan/longcat-2.0" and r.tool_name == "grep" and r.error_type == "validation"
+    grep_rows = [
+        row for row in data.failure_rows
+        if row.tool_name == "grep" and row.error_type == "validation"
     ]
-    glm_grep = [
-        r for r in data.failure_rows
-        if r.model == "z-ai/glm-5.2" and r.tool_name == "grep" and r.error_type == "validation"
-    ]
-    assert len(longcat_grep) == 1
-    assert longcat_grep[0].failed_calls == 1
-    assert len(glm_grep) == 0
+    assert {row.model for row in grep_rows} == {
+        "meituan/longcat-2.0",
+        "tencent/hy3:exacto",
+    }
+    assert all(row.failed_calls == 2 for row in grep_rows)
+    assert all(row.first_seen.run_id.startswith("pre-") for row in grep_rows)
+    assert all(row.last_seen.run_id.startswith("post-") for row in grep_rows)
+    assert all(row.last_seen.harness_commit == "3d67a669" for row in grep_rows)
+    assert all(row.last_seen.harness_dirty is True for row in grep_rows)
 
-    # The rendered report must contain the model name and the failure
+    friction_rows = [
+        row for row in data.friction_rows
+        if row.tool_name == "grep" and row.field_path == "-n"
+    ]
+    assert {row.model for row in friction_rows} == {
+        "meituan/longcat-2.0",
+        "tencent/hy3:exacto",
+    }
+
     md = render_report(data)
-    assert "meituan/longcat-2.0" in md
-    assert "grep" in md
-    assert "validation" in md
+    assert "post-longcat (3d67a669, dirty)" in md
+    assert "post-hy3 (3d67a669, dirty)" in md
+    assert "`-n`" in md

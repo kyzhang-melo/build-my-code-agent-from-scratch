@@ -36,6 +36,15 @@ from evals.analyze.scanner import (
 
 
 @dataclass
+class SeenRef:
+    run_id: str
+    model: str
+    harness_commit: str
+    harness_dirty: bool
+    created_at: str
+
+
+@dataclass
 class ToolFailureRow:
     model: str
     tool_name: str
@@ -44,32 +53,33 @@ class ToolFailureRow:
     failed_calls: int
     failure_rate: float
     affected_attempts: int
+    incomplete_calls: int
+    first_seen: SeenRef
+    last_seen: SeenRef
 
 
 @dataclass
 class ParamFrictionRow:
+    model: str
     tool_name: str
     field_path: str
     issue_type: str
     occurrences: int
     affected_attempts: int
-    affected_models: int
-    models: list[str]
-    first_seen: str
-    last_seen: str
+    first_seen: SeenRef
+    last_seen: SeenRef
 
 
 @dataclass
 class AnomalyRow:
+    model: str
     kind: str  # "consecutive_same_error" | "exact_repeat" | "permission_deny_loop"
     tool_name: str
     error_type: str
     count: int
     affected_attempts: int
-    affected_models: int
-    models: list[str]
-    first_seen: str
-    last_seen: str
+    first_seen: SeenRef
+    last_seen: SeenRef
     detail: str
 
 
@@ -93,6 +103,15 @@ class ReportData:
     total_tool_calls: int = 0
     legacy_attempts: int = 0
     dirty_attempts: int = 0
+    validation_unavailable_attempts: int = 0
+    fingerprint_unavailable_attempts: int = 0
+    api_step_unavailable_attempts: int = 0
+    truncation_unavailable_attempts: int = 0
+    incomplete_tool_calls: int = 0
+    malformed_trace_lines: int = 0
+    no_trace_attempts: int = 0
+    unavailable_result_attempts: int = 0
+    unavailable_manifest_attempts: int = 0
     models: list[str] = field(default_factory=list)
     runs_per_model: dict[str, int] = field(default_factory=dict)
     attempts_per_model: dict[str, int] = field(default_factory=dict)
@@ -120,6 +139,33 @@ class ReportData:
 # ---------------------------------------------------------------------------
 
 
+def _seen_ref(attempt: AttemptRef) -> SeenRef:
+    return SeenRef(
+        run_id=attempt.run_id,
+        model=attempt.model,
+        harness_commit=attempt.harness_commit,
+        harness_dirty=attempt.harness_dirty,
+        created_at=attempt.created_at,
+    )
+
+
+def _first_last(attempts: list[AttemptRef]) -> tuple[SeenRef, SeenRef]:
+    ordered = sorted(attempts, key=lambda a: (
+        a.created_at or "9999",
+        a.run_id,
+        a.instance_id,
+        a.attempt,
+    ))
+    return _seen_ref(ordered[0]), _seen_ref(ordered[-1])
+
+
+def _has_tool_events(attempt: AttemptRef) -> bool:
+    return any(
+        event.get("event") in {"tool.requested", "tool.completed"}
+        for event in attempt.trace_events
+    )
+
+
 def analyze(runs_dir: Path = DEFAULT_RUNS_DIR) -> ReportData:
     """Load all artifacts and compute the full report data."""
     attempts = load_runs(runs_dir)
@@ -139,8 +185,29 @@ def analyze(runs_dir: Path = DEFAULT_RUNS_DIR) -> ReportData:
 def _analyze_coverage(attempts: list[AttemptRef], report: ReportData) -> None:
     report.total_runs = len({a.run_id for a in attempts})
     report.total_attempts = len(attempts)
-    report.legacy_attempts = sum(1 for a in attempts if not a.has_phase0_fields)
+    relevant = [a for a in attempts if _has_tool_events(a)]
+    report.legacy_attempts = sum(1 for a in relevant if not a.has_phase0_fields)
     report.dirty_attempts = sum(1 for a in attempts if a.harness_dirty)
+    report.validation_unavailable_attempts = sum(
+        1 for a in relevant if not a.has_validation_issues
+    )
+    report.fingerprint_unavailable_attempts = sum(
+        1 for a in relevant if not a.has_raw_fingerprint
+    )
+    report.api_step_unavailable_attempts = sum(
+        1 for a in relevant if not a.has_api_step
+    )
+    report.truncation_unavailable_attempts = sum(
+        1 for a in relevant if not a.has_split_truncation
+    )
+    report.malformed_trace_lines = sum(a.trace_parse_errors for a in attempts)
+    report.no_trace_attempts = sum(1 for a in attempts if a.trace_missing)
+    report.unavailable_result_attempts = sum(
+        1 for a in attempts if a.result_unavailable
+    )
+    report.unavailable_manifest_attempts = sum(
+        1 for a in attempts if a.manifest_unavailable
+    )
 
     models = sorted({a.model for a in attempts if a.model})
     report.models = models
@@ -162,29 +229,46 @@ def _analyze_coverage(attempts: list[AttemptRef], report: ReportData) -> None:
         total_calls += sum(
             1 for e in a.trace_events if e.get("event") == "tool.requested"
         )
+        report.incomplete_tool_calls += sum(
+            1 for call in extract_tool_calls(a) if call.completed is None
+        )
     report.total_tool_calls = total_calls
 
 
 def _analyze_tool_failures(attempts: list[AttemptRef], report: ReportData) -> None:
     """Build model x tool x error_type failure matrix."""
-    # (model, tool, error_type) -> [total, failed, attempt_ids]
-    matrix: dict[tuple[str, str, str], list] = {}
+    # Denominators are all requests for one model+tool. Error-specific rows use
+    # that shared denominator, otherwise every error bucket reports 100%.
+    totals: collections.Counter[tuple[str, str]] = collections.Counter()
+    incomplete: collections.Counter[tuple[str, str]] = collections.Counter()
+    failures: dict[tuple[str, str, str], dict[str, Any]] = {}
     for a in attempts:
         calls = extract_tool_calls(a)
         for c in calls:
-            et = c.error_type or "none"
+            tool_key = (a.model, c.tool_name)
+            totals[tool_key] += 1
+            if c.completed is None or c.success is None:
+                incomplete[tool_key] += 1
+                continue
+            if c.success:
+                continue
+            et = c.error_type or "unknown"
             key = (a.model, c.tool_name, et)
-            if key not in matrix:
-                matrix[key] = [0, 0, set()]
-            matrix[key][0] += 1
-            if not c.success:
-                matrix[key][1] += 1
-            matrix[key][2].add(a.instance_id)
+            if key not in failures:
+                failures[key] = {
+                    "count": 0,
+                    "attempt_ids": set(),
+                    "attempts": [],
+                }
+            failures[key]["count"] += 1
+            failures[key]["attempt_ids"].add(a.identity)
+            failures[key]["attempts"].append(a)
 
     rows: list[ToolFailureRow] = []
-    for (model, tool, et), (total, failed, attempt_ids) in matrix.items():
-        if et == "none" and failed == 0:
-            continue  # skip pure-success rows with no error type
+    for (model, tool, et), data in failures.items():
+        total = totals[(model, tool)]
+        failed = data["count"]
+        first, last = _first_last(data["attempts"])
         rows.append(ToolFailureRow(
             model=model,
             tool_name=tool,
@@ -192,7 +276,10 @@ def _analyze_tool_failures(attempts: list[AttemptRef], report: ReportData) -> No
             total_calls=total,
             failed_calls=failed,
             failure_rate=failed / total if total else 0.0,
-            affected_attempts=len(attempt_ids),
+            affected_attempts=len(data["attempt_ids"]),
+            incomplete_calls=incomplete[(model, tool)],
+            first_seen=first,
+            last_seen=last,
         ))
     # Sort by failed_calls desc, then model, then tool
     rows.sort(key=lambda r: (-r.failed_calls, r.model, r.tool_name, r.error_type))
@@ -201,11 +288,11 @@ def _analyze_tool_failures(attempts: list[AttemptRef], report: ReportData) -> No
 
 def _analyze_param_friction(attempts: list[AttemptRef], report: ReportData) -> None:
     """Top-N parameter validation issues from validation_issues field."""
-    # (tool, field_path, issue_type) -> {occurrences, attempt_ids, models, runs}
-    agg: dict[tuple[str, str, str], dict] = {}
+    # Model is part of the key: model-specific rows are the primary report.
+    agg: dict[tuple[str, str, str, str], dict] = {}
     legacy_count = 0
     for a in attempts:
-        if not a.has_phase0_fields:
+        if _has_tool_events(a) and not a.has_validation_issues:
             legacy_count += 1
             continue
         calls = extract_tool_calls(a)
@@ -213,164 +300,179 @@ def _analyze_param_friction(attempts: list[AttemptRef], report: ReportData) -> N
             for issue in c.validation_issues:
                 path = issue.get("path", "")
                 itype = issue.get("type", "")
-                key = (c.tool_name, path, itype)
+                key = (a.model, c.tool_name, path, itype)
                 if key not in agg:
                     agg[key] = {
                         "occurrences": 0,
                         "attempt_ids": set(),
-                        "models": set(),
-                        "runs": [],
+                        "attempts": [],
                     }
                 agg[key]["occurrences"] += 1
-                agg[key]["attempt_ids"].add(a.instance_id)
-                agg[key]["models"].add(a.model)
-                agg[key]["runs"].append(a.run_id)
+                agg[key]["attempt_ids"].add(a.identity)
+                agg[key]["attempts"].append(a)
 
     report.friction_legacy_note = legacy_count > 0
 
     rows: list[ParamFrictionRow] = []
-    for (tool, path, itype), data in agg.items():
-        runs = data["runs"]
+    for (model, tool, path, itype), data in agg.items():
+        first, last = _first_last(data["attempts"])
         rows.append(ParamFrictionRow(
+            model=model,
             tool_name=tool,
             field_path=path,
             issue_type=itype,
             occurrences=data["occurrences"],
             affected_attempts=len(data["attempt_ids"]),
-            affected_models=len(data["models"]),
-            models=sorted(data["models"]),
-            first_seen=runs[0] if runs else "",
-            last_seen=runs[-1] if runs else "",
+            first_seen=first,
+            last_seen=last,
         ))
-    # Sort by affected_attempts desc, then affected_models, then occurrences
-    rows.sort(key=lambda r: (-r.affected_attempts, -r.affected_models, -r.occurrences))
+    rows.sort(key=lambda r: (
+        r.model,
+        -r.affected_attempts,
+        -r.occurrences,
+        r.tool_name,
+        r.field_path,
+    ))
     report.friction_rows = rows
 
 
 def _analyze_anomaly_sequences(attempts: list[AttemptRef], report: ReportData) -> None:
     """Detect consecutive same-type errors, exact repeats, and permission deny loops."""
-    # Consecutive same-type errors: same tool + same error_type back-to-back
-    consec_agg: dict[tuple[str, str], dict] = {}
-    # Exact repeat: same raw_arguments_sha256 submitted more than once in one attempt
-    repeat_agg: dict[tuple[str, str], dict] = {}
-    # Permission deny loop: permission denied then same tool called again
-    deny_agg: dict[tuple[str], dict] = {}
+    consec_agg: dict[tuple[str, str, str], dict] = {}
+    repeat_agg: dict[tuple[str, str, str, int, str], dict] = {}
+    deny_agg: dict[tuple[str, str], dict] = {}
 
     legacy_count = 0
     for a in attempts:
-        if not a.has_phase0_fields:
+        if _has_tool_events(a) and not a.has_raw_fingerprint:
             legacy_count += 1
         calls = extract_tool_calls(a)
 
         # Consecutive same-type errors
         prev_key: tuple[str, str] | None = None
         for c in calls:
-            if not c.success and c.error_type:
+            if c.success is False and c.error_type:
                 key = (c.tool_name, c.error_type)
                 if key == prev_key:
-                    if key not in consec_agg:
-                        consec_agg[key] = {
-                            "count": 0, "attempt_ids": set(), "models": set(), "runs": [],
+                    agg_key = (a.model, *key)
+                    if agg_key not in consec_agg:
+                        consec_agg[agg_key] = {
+                            "count": 0, "attempt_ids": set(), "attempts": [],
                         }
-                    consec_agg[key]["count"] += 1
-                    consec_agg[key]["attempt_ids"].add(a.instance_id)
-                    consec_agg[key]["models"].add(a.model)
-                    consec_agg[key]["runs"].append(a.run_id)
+                    consec_agg[agg_key]["count"] += 1
+                    consec_agg[agg_key]["attempt_ids"].add(a.identity)
+                    consec_agg[agg_key]["attempts"].append(a)
                 prev_key = key
             else:
                 prev_key = None
 
-        # Exact repeat (only if raw_arguments_sha256 is available)
-        if a.has_phase0_fields:
-            seen_hashes: dict[str, int] = {}
+        # Exact repeat: same source+tool+length+hash within one attempt.
+        if a.has_raw_fingerprint:
+            seen_hashes: collections.Counter[tuple[str, str, int, str]] = (
+                collections.Counter()
+            )
             for c in calls:
                 h = c.raw_arguments_sha256
                 if not h:
                     continue
-                seen_hashes[h] = seen_hashes.get(h, 0) + 1
-            for h, count in seen_hashes.items():
+                seen_hashes[(
+                    c.source,
+                    c.tool_name,
+                    c.raw_arguments_chars,
+                    h,
+                )] += 1
+            for (source, tool, chars, h), count in seen_hashes.items():
                 if count > 1:
-                    # Find the tool name for this hash
-                    tool = next((c.tool_name for c in calls if c.raw_arguments_sha256 == h), "")
-                    key = (tool, h)
+                    key = (a.model, source, tool, chars, h)
                     if key not in repeat_agg:
                         repeat_agg[key] = {
-                            "count": count - 1,  # repeats beyond the first
-                            "attempt_ids": set(), "models": set(), "runs": [],
+                            "count": 0, "attempt_ids": set(), "attempts": [],
                         }
-                    repeat_agg[key]["attempt_ids"].add(a.instance_id)
-                    repeat_agg[key]["models"].add(a.model)
-                    repeat_agg[key]["runs"].append(a.run_id)
+                    repeat_agg[key]["count"] += count - 1
+                    repeat_agg[key]["attempt_ids"].add(a.identity)
+                    repeat_agg[key]["attempts"].append(a)
 
-        # Permission deny loop
-        events = a.trace_events
-        for i, e in enumerate(events):
+        # Permission deny follow-up: only count the same tool in a strictly
+        # later API call. Calls submitted in the same model response are not a
+        # reaction to the denial and therefore are not counted.
+        if not a.has_api_step:
+            continue
+        requests_by_call = {
+            c.call_id: c for c in calls
+        }
+        for e in a.trace_events:
             if (
                 e.get("event") == "permission.decided"
                 and e.get("decision") == "deny"
             ):
-                tool = e.get("tool_name", "")
-                # Check if the same tool is requested again within the next 5 events
-                for j in range(i + 1, min(i + 6, len(events))):
-                    ne = events[j]
-                    if (
-                        ne.get("event") == "tool.requested"
-                        and ne.get("tool_name") == tool
-                    ):
-                        key = (tool,)
-                        if key not in deny_agg:
-                            deny_agg[key] = {
-                                "count": 0, "attempt_ids": set(), "models": set(), "runs": [],
-                            }
-                        deny_agg[key]["count"] += 1
-                        deny_agg[key]["attempt_ids"].add(a.instance_id)
-                        deny_agg[key]["models"].add(a.model)
-                        deny_agg[key]["runs"].append(a.run_id)
-                        break
+                denied = requests_by_call.get(e.get("call_id", ""))
+                if denied is None or not isinstance(denied.api_call, int):
+                    continue
+                followed_up = any(
+                    later.tool_name == denied.tool_name
+                    and later.source == denied.source
+                    and isinstance(later.api_call, int)
+                    and later.api_call > denied.api_call
+                    for later in calls
+                )
+                if not followed_up:
+                    continue
+                key = (a.model, denied.tool_name)
+                if key not in deny_agg:
+                    deny_agg[key] = {
+                        "count": 0, "attempt_ids": set(), "attempts": [],
+                    }
+                deny_agg[key]["count"] += 1
+                deny_agg[key]["attempt_ids"].add(a.identity)
+                deny_agg[key]["attempts"].append(a)
 
     report.anomaly_legacy_note = legacy_count > 0
 
     rows: list[AnomalyRow] = []
-    for (tool, et), data in consec_agg.items():
+    for (model, tool, et), data in consec_agg.items():
+        first, last = _first_last(data["attempts"])
         rows.append(AnomalyRow(
+            model=model,
             kind="consecutive_same_error",
             tool_name=tool,
             error_type=et,
             count=data["count"],
             affected_attempts=len(data["attempt_ids"]),
-            affected_models=len(data["models"]),
-            models=sorted(data["models"]),
-            first_seen=data["runs"][0] if data["runs"] else "",
-            last_seen=data["runs"][-1] if data["runs"] else "",
+            first_seen=first,
+            last_seen=last,
             detail=f"Same tool+error back-to-back: {tool} / {et}",
         ))
-    for (tool, h), data in repeat_agg.items():
+    for (model, source, tool, chars, h), data in repeat_agg.items():
+        first, last = _first_last(data["attempts"])
         rows.append(AnomalyRow(
+            model=model,
             kind="exact_repeat",
             tool_name=tool,
             error_type="",
             count=data["count"],
             affected_attempts=len(data["attempt_ids"]),
-            affected_models=len(data["models"]),
-            models=sorted(data["models"]),
-            first_seen=data["runs"][0] if data["runs"] else "",
-            last_seen=data["runs"][-1] if data["runs"] else "",
-            detail=f"Identical raw arguments submitted {data['count'] + 1}x (sha256={h[:8]}...)",
+            first_seen=first,
+            last_seen=last,
+            detail=(
+                f"Repeated identical raw arguments {data['count']} time(s) "
+                f"beyond the first (source={source}, chars={chars}, "
+                f"sha256={h[:8]}...)"
+            ),
         ))
-    for (tool,), data in deny_agg.items():
+    for (model, tool), data in deny_agg.items():
+        first, last = _first_last(data["attempts"])
         rows.append(AnomalyRow(
+            model=model,
             kind="permission_deny_loop",
             tool_name=tool,
             error_type="permission_denied",
             count=data["count"],
             affected_attempts=len(data["attempt_ids"]),
-            affected_models=len(data["models"]),
-            models=sorted(data["models"]),
-            first_seen=data["runs"][0] if data["runs"] else "",
-            last_seen=data["runs"][-1] if data["runs"] else "",
-            detail=f"Permission denied then same tool re-requested: {tool}",
+            first_seen=first,
+            last_seen=last,
+            detail=f"Permission denied, then {tool} requested in a later API call",
         ))
-    rows.sort(key=lambda r: (-r.count, -r.affected_attempts))
+    rows.sort(key=lambda r: (r.model, -r.count, -r.affected_attempts, r.kind))
     report.anomaly_rows = rows
 
 
@@ -378,6 +480,8 @@ def _analyze_defect_candidates(attempts: list[AttemptRef], report: ReportData) -
     """Budget-bound and no-patch candidates."""
     rows: list[DefectCandidateRow] = []
     for a in attempts:
+        if a.result_unavailable:
+            continue
         # Budget-bound: max_api_calls AND trace shows tool activity near the end
         if a.agent_status == "max_api_calls":
             calls = extract_tool_calls(a)
@@ -415,19 +519,43 @@ def _analyze_defect_candidates(attempts: list[AttemptRef], report: ReportData) -
 def _collect_observation_gaps(attempts: list[AttemptRef], report: ReportData) -> None:
     """List questions the current trace cannot answer."""
     gaps: list[str] = []
-    legacy = sum(1 for a in attempts if not a.has_phase0_fields)
-    if legacy > 0:
+    unavailable = (
+        ("validation_issues", report.validation_unavailable_attempts),
+        ("raw_arguments fingerprint", report.fingerprint_unavailable_attempts),
+        ("api_call/step_index", report.api_step_unavailable_attempts),
+        ("split truncation", report.truncation_unavailable_attempts),
+    )
+    for field_name, count in unavailable:
+        if count:
+            gaps.append(
+                f"{count} attempts with tool events lack complete {field_name} "
+                "instrumentation; that metric is unavailable for those attempts."
+            )
+    if report.no_trace_attempts > 0:
         gaps.append(
-            f"{legacy} attempts have legacy traces (pre-Phase-0). "
-            "validation_issues, raw_arguments fingerprint, api_call/step_index, "
-            "and split truncation fields are unavailable for these."
-        )
-    # Check if any attempt has no trace at all
-    no_trace = sum(1 for a in attempts if not a.trace_events)
-    if no_trace > 0:
-        gaps.append(
-            f"{no_trace} attempts have no trace events. "
+            f"{report.no_trace_attempts} attempts have no trace file. "
             "Tool-level analysis is unavailable for these."
+        )
+    if report.malformed_trace_lines > 0:
+        gaps.append(
+            f"{report.malformed_trace_lines} malformed trace lines were excluded. "
+            "Metrics for their attempts may be incomplete."
+        )
+    if report.incomplete_tool_calls > 0:
+        gaps.append(
+            f"{report.incomplete_tool_calls} tool requests have no matching "
+            "tool.completed event. Their outcomes are classified as incomplete, "
+            "not successful."
+        )
+    if report.unavailable_result_attempts > 0:
+        gaps.append(
+            f"{report.unavailable_result_attempts} attempt results are missing or "
+            "malformed; result-level candidate analysis is unavailable for them."
+        )
+    if report.unavailable_manifest_attempts > 0:
+        gaps.append(
+            f"{report.unavailable_manifest_attempts} attempts have a missing or "
+            "malformed run manifest; model and harness provenance may be unavailable."
         )
     # Context compaction events
     has_compact = any(
@@ -477,6 +605,12 @@ def render_report(data: ReportData) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _render_seen(ref: SeenRef) -> str:
+    dirty = "dirty" if ref.harness_dirty else "clean"
+    commit = ref.harness_commit or "unknown"
+    return f"{ref.run_id} ({commit}, {dirty})"
+
+
 def _render_coverage(data: ReportData, lines: list[str]) -> None:
     lines.append("## 1. Data Coverage")
     lines.append("")
@@ -487,6 +621,22 @@ def _render_coverage(data: ReportData, lines: list[str]) -> None:
     lines.append(f"| Tool calls | {data.total_tool_calls} |")
     lines.append(f"| Legacy attempts (pre-Phase-0) | {data.legacy_attempts} |")
     lines.append(f"| Dirty harness attempts | {data.dirty_attempts} |")
+    lines.append(f"| Incomplete tool calls | {data.incomplete_tool_calls} |")
+    lines.append(f"| Malformed trace lines | {data.malformed_trace_lines} |")
+    lines.append(f"| Attempts without trace file | {data.no_trace_attempts} |")
+    lines.append("")
+    lines.append("| Phase-0 capability | Attempts unavailable |")
+    lines.append("|---|---|")
+    lines.append(
+        f"| validation_issues | {data.validation_unavailable_attempts} |"
+    )
+    lines.append(
+        f"| raw arguments fingerprint | {data.fingerprint_unavailable_attempts} |"
+    )
+    lines.append(f"| api_call / step_index | {data.api_step_unavailable_attempts} |")
+    lines.append(
+        f"| split truncation | {data.truncation_unavailable_attempts} |"
+    )
     lines.append("")
     if data.models:
         lines.append("| Model | Runs | Attempts |")
@@ -500,8 +650,8 @@ def _render_coverage(data: ReportData, lines: list[str]) -> None:
     if data.dirty_attempts > 0:
         lines.append(
             f"> **Warning**: {data.dirty_attempts} attempts ran with a dirty harness "
-            "worktree. Run-level grouping by commit is unreliable; use observable "
-            "harness features (e.g. error message text) for regression detection."
+            "worktree. Their commit labels do not uniquely identify the executed "
+            "harness and cannot independently prove a regression."
         )
         lines.append("")
 
@@ -513,13 +663,18 @@ def _render_tool_failures(data: ReportData, lines: list[str]) -> None:
         lines.append("_No tool failures detected._")
         lines.append("")
         return
-    lines.append("| Model | Tool | Error type | Total | Failed | Rate | Attempts |")
-    lines.append("|---|---|---|---|---|---|---|")
+    lines.append(
+        "| Model | Tool | Error type | Requests | Failed | Rate | Incomplete | "
+        "Attempts | First seen | Last seen |"
+    )
+    lines.append("|---|---|---|---|---|---|---|---|---|---|")
     for r in data.failure_rows:
         lines.append(
             f"| {r.model} | {r.tool_name} | {r.error_type} | "
             f"{r.total_calls} | {r.failed_calls} | "
-            f"{r.failure_rate:.1%} | {r.affected_attempts} |"
+            f"{r.failure_rate:.1%} | {r.incomplete_calls} | "
+            f"{r.affected_attempts} | {_render_seen(r.first_seen)} | "
+            f"{_render_seen(r.last_seen)} |"
         )
     lines.append("")
 
@@ -529,9 +684,9 @@ def _render_param_friction(data: ReportData, lines: list[str]) -> None:
     lines.append("")
     if data.friction_legacy_note:
         lines.append(
-            "> **Legacy note**: some attempts predate Phase-0 instrumentation "
-            "and are excluded from this section. Historical `-n`/`-C` grep issues "
-            "are only visible in `agent.log` text, not in structured trace."
+            "> **Availability note**: attempts without structured "
+            "`validation_issues` are excluded from this section; no values are "
+            "inferred from `agent.log`."
         )
         lines.append("")
     if not data.friction_rows:
@@ -539,15 +694,15 @@ def _render_param_friction(data: ReportData, lines: list[str]) -> None:
         lines.append("")
         return
     lines.append(
-        "| Tool | Field | Type | Occurrences | Attempts | Models | "
+        "| Model | Tool | Field | Type | Occurrences | Attempts | "
         "First seen | Last seen |"
     )
     lines.append("|---|---|---|---|---|---|---|---|")
     for r in data.friction_rows:
         lines.append(
-            f"| {r.tool_name} | `{r.field_path}` | {r.issue_type} | "
-            f"{r.occurrences} | {r.affected_attempts} | {r.affected_models} | "
-            f"{r.first_seen} | {r.last_seen} |"
+            f"| {r.model} | {r.tool_name} | `{r.field_path}` | {r.issue_type} | "
+            f"{r.occurrences} | {r.affected_attempts} | "
+            f"{_render_seen(r.first_seen)} | {_render_seen(r.last_seen)} |"
         )
     lines.append("")
 
@@ -557,10 +712,10 @@ def _render_anomaly_sequences(data: ReportData, lines: list[str]) -> None:
     lines.append("")
     if data.anomaly_legacy_note:
         lines.append(
-            "> **Legacy note**: exact-repeat detection requires "
-            "`raw_arguments_sha256` (Phase-0). Legacy attempts are excluded "
-            "from exact-repeat counts. Consecutive-error detection works on "
-            "all traces."
+            "> **Availability note**: exact-repeat detection requires "
+            "`raw_arguments_sha256`. Attempts without it are excluded from "
+            "exact-repeat counts. Consecutive-error detection still uses all "
+            "completed tool traces."
         )
         lines.append("")
     if not data.anomaly_rows:
@@ -568,15 +723,16 @@ def _render_anomaly_sequences(data: ReportData, lines: list[str]) -> None:
         lines.append("")
         return
     lines.append(
-        "| Kind | Tool | Error type | Count | Attempts | Models | "
+        "| Model | Kind | Tool | Error type | Count | Attempts | "
         "First seen | Last seen | Detail |"
     )
     lines.append("|---|---|---|---|---|---|---|---|---|")
     for r in data.anomaly_rows:
         lines.append(
-            f"| {r.kind} | {r.tool_name} | {r.error_type} | "
-            f"{r.count} | {r.affected_attempts} | {r.affected_models} | "
-            f"{r.first_seen} | {r.last_seen} | {r.detail} |"
+            f"| {r.model} | {r.kind} | {r.tool_name} | {r.error_type} | "
+            f"{r.count} | {r.affected_attempts} | "
+            f"{_render_seen(r.first_seen)} | {_render_seen(r.last_seen)} | "
+            f"{r.detail} |"
         )
     lines.append("")
 

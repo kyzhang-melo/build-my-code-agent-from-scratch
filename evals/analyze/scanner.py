@@ -45,9 +45,18 @@ class AttemptRef:
     model: str
     harness_commit: str
     harness_dirty: bool
-    # Whether the trace has Phase-0 fields (validation_issues, raw_arguments_*,
-    # api_call, step_index, split truncation).
-    has_phase0_fields: bool = False
+    created_at: str = ""
+    trace_parse_errors: int = 0
+    trace_missing: bool = False
+    result_unavailable: bool = False
+    manifest_unavailable: bool = False
+    # Phase-0 was delivered as four independent commits. Track each
+    # capability separately so a partially instrumented trace is never treated
+    # as if all fields were available.
+    has_validation_issues: bool = False
+    has_raw_fingerprint: bool = False
+    has_api_step: bool = False
+    has_split_truncation: bool = False
 
     @property
     def agent_status(self) -> str:
@@ -60,6 +69,20 @@ class AttemptRef:
     @property
     def api_calls(self) -> int:
         return self.result.get("api_calls", 0)
+
+    @property
+    def identity(self) -> tuple[str, str, int]:
+        return (self.run_id, self.instance_id, self.attempt)
+
+    @property
+    def has_phase0_fields(self) -> bool:
+        """Backward-compatible shorthand for a complete Phase-0 trace."""
+        return all((
+            self.has_validation_issues,
+            self.has_raw_fingerprint,
+            self.has_api_step,
+            self.has_split_truncation,
+        ))
 
 
 @dataclass
@@ -74,7 +97,7 @@ class ToolCallPair:
     # Convenience fields extracted at load time.
     status: str = ""
     error_type: str | None = None
-    success: bool = True
+    success: bool | None = None
     api_call: int | None = None
     step_index: int | None = None
     validation_issues: list[dict] = field(default_factory=list)
@@ -104,7 +127,13 @@ def load_runs(runs_dir: Path = DEFAULT_RUNS_DIR) -> list[AttemptRef]:
         if not run_dir.is_dir():
             continue
         manifest_path = run_dir / "manifest.json"
-        manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
+        manifest: dict[str, Any] = {}
+        manifest_unavailable = not manifest_path.is_file()
+        if manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                manifest_unavailable = True
         instances_dir = run_dir / "instances"
         if not instances_dir.is_dir():
             continue
@@ -114,9 +143,24 @@ def load_runs(runs_dir: Path = DEFAULT_RUNS_DIR) -> list[AttemptRef]:
             for attempt_dir in sorted(inst_dir.iterdir()):
                 if not attempt_dir.is_dir() or not attempt_dir.name.startswith("attempt-"):
                     continue
-                ref = _load_attempt(run_dir, inst_dir.name, attempt_dir, manifest)
+                suffix = attempt_dir.name.removeprefix("attempt-")
+                if not suffix.isdigit():
+                    continue
+                ref = _load_attempt(
+                    run_dir,
+                    inst_dir.name,
+                    attempt_dir,
+                    manifest,
+                    manifest_unavailable=manifest_unavailable,
+                )
                 if ref is not None:
                     attempts.append(ref)
+    attempts.sort(key=lambda a: (
+        a.created_at or "9999",
+        a.run_id,
+        a.instance_id,
+        a.attempt,
+    ))
     return attempts
 
 
@@ -125,24 +169,34 @@ def _load_attempt(
     instance_id: str,
     attempt_dir: Path,
     manifest: dict[str, Any],
+    *,
+    manifest_unavailable: bool,
 ) -> AttemptRef | None:
     result_path = attempt_dir / "result.json"
     trace_path = attempt_dir / "trace.jsonl"
-    if not result_path.is_file():
-        return None
-    result = json.loads(result_path.read_text())
+    result: dict[str, Any] = {}
+    result_unavailable = not result_path.is_file()
+    if result_path.is_file():
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            result_unavailable = True
     trace_events: list[dict[str, Any]] = []
+    trace_parse_errors = 0
     if trace_path.is_file():
-        for line in trace_path.read_text().splitlines():
+        for line in trace_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line:
                 continue
             try:
                 trace_events.append(json.loads(line))
             except json.JSONDecodeError:
-                continue
+                trace_parse_errors += 1
 
-    has_phase0 = _detect_phase0_fields(trace_events)
+    capabilities = _detect_phase0_fields(trace_events)
+    created_at = str(manifest.get("created_at", ""))
+    if not created_at and trace_events:
+        created_at = str(trace_events[0].get("timestamp", ""))
     return AttemptRef(
         run_id=run_dir.name,
         instance_id=instance_id,
@@ -154,20 +208,38 @@ def _load_attempt(
         model=manifest.get("model", ""),
         harness_commit=str(manifest.get("harness_commit", ""))[:8],
         harness_dirty=bool(manifest.get("harness_worktree_dirty", False)),
-        has_phase0_fields=has_phase0,
+        created_at=created_at,
+        trace_parse_errors=trace_parse_errors,
+        trace_missing=not trace_path.is_file(),
+        result_unavailable=result_unavailable,
+        manifest_unavailable=manifest_unavailable,
+        **capabilities,
     )
 
 
-def _detect_phase0_fields(trace_events: list[dict[str, Any]]) -> bool:
-    """Return True if any trace event has Phase-0 instrumentation fields."""
-    for event in trace_events:
-        if event.get("event") == "tool.requested":
-            if "validation_issues" in event or "raw_arguments_sha256" in event:
-                return True
-        if event.get("event") == "tool.completed":
-            if "runtime_output_truncated" in event or "tool_internal_truncated" in event:
-                return True
-    return False
+def _detect_phase0_fields(trace_events: list[dict[str, Any]]) -> dict[str, bool]:
+    """Return per-capability availability for one attempt."""
+    requested = [e for e in trace_events if e.get("event") == "tool.requested"]
+    completed = [e for e in trace_events if e.get("event") == "tool.completed"]
+    tool_events = [*requested, *completed]
+    return {
+        "has_validation_issues": bool(requested) and all(
+            "validation_issues" in e for e in requested
+        ),
+        "has_raw_fingerprint": bool(requested) and all(
+            "raw_arguments_sha256" in e and "raw_arguments_chars" in e
+            for e in requested
+        ),
+        "has_api_step": bool(tool_events) and all(
+            "api_call" in e and "step_index" in e for e in tool_events
+        ),
+        "has_split_truncation": bool(completed) and all(
+            "runtime_output_truncated" in e
+            and "tool_internal_truncated" in e
+            and "truncated_chars" in e
+            for e in completed
+        ),
+    }
 
 
 def extract_tool_calls(attempt: AttemptRef) -> list[ToolCallPair]:
