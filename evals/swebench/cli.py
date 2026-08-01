@@ -208,7 +208,7 @@ def _generate_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-api-calls", type=int, default=30)
     parser.add_argument(
         "--reasoning-effort",
-        choices=("minimal", "low", "medium", "high", "xhigh"),
+        choices=("none", "minimal", "low", "medium", "high", "xhigh"),
     )
     parser.add_argument("--max-output-tokens", type=_positive_int)
     parser.add_argument(

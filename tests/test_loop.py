@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import types
 
@@ -134,6 +135,66 @@ def test_run_one_turn_uses_session_generation_config(
     assert captured["max_output_tokens"] == 16000
 
 
+def test_run_one_turn_sends_explicit_none_reasoning_effort(
+    load_module, monkeypatch, tmp_path
+) -> None:
+    main_module = load_module("main", "main.py")
+    captured = {}
+    monkeypatch.setattr(
+        main_module,
+        "client",
+        _client_for_response(_no_tool_response("Done."), captured),
+    )
+    session = main_module.create_parent_session(
+        tmp_path,
+        approval_handler=None,
+        on_text=None,
+        reasoning_effort="none",
+    )
+    state = main_module.LoopState(
+        messages=[{"role": "user", "content": "task"}]
+    )
+
+    _run(main_module.run_one_turn(state, session))
+
+    assert captured["reasoning"] == {"effort": "none"}
+
+
+def test_run_one_turn_traces_response_parse_failure(
+    load_module, monkeypatch, capsys, tmp_path
+) -> None:
+    main_module = load_module("main", "main.py")
+    trace_module = sys.modules["trace"]
+    sink = trace_module.MemoryTraceSink()
+    session = main_module.create_parent_session(
+        tmp_path,
+        approval_handler=None,
+        trace_context=trace_module.TraceContext(sink=sink, run_id="test-run"),
+        on_text=None,
+    )
+
+    async def fail_create(**_kwargs):
+        raise json.JSONDecodeError("Expecting value", "not-json", 0)
+
+    monkeypatch.setattr(
+        main_module,
+        "client",
+        types.SimpleNamespace(responses=types.SimpleNamespace(create=fail_create)),
+    )
+    state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
+
+    with pytest.raises(json.JSONDecodeError):
+        _run(main_module.run_one_turn(state, session))
+
+    event = sink.by_type("llm.request_failed")[0]
+    assert event["api_call"] == 1
+    assert event["input_message_count"] == 1
+    assert event["json_error_line"] == 1
+    assert event["json_document_chars"] == len("not-json")
+    assert "not-json" not in json.dumps(event)
+    assert "LLM request failed" in capsys.readouterr().out
+
+
 def test_run_one_turn_default_omits_max_output_tokens(
     load_module, monkeypatch, tmp_path
 ) -> None:
@@ -177,6 +238,16 @@ def test_main_cli_parses_generation_config(load_module, monkeypatch) -> None:
 
     assert args["reasoning_effort"] == "high"
     assert args["max_output_tokens"] == 16000
+
+
+def test_main_cli_parses_none_reasoning_effort(load_module, monkeypatch) -> None:
+    main_module = load_module("main", "main.py")
+    monkeypatch.setattr(sys, "argv", ["main.py", "--reasoning-effort", "none"])
+
+    args = main_module.parse_args()
+
+    assert args["reasoning_effort"] == "none"
+
 
 @pytest.mark.parametrize(
     "argv",

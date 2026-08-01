@@ -63,6 +63,10 @@ configuration:
 The effective settings are recorded in the run manifest. Resuming the same run
 ID with different settings is rejected.
 
+Use `--reasoning-effort none` to explicitly send
+`reasoning: {"effort": "none"}`. Omitting the option leaves the API field
+unset and lets the provider choose its default.
+
 Omitting `--max-output-tokens` omits the API field and records `null` in the
 manifest. Passing `--max-output-tokens 8000` sends and records an explicit
 8,000-token limit. Provider-default mode keeps a 32,768-token context

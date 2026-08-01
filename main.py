@@ -6,6 +6,7 @@ Split version of the code-agent loop.
 
 import asyncio
 import copy
+import hashlib
 import json
 import os
 import re
@@ -129,7 +130,7 @@ DEFAULT_CONTEXT_WINDOW = 32000
 CONTEXT_WINDOW_OVERRIDE = int(os.getenv("CONTEXT_WINDOW_OVERRIDE", "0"))
 DEFAULT_MAX_OUTPUT_TOKENS: int | None = None
 AUTO_MAX_OUTPUT_TOKEN_RESERVATION = 32768
-REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
+REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
 RESERVED_OVERHEAD_TOKENS = 4000    # system prompt + tool schemas
 COMPACT_TRIGGER_RATIO = 0.85
 # On by default; AUTO_COMPACT=0 disables automatic compaction (manual /compact
@@ -264,6 +265,47 @@ def debug_empty_output_text_response(response) -> None:
             line += f" content_types={content_types!r}"
 
         print(line)
+
+
+def llm_request_failure_details(exc: BaseException) -> dict[str, str | int]:
+    """Return safe, actionable metadata for a failed Responses API request."""
+    details: dict[str, str | int] = {
+        "error_type": type(exc).__name__,
+        "error_message": str(exc),
+    }
+    if isinstance(exc, json.JSONDecodeError):
+        # Do not write a malformed provider body to logs or trace files. Its
+        # size and digest still let us correlate repeated bad responses with a
+        # provider while preserving the agent's potentially sensitive context.
+        document = exc.doc
+        details.update({
+            "json_error_line": exc.lineno,
+            "json_error_column": exc.colno,
+            "json_error_position": exc.pos,
+            "json_document_chars": len(document),
+            "json_document_sha256": hashlib.sha256(
+                document.encode("utf-8", "replace")
+            ).hexdigest(),
+        })
+
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status_code = getattr(response, "status_code", None)
+        if isinstance(status_code, int):
+            details["http_status_code"] = status_code
+        headers = getattr(response, "headers", None)
+        if headers is not None:
+            for header_name, field_name in (
+                ("x-request-id", "request_id"),
+                ("x-openrouter-request-id", "openrouter_request_id"),
+                ("cf-ray", "cloudflare_ray"),
+                ("content-type", "response_content_type"),
+                ("content-length", "response_content_length"),
+            ):
+                value = headers.get(header_name)
+                if value:
+                    details[field_name] = str(value)
+    return details
 
 
 def create_explore_session(
@@ -433,7 +475,20 @@ async def run_one_turn(state: LoopState, session: AgentSession) -> StepOutcome |
         request["max_output_tokens"] = session.max_output_tokens
     if session.reasoning_effort is not None:
         request["reasoning"] = {"effort": session.reasoning_effort}
-    response = await client.responses.create(**request)
+    try:
+        response = await client.responses.create(**request)
+    except Exception as exc:
+        details = llm_request_failure_details(exc)
+        details.update({
+            "api_call": state.api_call_count,
+            "input_message_count": len(input_messages),
+            "input_chars": len(json.dumps(input_messages, default=str)),
+            "model": MODEL_ID or "",
+            "provider": OPENROUTER_PROVIDER or "default",
+        })
+        print(f"[debug] LLM request failed: {json.dumps(details, sort_keys=True)}")
+        emit_trace(session.trace_context, "llm.request_failed", **details)
+        raise
     debug_empty_output_text_response(response)
 
     # Track input-token load for the auto-compaction trigger. Prefer the API's
@@ -1055,7 +1110,7 @@ def parse_args() -> dict:
     parser.add_argument("--name", dest="session_name", help="Optional name for a new session")
     parser.add_argument(
         "--reasoning-effort",
-        choices=("minimal", "low", "medium", "high", "xhigh"),
+        choices=("none", "minimal", "low", "medium", "high", "xhigh"),
         help="reasoning effort sent to the Responses API",
     )
     parser.add_argument(

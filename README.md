@@ -96,8 +96,10 @@ python main.py --reasoning-effort high --max-output-tokens 16000
 ```
 
 Omit `--reasoning-effort` to leave the reasoning effort unspecified. Supported
-explicit values are `minimal`, `low`, `medium`, `high`, and `xhigh`; the
-selected model and provider must support the chosen value.
+explicit values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`;
+the selected model and provider must support the chosen value. `none` sends
+`reasoning: {"effort": "none"}`, whereas omitting the option leaves the API
+field unset.
 
 Omit `--max-output-tokens` to leave the API field unset. Passing
 `--max-output-tokens 8000` sends an explicit limit of 8,000. When the field is
