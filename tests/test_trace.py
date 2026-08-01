@@ -393,3 +393,52 @@ def test_dispatcher_raw_fingerprint_handles_non_string_arguments(load_module, wo
     requested = sink.by_type("tool.requested")[0]
     assert requested["raw_arguments_chars"] == 0
     assert requested["raw_arguments_sha256"] == ""
+
+
+def test_dispatcher_traces_api_call_and_step_index(load_module, workspace) -> None:
+    tools = load_module("tools", "tools.py")
+    sink = runtime_trace.MemoryTraceSink()
+    context = runtime_trace.TraceContext(sink=sink)
+    registry = tools.build_tool_registry(workspace, tools.TodoManager())
+    registry["read_file"].execute = lambda _params: asyncio.sleep(0, result="ok")
+    registry["glob"].execute = lambda _params: asyncio.sleep(0, result="ok")
+
+    asyncio.run(tools.execute_tool_calls_async(
+        [_fc("read_file", "r1", '{"path":"a.txt"}'),
+         _fc("glob", "g1", '{"pattern":"*.py"}')],
+        registry,
+        tools.TodoManager(),
+        trace_context=context,
+        api_call=7,
+    ))
+
+    requested = sink.by_type("tool.requested")
+    completed = sink.by_type("tool.completed")
+    # Both tools share the same api_call; step_index is sequential.
+    assert requested[0]["api_call"] == 7
+    assert requested[0]["step_index"] == 0
+    assert requested[1]["api_call"] == 7
+    assert requested[1]["step_index"] == 1
+    assert completed[0]["api_call"] == 7
+    assert completed[0]["step_index"] == 0
+    assert completed[1]["api_call"] == 7
+    assert completed[1]["step_index"] == 1
+
+
+def test_dispatcher_traces_null_api_call_when_not_provided(load_module, workspace) -> None:
+    tools = load_module("tools", "tools.py")
+    sink = runtime_trace.MemoryTraceSink()
+    context = runtime_trace.TraceContext(sink=sink)
+    registry = tools.build_tool_registry(workspace, tools.TodoManager())
+    registry["read_file"].execute = lambda _params: asyncio.sleep(0, result="ok")
+
+    asyncio.run(tools.execute_tool_calls_async(
+        [_fc("read_file", "r1", '{"path":"a.txt"}')],
+        registry,
+        tools.TodoManager(),
+        trace_context=context,
+    ))
+
+    requested = sink.by_type("tool.requested")[0]
+    assert requested["api_call"] is None
+    assert requested["step_index"] == 0

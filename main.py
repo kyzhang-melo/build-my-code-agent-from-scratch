@@ -430,6 +430,7 @@ def build_subagent_prompt(prompt: str) -> str:
 async def execute_configured_tool_calls(
     tool_calls,
     session: AgentSession,
+    api_call: int | None = None,
 ) -> tuple[list[dict], bool]:
     return await execute_tool_calls_async(
         tool_calls,
@@ -438,6 +439,7 @@ async def execute_configured_tool_calls(
         permission_service=session.permission_service,
         permission_source=session.permission_source,
         trace_context=session.trace_context,
+        api_call=api_call,
     )
 
 
@@ -624,7 +626,7 @@ async def run_one_turn(state: LoopState, session: AgentSession) -> StepOutcome |
     if output_text and session.on_text is not None:
         session.on_text(output_text)
 
-    results, _ = await execute_configured_tool_calls(tool_calls, session)
+    results, _ = await execute_configured_tool_calls(tool_calls, session, api_call=state.api_call_count)
     if not results:
         return StepOutcome(stop_reason="completed", final_text="")
 

@@ -1942,6 +1942,8 @@ async def run_tool_call_async(
     permission_service: PermissionService | None = None,
     permission_source: str = "parent",
     trace_context: TraceContext | None = None,
+    api_call: int | None = None,
+    step_index: int | None = None,
 ) -> tuple[dict, bool]:
     started_at = time.monotonic()
     used_todo = item.name == "todo"
@@ -1965,6 +1967,8 @@ async def run_tool_call_async(
             arguments=_safe_trace_arguments(item.name, normalized_args),
             argument_error=argument_error,
             validation_issues=validation_issues or [],
+            api_call=api_call,
+            step_index=step_index,
             **_raw_arguments_fingerprint(item.arguments),
         )
 
@@ -2042,6 +2046,8 @@ async def run_tool_call_async(
                         error_type="cancelled",
                         output_chars=0,
                         output_truncated=False,
+                        api_call=api_call,
+                        step_index=step_index,
                     )
                     raise
                 except Exception as e:
@@ -2098,6 +2104,8 @@ async def run_tool_call_async(
         error_type=error_type,
         output_chars=len(output),
         output_truncated=output_truncated,
+        api_call=api_call,
+        step_index=step_index,
     )
 
     return {
@@ -2114,6 +2122,8 @@ def run_tool_call(
     permission_service: PermissionService | None = None,
     permission_source: str = "parent",
     trace_context: TraceContext | None = None,
+    api_call: int | None = None,
+    step_index: int | None = None,
 ) -> tuple[dict, bool]:
     return _run_async_from_sync(
         run_tool_call_async(
@@ -2123,6 +2133,8 @@ def run_tool_call(
             permission_service,
             permission_source,
             trace_context,
+            api_call,
+            step_index,
         )
     )
 
@@ -2161,9 +2173,11 @@ async def execute_tool_calls_async(
     permission_service: PermissionService | None = None,
     permission_source: str = "parent",
     trace_context: TraceContext | None = None,
+    api_call: int | None = None,
 ) -> tuple[list[dict], bool]:
     results = []
     used_todo = False
+    step = 0
 
     for is_safe, batch in _partition_tool_calls(tool_calls, registry):
         if is_safe and len(batch) > 1:
@@ -2178,10 +2192,13 @@ async def execute_tool_calls_async(
                             permission_service,
                             permission_source,
                             trace_context,
+                            api_call,
+                            step + i,
                         )
-                        for item in chunk
+                        for i, item in enumerate(chunk)
                     )
                 )
+                step += len(chunk)
                 for tool_result, called_todo in chunk_results:
                     if called_todo:
                         used_todo = True
@@ -2195,7 +2212,10 @@ async def execute_tool_calls_async(
                     permission_service,
                     permission_source,
                     trace_context,
+                    api_call,
+                    step,
                 )
+                step += 1
                 if called_todo:
                     used_todo = True
                 results.append(tool_result)
@@ -2209,6 +2229,7 @@ def execute_tool_calls(
     permission_service: PermissionService | None = None,
     permission_source: str = "parent",
     trace_context: TraceContext | None = None,
+    api_call: int | None = None,
 ) -> tuple[list[dict], bool]:
     return _run_async_from_sync(
         execute_tool_calls_async(
@@ -2218,5 +2239,6 @@ def execute_tool_calls(
             permission_service,
             permission_source,
             trace_context,
+            api_call,
         )
     )
