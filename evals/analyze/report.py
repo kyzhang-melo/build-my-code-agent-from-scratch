@@ -168,7 +168,11 @@ def _has_tool_events(attempt: AttemptRef) -> bool:
 
 def analyze(runs_dir: Path = DEFAULT_RUNS_DIR) -> ReportData:
     """Load all artifacts and compute the full report data."""
-    attempts = load_runs(runs_dir)
+    return analyze_attempts(load_runs(runs_dir))
+
+
+def analyze_attempts(attempts: list[AttemptRef]) -> ReportData:
+    """Compute a report from an explicit, already-scanned attempt set."""
     report = ReportData()
     if not attempts:
         return report

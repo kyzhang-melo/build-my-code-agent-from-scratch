@@ -288,6 +288,11 @@ def test_manifest_rejects_material_config_changes(tmp_path) -> None:
     changed = {**base, "max_output_tokens": 8000}
     with pytest.raises(ValueError, match="max_output_tokens"):
         core.ensure_manifest(path, changed)
+    # Legacy manifests without provider remain resumable when no pin is used.
+    core.ensure_manifest(path, {**base, "provider": ""})
+    changed = {**base, "provider": "provider/fp8"}
+    with pytest.raises(ValueError, match="provider"):
+        core.ensure_manifest(path, changed)
 
 
 def test_report_merges_agent_and_official_statuses(tmp_path) -> None:
@@ -490,6 +495,55 @@ def test_run_command_executes_all_pipeline_phases(monkeypatch, tmp_path) -> None
 
     assert asyncio.run(cli.cmd_run(args)) == 0
     assert calls == ["generate", "evaluate", "report"]
+
+
+def test_report_command_automatically_generates_harness_diagnostics(
+    monkeypatch, tmp_path, capsys,
+) -> None:
+    from evals.analyze import automation
+    from evals.swebench import cli
+
+    target = tmp_path / "run"
+    target.mkdir()
+    monkeypatch.setattr(cli, "generate_report", lambda _path: {
+        "resolved": 1,
+        "total_instances": 1,
+        "evaluated": 1,
+    })
+    called = []
+
+    def generate_diagnostics(path):
+        called.append(path)
+        return {"diff": path / "harness-diagnostic-diff.md"}
+
+    monkeypatch.setattr(automation, "generate_run_diagnostics", generate_diagnostics)
+    args = argparse.Namespace(run_id="run", runs_dir=str(tmp_path))
+
+    assert cli.cmd_report(args) == 0
+    assert called == [target]
+    assert "Harness diagnostic diff" in capsys.readouterr().out
+
+
+def test_diagnostic_failure_does_not_change_swebench_report_status(
+    monkeypatch, tmp_path, capsys,
+) -> None:
+    from evals.analyze import automation
+    from evals.swebench import cli
+
+    monkeypatch.setattr(cli, "generate_report", lambda _path: {
+        "resolved": 0,
+        "total_instances": 1,
+        "evaluated": 1,
+    })
+    monkeypatch.setattr(
+        automation,
+        "generate_run_diagnostics",
+        lambda _path: (_ for _ in ()).throw(ValueError("bad trace")),
+    )
+    args = argparse.Namespace(run_id="run", runs_dir=str(tmp_path))
+
+    assert cli.cmd_report(args) == 0
+    assert "diagnostics warning" in capsys.readouterr().err
 
 
 def test_run_command_stops_when_generation_has_no_predictions(

@@ -79,6 +79,7 @@ async def cmd_generate(args: argparse.Namespace) -> int:
         max_output_tokens=args.max_output_tokens,
         timeout=args.instance_timeout,
         swebench_repo=swebench_repo,
+        provider=os.getenv("OPENROUTER_PROVIDER"),
     )
     ensure_manifest(target / "manifest.json", manifest)
     tasks = load_tasks_via_bridge(
@@ -159,11 +160,24 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
 
 def cmd_report(args: argparse.Namespace) -> int:
     report = generate_report(run_dir(args))
+    diagnostic_path = None
+    try:
+        from evals.analyze.automation import generate_run_diagnostics
+
+        artifacts = generate_run_diagnostics(run_dir(args))
+        diagnostic_path = artifacts["diff"]
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not erase eval success
+        print(
+            f"[diagnostics warning] {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
     print(
         f"Resolved {report['resolved']}/{report['total_instances']}. "
         f"Evaluated {report['evaluated']}/{report['total_instances']}. "
         f"Report: {run_dir(args) / 'summary.md'}"
     )
+    if diagnostic_path is not None:
+        print(f"Harness diagnostic diff: {diagnostic_path}")
     return 0
 
 

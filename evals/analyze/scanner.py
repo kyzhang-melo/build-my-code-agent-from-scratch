@@ -124,43 +124,51 @@ def load_runs(runs_dir: Path = DEFAULT_RUNS_DIR) -> list[AttemptRef]:
         return attempts
 
     for run_dir in sorted(runs_dir.iterdir()):
-        if not run_dir.is_dir():
-            continue
-        manifest_path = run_dir / "manifest.json"
-        manifest: dict[str, Any] = {}
-        manifest_unavailable = not manifest_path.is_file()
-        if manifest_path.is_file():
-            try:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                manifest_unavailable = True
-        instances_dir = run_dir / "instances"
-        if not instances_dir.is_dir():
-            continue
-        for inst_dir in sorted(instances_dir.iterdir()):
-            if not inst_dir.is_dir():
-                continue
-            for attempt_dir in sorted(inst_dir.iterdir()):
-                if not attempt_dir.is_dir() or not attempt_dir.name.startswith("attempt-"):
-                    continue
-                suffix = attempt_dir.name.removeprefix("attempt-")
-                if not suffix.isdigit():
-                    continue
-                ref = _load_attempt(
-                    run_dir,
-                    inst_dir.name,
-                    attempt_dir,
-                    manifest,
-                    manifest_unavailable=manifest_unavailable,
-                )
-                if ref is not None:
-                    attempts.append(ref)
+        if run_dir.is_dir():
+            attempts.extend(load_run(run_dir))
     attempts.sort(key=lambda a: (
         a.created_at or "9999",
         a.run_id,
         a.instance_id,
         a.attempt,
     ))
+    return attempts
+
+
+def load_run(run_dir: Path) -> list[AttemptRef]:
+    """Load attempts from exactly one run directory."""
+    manifest_path = run_dir / "manifest.json"
+    manifest: dict[str, Any] = {}
+    manifest_unavailable = not manifest_path.is_file()
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            manifest_unavailable = True
+    instances_dir = run_dir / "instances"
+    if not instances_dir.is_dir():
+        return []
+
+    attempts: list[AttemptRef] = []
+    for inst_dir in sorted(instances_dir.iterdir()):
+        if not inst_dir.is_dir():
+            continue
+        for attempt_dir in sorted(inst_dir.iterdir()):
+            if not attempt_dir.is_dir() or not attempt_dir.name.startswith("attempt-"):
+                continue
+            suffix = attempt_dir.name.removeprefix("attempt-")
+            if not suffix.isdigit():
+                continue
+            ref = _load_attempt(
+                run_dir,
+                inst_dir.name,
+                attempt_dir,
+                manifest,
+                manifest_unavailable=manifest_unavailable,
+            )
+            if ref is not None:
+                attempts.append(ref)
+    attempts.sort(key=lambda a: (a.instance_id, a.attempt))
     return attempts
 
 

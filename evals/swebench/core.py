@@ -342,6 +342,7 @@ def create_manifest(
     max_output_tokens: int | None,
     timeout: int | None,
     swebench_repo: Path,
+    provider: str | None = None,
 ) -> dict:
     harness_commit, harness_dirty = repository_state(PROJECT_ROOT)
     swebench_commit, swebench_dirty = repository_state(swebench_repo)
@@ -354,6 +355,7 @@ def create_manifest(
         "selection": selection,
         "instance_ids": instance_ids,
         "model": model,
+        "provider": provider or "",
         "max_api_calls": max_api_calls,
         "reasoning_effort": reasoning_effort,
         "max_output_tokens": max_output_tokens,
@@ -377,6 +379,7 @@ def ensure_manifest(path: Path, proposed: dict) -> dict:
         "split",
         "instance_ids",
         "model",
+        "provider",
         "max_api_calls",
         "reasoning_effort",
         "max_output_tokens",
@@ -384,7 +387,15 @@ def ensure_manifest(path: Path, proposed: dict) -> dict:
         "harness_commit",
         "swebench_commit",
     )
-    conflicts = [key for key in keys if existing.get(key) != proposed.get(key)]
+    conflicts = [
+        key
+        for key in keys
+        if (
+            (existing.get(key) or "") != (proposed.get(key) or "")
+            if key == "provider"
+            else existing.get(key) != proposed.get(key)
+        )
+    ]
     if conflicts:
         raise ValueError(f"run manifest conflicts in: {', '.join(conflicts)}")
     return existing

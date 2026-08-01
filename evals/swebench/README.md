@@ -115,6 +115,28 @@ Merge the agent and official results:
   --run-id verified-smoke-001
 ```
 
+The `run` pipeline and the standalone `report` command automatically generate
+Phase-3 harness diagnostics after the ordinary SWE-bench summary succeeds:
+
+```text
+harness-diagnostic.json       # structured facts for this run
+harness-diagnostic.md         # human-readable per-run diagnostic report
+harness-diagnostic-diff.json  # structured comparison with the previous run
+harness-diagnostic-diff.md    # new, disappeared, and changed diagnostic signals
+```
+
+A previous run is used only when dataset, split, exact instance set, model,
+provider, API-call budget, reasoning effort, and output-token configuration all
+match; timeout and auto-compaction settings must match as well. Harness commits
+are deliberately allowed to differ so a harness change can be measured. If no
+like-for-like baseline exists, the diff says so instead of comparing unrelated
+runs. Dirty runs remain visible with a warning and should not independently be
+used to announce a regression.
+
+Automatic diagnostic failures are printed as warnings and do not replace or
+invalidate the official SWE-bench result. The original trace and report remain
+available for repair and rerunning the `report` phase.
+
 The smoke subset is curated only to validate the pipeline. Its result is not a
 representative benchmark score.
 
