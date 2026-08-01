@@ -37,6 +37,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="model ID; pass exactly twice for the Phase 2 acceptance run",
     )
+    parser.add_argument(
+        "--provider",
+        help=(
+            "OpenRouter provider slug pinned for both variants; overrides "
+            "OPENROUTER_PROVIDER and the value loaded from .env"
+        ),
+    )
     parser.add_argument("--k", type=positive_int, default=5, help="repeats per pair (default: 5)")
     parser.add_argument("--max-api-calls", type=positive_int, default=8)
     parser.add_argument(
@@ -68,9 +75,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("Phase 2 requires exactly two distinct --model values")
     if args.k < 5:
         parser.error("Phase 2 requires --k >= 5")
-    if not os.getenv("OPENROUTER_PROVIDER"):
+    provider = args.provider or os.getenv("OPENROUTER_PROVIDER")
+    if not provider:
         parser.error(
-            "Phase 2 requires OPENROUTER_PROVIDER so both variants use one fixed provider"
+            "Phase 2 requires --provider or OPENROUTER_PROVIDER so both variants "
+            "use one fixed provider"
         )
 
     run_root = args.output_dir or (
@@ -78,6 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     results = asyncio.run(run_experiment(
         models=models,
+        provider=provider,
         k=args.k,
         run_root=run_root,
         reasoning_effort=args.reasoning_effort,
@@ -91,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
         results,
         metrics,
         criteria,
+        provider=provider,
         k=args.k,
         reasoning_effort=args.reasoning_effort,
         max_output_tokens=args.max_output_tokens,

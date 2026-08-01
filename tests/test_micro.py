@@ -44,6 +44,7 @@ from evals.micro.paired import (
     _candidate_grep_schema,
     aggregate,
     apply_harness_variant,
+    configure_main_provider,
     evaluate_acceptance,
     normalize_grep_n_alias,
 )
@@ -457,6 +458,23 @@ def test_candidate_variant_accepts_n_at_real_dispatcher(tmp_path: Path) -> None:
 
     assert "TODO" in response["output"]
     assert candidate.registry["grep"] is not baseline.registry["grep"]
+
+
+def test_explicit_provider_replaces_dotenv_loaded_provider() -> None:
+    fake_main = types.SimpleNamespace(
+        OPENROUTER_PROVIDER="dotenv-provider",
+        PROVIDER_EXTRA_BODY={"provider": {"only": ["dotenv-provider"]}},
+    )
+
+    configure_main_provider(fake_main, "cli-provider/fp8")
+
+    assert fake_main.OPENROUTER_PROVIDER == "cli-provider/fp8"
+    assert fake_main.PROVIDER_EXTRA_BODY == {
+        "provider": {
+            "only": ["cli-provider/fp8"],
+            "allow_fallbacks": False,
+        }
+    }
 
 
 def _trial(

@@ -142,16 +142,19 @@ versus an eval-only candidate that accepts `-n` as an alias for
 The acceptance run deliberately requires two distinct models and `k >= 5`:
 
 ```bash
-export OPENROUTER_PROVIDER=<one-fixed-provider>
-
 ./.venv/bin/python evals/micro/run_paired.py --list
 
 ./.venv/bin/python evals/micro/run_paired.py \
+  --provider <one-fixed-provider> \
   --model <first-model-id> \
   --model <second-model-id> \
   --k 5 \
   --reasoning-effort low
 ```
+
+`--provider` takes precedence over `OPENROUTER_PROVIDER` and over the value in
+`.env`. This is the recommended form for reproducible experiments because
+`main.py` otherwise loads `.env` with override semantics.
 
 Baseline/candidate order alternates between trials. Reports are written under
 `evals/.runs/micro-paired/` and contain model-scoped success rates, median API

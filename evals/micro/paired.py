@@ -181,6 +181,22 @@ def apply_harness_variant(session, variant: str):
     )
 
 
+def configure_main_provider(main_module, provider: str) -> None:
+    """Apply the experiment provider after ``main`` has loaded ``.env``.
+
+    ``main`` deliberately loads dotenv with ``override=True``.  The paired
+    runner therefore applies its explicit provider after the lazy import so a
+    CLI value cannot be silently replaced by the repository's ``.env``.
+    """
+    main_module.OPENROUTER_PROVIDER = provider
+    main_module.PROVIDER_EXTRA_BODY = {
+        "provider": {
+            "only": [provider],
+            "allow_fallbacks": False,
+        }
+    }
+
+
 def _count_alias_validation_failures(events: list[dict]) -> int:
     return sum(
         1
@@ -232,6 +248,7 @@ async def run_trial(
     # Lazy import keeps deterministic pytest independent of live-model env vars.
     import main
 
+    configure_main_provider(main, provider)
     config = load_scenario(scenario_dir)
     trial_root = (
         run_root / model.replace("/", "__").replace(":", "_")
@@ -386,13 +403,13 @@ def evaluate_acceptance(
 async def run_experiment(
     *,
     models: list[str],
+    provider: str,
     k: int,
     run_root: Path,
     reasoning_effort: str | None = None,
     max_output_tokens: int | None = None,
     max_api_calls: int = 8,
 ) -> list[PairedTrialResult]:
-    provider = os.getenv("OPENROUTER_PROVIDER", "")
     scenarios = discover_scenarios()
     results: list[PairedTrialResult] = []
     for model in models:
@@ -427,6 +444,7 @@ def write_report(
     metrics: list[VariantMetrics],
     criteria: list[CriterionResult],
     *,
+    provider: str,
     k: int,
     reasoning_effort: str | None,
     max_output_tokens: int | None,
@@ -450,7 +468,7 @@ def write_report(
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "hypothesis": GREP_ALIAS_HYPOTHESIS.__dict__,
-        "provider": os.getenv("OPENROUTER_PROVIDER", ""),
+        "provider": provider,
         "base_url": os.getenv("OPENROUTER_BASE_URL", ""),
         "harness_commit": commit,
         "harness_worktree_dirty": dirty,
