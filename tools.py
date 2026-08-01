@@ -1,6 +1,7 @@
 import asyncio
 import codecs
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -1896,6 +1897,63 @@ def _tool_reported_error(tool_name: str, output: str) -> bool:
     return False
 
 
+def _extract_validation_issues(exc: Exception) -> list[dict]:
+    """Extract non-sensitive validation issues from a Pydantic ValidationError.
+
+    Only ``loc`` (as ``path``) and ``type`` are kept; ``input``, ``msg``, and
+    ``ctx`` are dropped because they may contain user content or sensitive
+    values.
+    """
+    errors_fn = getattr(exc, "errors", None)
+    if not callable(errors_fn):
+        return []
+    try:
+        raw_errors = errors_fn()
+    except Exception:
+        return []
+    issues: list[dict] = []
+    for err in raw_errors:
+        loc = err.get("loc", ())
+        loc_path = ".".join(str(part) for part in loc) if loc else ""
+        issues.append({"path": loc_path, "type": err.get("type", "")})
+    return issues
+
+
+def _raw_arguments_fingerprint(raw_arguments) -> dict:
+    """Return a non-sensitive fingerprint of the raw tool-call arguments.
+
+    Stores only the character count and a truncated SHA-256 hash so the
+    offline analyzer can detect exact-repeat calls without exposing the
+    original content.
+    """
+    if not isinstance(raw_arguments, str):
+        return {"raw_arguments_chars": 0, "raw_arguments_sha256": ""}
+    chars = len(raw_arguments)
+    if chars == 0:
+        return {"raw_arguments_chars": 0, "raw_arguments_sha256": ""}
+    digest = hashlib.sha256(raw_arguments.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return {"raw_arguments_chars": chars, "raw_arguments_sha256": digest}
+
+
+def _detect_internal_truncation(tool_name: str, output: str) -> bool:
+    """Detect whether a self-bounding tool truncated its own output.
+
+    ``bash`` renders a ``[truncated] true/false`` metadata line in its
+    header block; ``read_file``'s footer notes "Stopped at the" or
+    "truncated" when line/byte/per-line limits are hit.  Other tools do
+    not self-bound, so they always return ``False``.
+    """
+    if tool_name == "bash":
+        header = output.split("\n\n", 1)[0] if "\n\n" in output else output
+        return "[truncated] true" in header
+    if tool_name == "read_file":
+        for line in reversed(output.splitlines()):
+            if line.startswith("[Read ") and line.endswith("]"):
+                return "Stopped at the" in line or "truncated" in line
+        return False
+    return False
+
+
 async def run_tool_call_async(
     item,
     registry: dict[str, ToolRuntimeSpec],
@@ -1903,6 +1961,8 @@ async def run_tool_call_async(
     permission_service: PermissionService | None = None,
     permission_source: str = "parent",
     trace_context: TraceContext | None = None,
+    api_call: int | None = None,
+    step_index: int | None = None,
 ) -> tuple[dict, bool]:
     started_at = time.monotonic()
     used_todo = item.name == "todo"
@@ -1913,7 +1973,10 @@ async def run_tool_call_async(
     normalized_args = args
     todo_before = None
 
-    def emit_requested(argument_error: str | None = None) -> None:
+    def emit_requested(
+        argument_error: str | None = None,
+        validation_issues: list[dict] | None = None,
+    ) -> None:
         emit_trace(
             trace_context,
             "tool.requested",
@@ -1922,6 +1985,10 @@ async def run_tool_call_async(
             tool_name=item.name,
             arguments=_safe_trace_arguments(item.name, normalized_args),
             argument_error=argument_error,
+            validation_issues=validation_issues or [],
+            api_call=api_call,
+            step_index=step_index,
+            **_raw_arguments_fingerprint(item.arguments),
         )
 
     print(f"\033[33m{_tool_call_preview(item.name, args)}\033[0m")
@@ -1942,7 +2009,7 @@ async def run_tool_call_async(
         try:
             params = spec.params_model.model_validate(clean_args)
         except Exception as e:
-            emit_requested()
+            emit_requested(validation_issues=_extract_validation_issues(e))
             status = "invalid_arguments"
             error_type = "validation"
             output = f"Error: invalid arguments for tool '{item.name}': {e}"
@@ -1998,6 +2065,11 @@ async def run_tool_call_async(
                         error_type="cancelled",
                         output_chars=0,
                         output_truncated=False,
+                        runtime_output_truncated=False,
+                        tool_internal_truncated=False,
+                        truncated_chars=0,
+                        api_call=api_call,
+                        step_index=step_index,
                     )
                     raise
                 except Exception as e:
@@ -2032,9 +2104,12 @@ async def run_tool_call_async(
     # structured metadata -- leave these verbatim; everything else gets
     # middle-truncated if oversized.
     original_output_length = len(output)
+    tool_internal_truncated = _detect_internal_truncation(item.name, output)
     if item.name not in ("todo", "read_file", "bash"):
         output = truncate_middle(output)
-    output_truncated = len(output) < original_output_length
+    runtime_output_truncated = len(output) < original_output_length
+    truncated_chars = original_output_length - len(output) if runtime_output_truncated else 0
+    output_truncated = runtime_output_truncated
 
     if item.name == "todo":
         print(output)
@@ -2054,6 +2129,11 @@ async def run_tool_call_async(
         error_type=error_type,
         output_chars=len(output),
         output_truncated=output_truncated,
+        runtime_output_truncated=runtime_output_truncated,
+        tool_internal_truncated=tool_internal_truncated,
+        truncated_chars=truncated_chars,
+        api_call=api_call,
+        step_index=step_index,
     )
 
     return {
@@ -2070,6 +2150,8 @@ def run_tool_call(
     permission_service: PermissionService | None = None,
     permission_source: str = "parent",
     trace_context: TraceContext | None = None,
+    api_call: int | None = None,
+    step_index: int | None = None,
 ) -> tuple[dict, bool]:
     return _run_async_from_sync(
         run_tool_call_async(
@@ -2079,6 +2161,8 @@ def run_tool_call(
             permission_service,
             permission_source,
             trace_context,
+            api_call,
+            step_index,
         )
     )
 
@@ -2117,9 +2201,11 @@ async def execute_tool_calls_async(
     permission_service: PermissionService | None = None,
     permission_source: str = "parent",
     trace_context: TraceContext | None = None,
+    api_call: int | None = None,
 ) -> tuple[list[dict], bool]:
     results = []
     used_todo = False
+    step = 0
 
     for is_safe, batch in _partition_tool_calls(tool_calls, registry):
         if is_safe and len(batch) > 1:
@@ -2134,10 +2220,13 @@ async def execute_tool_calls_async(
                             permission_service,
                             permission_source,
                             trace_context,
+                            api_call,
+                            step + i,
                         )
-                        for item in chunk
+                        for i, item in enumerate(chunk)
                     )
                 )
+                step += len(chunk)
                 for tool_result, called_todo in chunk_results:
                     if called_todo:
                         used_todo = True
@@ -2151,7 +2240,10 @@ async def execute_tool_calls_async(
                     permission_service,
                     permission_source,
                     trace_context,
+                    api_call,
+                    step,
                 )
+                step += 1
                 if called_todo:
                     used_todo = True
                 results.append(tool_result)
@@ -2165,6 +2257,7 @@ def execute_tool_calls(
     permission_service: PermissionService | None = None,
     permission_source: str = "parent",
     trace_context: TraceContext | None = None,
+    api_call: int | None = None,
 ) -> tuple[list[dict], bool]:
     return _run_async_from_sync(
         execute_tool_calls_async(
@@ -2174,5 +2267,6 @@ def execute_tool_calls(
             permission_service,
             permission_source,
             trace_context,
+            api_call,
         )
     )

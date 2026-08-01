@@ -1,0 +1,9 @@
+{
+  "name": "find a definition with numbered grep output",
+  "prompt": "Use the grep tool to find TARGET_RENDERER in the workspace. For this experiment, request content output and pass the familiar ripgrep-style JSON flag `-n: true` instead of `line_number`. Then report the exact string assigned to TARGET_RENDERER.",
+  "timeout": 180,
+  "expect": {
+    "successful_grep": true,
+    "final_contains": ["cerulean-renderer"]
+  }
+}

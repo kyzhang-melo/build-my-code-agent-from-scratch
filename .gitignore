@@ -44,3 +44,6 @@ dist/
 evals/.runs/
 evals/.runs_hybrid/
 evals/.cache/
+
+# Local cross-session notes; intentionally not versioned
+evals/.handover/
