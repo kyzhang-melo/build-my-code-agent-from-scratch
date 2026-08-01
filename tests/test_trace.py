@@ -322,3 +322,74 @@ def test_dispatcher_traces_empty_validation_issues_on_json_parse_error(load_modu
     # JSON parse errors have no Pydantic validation issues.
     assert requested["validation_issues"] == []
     assert requested["argument_error"] is not None
+
+
+def test_dispatcher_traces_raw_arguments_fingerprint(load_module, workspace) -> None:
+    tools = load_module("tools", "tools.py")
+    sink = runtime_trace.MemoryTraceSink()
+    context = runtime_trace.TraceContext(sink=sink)
+    registry = tools.build_tool_registry(workspace, tools.TodoManager())
+    registry["read_file"].execute = lambda _params: asyncio.sleep(0, result="ok")
+
+    raw = '{"path":"x.txt"}'
+    asyncio.run(tools.execute_tool_calls_async(
+        [_fc("read_file", "r1", raw)],
+        registry,
+        tools.TodoManager(),
+        trace_context=context,
+    ))
+
+    requested = sink.by_type("tool.requested")[0]
+    assert requested["raw_arguments_chars"] == len(raw)
+    assert len(requested["raw_arguments_sha256"]) == 16
+    # The fingerprint must not contain the raw JSON string itself.
+    assert requested["raw_arguments_sha256"] != raw
+
+
+def test_dispatcher_raw_fingerprint_detects_exact_repeats(load_module, workspace) -> None:
+    import hashlib
+    tools = load_module("tools", "tools.py")
+    sink = runtime_trace.MemoryTraceSink()
+    context = runtime_trace.TraceContext(sink=sink)
+    registry = tools.build_tool_registry(workspace, tools.TodoManager())
+    registry["read_file"].execute = lambda _params: asyncio.sleep(0, result="ok")
+
+    raw = '{"path":"x.txt"}'
+    expected_hash = hashlib.sha256(raw.encode()).hexdigest()[:16]
+    asyncio.run(tools.execute_tool_calls_async(
+        [_fc("read_file", "r1", raw), _fc("read_file", "r2", raw)],
+        registry,
+        tools.TodoManager(),
+        trace_context=context,
+    ))
+
+    events = sink.by_type("tool.requested")
+    assert events[0]["raw_arguments_sha256"] == expected_hash
+    assert events[1]["raw_arguments_sha256"] == expected_hash
+    # Different arguments produce a different hash.
+    asyncio.run(tools.execute_tool_calls_async(
+        [_fc("read_file", "r3", '{"path":"y.txt"}')],
+        registry,
+        tools.TodoManager(),
+        trace_context=context,
+    ))
+    third = sink.by_type("tool.requested")[2]
+    assert third["raw_arguments_sha256"] != expected_hash
+
+
+def test_dispatcher_raw_fingerprint_handles_non_string_arguments(load_module, workspace) -> None:
+    tools = load_module("tools", "tools.py")
+    sink = runtime_trace.MemoryTraceSink()
+    context = runtime_trace.TraceContext(sink=sink)
+    registry = tools.build_tool_registry(workspace, tools.TodoManager())
+
+    item = types.SimpleNamespace(
+        type="function_call", name="bash", call_id="b1", arguments=None,
+    )
+    asyncio.run(tools.run_tool_call_async(
+        item, registry, tools.TodoManager(), trace_context=context,
+    ))
+
+    requested = sink.by_type("tool.requested")[0]
+    assert requested["raw_arguments_chars"] == 0
+    assert requested["raw_arguments_sha256"] == ""

@@ -1,6 +1,7 @@
 import asyncio
 import codecs
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -1918,6 +1919,22 @@ def _extract_validation_issues(exc: Exception) -> list[dict]:
     return issues
 
 
+def _raw_arguments_fingerprint(raw_arguments) -> dict:
+    """Return a non-sensitive fingerprint of the raw tool-call arguments.
+
+    Stores only the character count and a truncated SHA-256 hash so the
+    offline analyzer can detect exact-repeat calls without exposing the
+    original content.
+    """
+    if not isinstance(raw_arguments, str):
+        return {"raw_arguments_chars": 0, "raw_arguments_sha256": ""}
+    chars = len(raw_arguments)
+    if chars == 0:
+        return {"raw_arguments_chars": 0, "raw_arguments_sha256": ""}
+    digest = hashlib.sha256(raw_arguments.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return {"raw_arguments_chars": chars, "raw_arguments_sha256": digest}
+
+
 async def run_tool_call_async(
     item,
     registry: dict[str, ToolRuntimeSpec],
@@ -1948,6 +1965,7 @@ async def run_tool_call_async(
             arguments=_safe_trace_arguments(item.name, normalized_args),
             argument_error=argument_error,
             validation_issues=validation_issues or [],
+            **_raw_arguments_fingerprint(item.arguments),
         )
 
     print(f"\033[33m{_tool_call_preview(item.name, args)}\033[0m")
