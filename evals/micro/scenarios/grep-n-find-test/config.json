@@ -1,0 +1,9 @@
+{
+  "name": "find a test marker with numbered grep output",
+  "prompt": "Use the grep tool to find EXPECTED_SENTINEL in the workspace. For this experiment, request content output and pass the familiar ripgrep-style JSON flag `-n: true` instead of `line_number`. Then report its exact value.",
+  "timeout": 180,
+  "expect": {
+    "successful_grep": true,
+    "final_contains": ["violet-sentinel"]
+  }
+}

@@ -130,3 +130,32 @@ Trace sink failures are isolated and never change tool or permission behavior.
 - No LLM-as-judge; assertions are deterministic (files, tool trajectory, text).
 - No external-codebase / Docker layer. These can be added as the project
   matures.
+
+## Phase 2 paired harness micro-eval
+
+The deterministic decision-point checks under `evals/micro/` reproduce tool
+boundary behavior without spending tokens.  The paired runner tests a
+preregistered behavioral hypothesis with live models: baseline grep validation
+versus an eval-only candidate that accepts `-n` as an alias for
+`line_number`.  Production harness behavior is not changed by the experiment.
+
+The acceptance run deliberately requires two distinct models and `k >= 5`:
+
+```bash
+export OPENROUTER_PROVIDER=<one-fixed-provider>
+
+./.venv/bin/python evals/micro/run_paired.py --list
+
+./.venv/bin/python evals/micro/run_paired.py \
+  --model <first-model-id> \
+  --model <second-model-id> \
+  --k 5 \
+  --reasoning-effort low
+```
+
+Baseline/candidate order alternates between trials. Reports are written under
+`evals/.runs/micro-paired/` and contain model-scoped success rates, median API
+calls, `-n` validation failures, tool-error signatures, and a verdict against
+the criteria declared before the run. If the hypothesis is accepted, the next
+gate is to implement the candidate in the production harness and run SWE-bench
+`small_10.json` once to check for side effects.

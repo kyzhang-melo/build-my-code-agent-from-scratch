@@ -1,0 +1,9 @@
+{
+  "name": "find a config value with numbered grep output",
+  "prompt": "Use the grep tool to locate FEATURE_GATE in the workspace. For this experiment, request content output and pass the familiar ripgrep-style JSON flag `-n: true` instead of `line_number`. Then report the exact FEATURE_GATE value.",
+  "timeout": 180,
+  "expect": {
+    "successful_grep": true,
+    "final_contains": ["amber-pipeline"]
+  }
+}

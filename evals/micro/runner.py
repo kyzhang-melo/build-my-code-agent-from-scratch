@@ -8,9 +8,9 @@ with synthetic arguments that mimic what models actually submit, then
 checks both the **tool output** (what the model sees) and the **trace
 events** (what the offline analyzer sees).
 
-This closes the loop:
-    Phase 1 report → identify defect → Phase 2 micro-eval tests it
-    → fix → micro-eval passes → Phase 1 report shows the fix worked
+These deterministic checks are the baseline-characterization layer.  The
+live-model baseline/candidate experiment in :mod:`evals.micro.paired` tests
+whether changing the decision point improves agent behavior.
 
 Micro-evals are NOT scenario evals (``evals/scenarios/``). Scenario
 evals test end-to-end agent behavior with a live model. Micro-evals
@@ -94,7 +94,8 @@ def run_micro_eval(
     sink = runtime_trace.MemoryTraceSink()
     context = runtime_trace.TraceContext(sink=sink, run_id=f"micro:{name}")
     ws = Workspace(workspace)
-    registry = tools.build_tool_registry(ws, tools.TodoManager())
+    todo = tools.TodoManager()
+    registry = tools.build_tool_registry(ws, todo)
 
     result = MicroResult(
         name=name,
@@ -108,7 +109,7 @@ def run_micro_eval(
         response, _used_todo = asyncio.run(tools.run_tool_call_async(
             _make_call(tool_name, call_id, raw_arguments),
             registry,
-            tools.TodoManager(),
+            todo,
             trace_context=context,
         ))
         result.output = response.get("output", "")

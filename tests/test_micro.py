@@ -7,10 +7,14 @@ the real tool dispatcher with synthetic inputs.
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
+import types
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+import tools
 
 from evals.micro.cases import (
     ALL_CASES,
@@ -32,6 +36,17 @@ from evals.micro.checks import (
     trace_validation_issue_contains,
 )
 from evals.micro.runner import MicroCheck, MicroResult, run_micro_eval
+from workspace import Workspace
+from evals.micro.paired import (
+    CriterionResult,
+    PairedTrialResult,
+    VariantMetrics,
+    _candidate_grep_schema,
+    aggregate,
+    apply_harness_variant,
+    evaluate_acceptance,
+    normalize_grep_n_alias,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -306,9 +321,8 @@ def test_run_micro_eval_no_checks_returns_error(tmp_path: Path) -> None:
 def test_all_micro_cases_pass(tmp_path: Path) -> None:
     """Every defined micro-eval case must pass against the real dispatcher.
 
-    This is the acceptance test for Phase 2: all decision-point micro-evals
-    derived from the Phase 1 report must pass, proving the harness handles
-    the observed failure patterns correctly.
+    This is the deterministic baseline-characterization layer for Phase 2.
+    Behavioral improvement is decided separately by the paired live runner.
     """
     failures: list[str] = []
     for case in ALL_CASES:
@@ -340,9 +354,9 @@ def test_micro_evals_reproduce_grep_friction_from_report(tmp_path: Path) -> None
     """The grep micro-evals must test the exact failure patterns that the
     Phase 1 report surfaced: models passing -n, -C, -A, -B as JSON keys.
 
-    This closes the loop: the report identifies the defect, the micro-eval
-    tests it deterministically. If a future harness change regresses grep
-    validation, these micro-evals will catch it before the next eval run.
+    This preserves the exact baseline behavior behind the report finding. The
+    paired live experiment separately tests whether accepting the alias is
+    better for model behavior.
     """
     grep_validation_cases = [
         c for c in GREP_CASES
@@ -370,3 +384,180 @@ def test_micro_evals_reproduce_grep_friction_from_report(tmp_path: Path) -> None
                 workspace=ws,
             )
             assert result.passed, f"{case.name} failed: {[c.label for c in result.checks if not c.passed]}"
+
+
+# ---------------------------------------------------------------------------
+# Live paired experiment (no provider calls in pytest)
+# ---------------------------------------------------------------------------
+
+
+def test_candidate_grep_schema_exposes_n_without_mutating_baseline() -> None:
+    baseline = [{
+        "name": "grep",
+        "description": "Do not pass command-line flags such as -n, -A, -B, or -C. ",
+        "parameters": {"properties": {"pattern": {"type": "string"}}},
+    }]
+    candidate = _candidate_grep_schema(baseline)
+
+    assert "-n" not in baseline[0]["parameters"]["properties"]
+    assert candidate[0]["parameters"]["properties"]["-n"]["type"] == "boolean"
+    assert "-n is accepted" in candidate[0]["description"]
+
+
+def test_candidate_normalizes_n_to_line_number() -> None:
+    normalized = normalize_grep_n_alias({
+        "pattern": "TODO",
+        "output_mode": "content",
+        "-n": True,
+    })
+
+    assert normalized == {
+        "pattern": "TODO",
+        "output_mode": "content",
+        "line_number": True,
+    }
+
+
+def test_candidate_preserves_conflicting_alias_for_strict_rejection() -> None:
+    normalized = normalize_grep_n_alias({
+        "pattern": "TODO",
+        "-n": True,
+        "line_number": False,
+    })
+
+    assert normalized["-n"] is True
+    assert normalized["line_number"] is False
+
+
+def test_candidate_variant_accepts_n_at_real_dispatcher(tmp_path: Path) -> None:
+    @dataclass(frozen=True)
+    class DummySession:
+        tools: list[dict]
+        registry: dict
+
+    (tmp_path / "app.py").write_text("# TODO: candidate path\n")
+    todo = tools.TodoManager()
+    baseline = DummySession(
+        tools=tools.select_tool_schemas({"grep"}),
+        registry=tools.build_tool_registry(Workspace(tmp_path), todo, {"grep"}),
+    )
+    candidate = apply_harness_variant(baseline, "candidate")
+    call = types.SimpleNamespace(
+        type="function_call",
+        name="grep",
+        call_id="candidate-grep",
+        arguments='{"pattern":"TODO","output_mode":"content","-n":true}',
+    )
+
+    response, _ = asyncio.run(tools.run_tool_call_async(
+        call,
+        candidate.registry,
+        todo,
+    ))
+
+    assert "TODO" in response["output"]
+    assert candidate.registry["grep"] is not baseline.registry["grep"]
+
+
+def _trial(
+    model: str,
+    variant: str,
+    *,
+    passed: bool,
+    api_calls: int,
+    alias_failures: int,
+    errors: list[str] | None = None,
+) -> PairedTrialResult:
+    return PairedTrialResult(
+        model=model,
+        provider="fixed-provider",
+        scenario="grep-n-find-definition",
+        trial=1,
+        variant=variant,
+        passed=passed,
+        api_calls=api_calls,
+        alias_validation_failures=alias_failures,
+        tool_errors=errors or [],
+    )
+
+
+def test_aggregate_keeps_model_and_variant_separate() -> None:
+    results = [
+        _trial("model-a", "baseline", passed=False, api_calls=4, alias_failures=1,
+               errors=["grep/validation"]),
+        _trial("model-a", "candidate", passed=True, api_calls=2, alias_failures=0),
+        _trial("model-a", "candidate", passed=True, api_calls=3, alias_failures=0),
+    ]
+
+    metrics = aggregate(results)
+    baseline = next(item for item in metrics if item.variant == "baseline")
+    candidate = next(item for item in metrics if item.variant == "candidate")
+
+    assert baseline.success_rate == 0.0
+    assert baseline.alias_validation_failures == 1
+    assert candidate.success_rate == 1.0
+    assert candidate.median_api_calls == 2.5
+
+
+def _passing_metrics() -> list[VariantMetrics]:
+    rows: list[VariantMetrics] = []
+    for model in ("model-a", "model-b"):
+        rows.extend([
+            VariantMetrics(
+                model=model,
+                variant="baseline",
+                attempts=15,
+                passed=12,
+                success_rate=0.8,
+                median_api_calls=3,
+                alias_validation_failures=5,
+                tool_errors=["grep/validation"],
+            ),
+            VariantMetrics(
+                model=model,
+                variant="candidate",
+                attempts=15,
+                passed=14,
+                success_rate=14 / 15,
+                median_api_calls=2,
+                alias_validation_failures=0,
+                tool_errors=[],
+            ),
+        ])
+    return rows
+
+
+def test_acceptance_requires_all_preregistered_criteria() -> None:
+    criteria = evaluate_acceptance(_passing_metrics())
+
+    assert len(criteria) == 5
+    assert all(item.passed for item in criteria)
+
+
+def test_acceptance_rejects_candidate_only_error() -> None:
+    metrics = _passing_metrics()
+    candidate = next(
+        item for item in metrics
+        if item.model == "model-b" and item.variant == "candidate"
+    )
+    candidate.tool_errors = ["grep/execution_error"]
+
+    criteria = evaluate_acceptance(metrics)
+
+    new_error = next(
+        item for item in criteria
+        if item.label == "no per-model candidate-only tool error signature"
+    )
+    assert not new_error.passed
+
+
+def test_acceptance_rejects_single_model() -> None:
+    metrics = [item for item in _passing_metrics() if item.model == "model-a"]
+
+    criteria = evaluate_acceptance(metrics)
+
+    assert criteria == [CriterionResult(
+        label="at least two models",
+        passed=False,
+        detail="paired models=1",
+    )]
