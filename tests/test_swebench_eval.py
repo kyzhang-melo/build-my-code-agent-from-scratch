@@ -214,6 +214,44 @@ def test_failed_attempt_requires_explicit_rerun(tmp_path) -> None:
     assert core.next_attempt(instance) == 2
 
 
+def test_agent_attempt_records_api_calls_when_the_agent_errors(
+    monkeypatch, tmp_path,
+) -> None:
+    _, mirror, commit = make_repo(tmp_path)
+    task = Task("owner__repo-1", "owner/repo", commit, "Fix it")
+    attempt_dir = tmp_path / "attempt-1"
+
+    import main
+
+    class FakeState:
+        def __init__(self, messages):
+            del messages
+            self.api_call_count = 0
+
+    async def fail_agent_loop(state, _session):
+        state.api_call_count = 7
+        raise json.JSONDecodeError("Expecting value", "not-json", 0)
+
+    monkeypatch.setattr(main, "LoopState", FakeState)
+    monkeypatch.setattr(main, "create_parent_session", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(main, "agent_loop", fail_agent_loop)
+
+    result = asyncio.run(core.run_agent_attempt(
+        task,
+        mirror,
+        attempt_dir,
+        run_id="test",
+        model="test-model",
+        max_api_calls=30,
+        reasoning_effort=None,
+        max_output_tokens=None,
+        timeout=None,
+    ))
+
+    assert result.agent_status == "error"
+    assert result.api_calls == 7
+
+
 def test_successful_attempt_is_never_rerun(tmp_path) -> None:
     result = tmp_path / "instance" / "attempt-1" / "result.json"
     core.atomic_write_json(
@@ -508,6 +546,16 @@ def test_run_parser_combines_generation_and_evaluation_options() -> None:
     assert args.max_output_tokens == 16000
     assert args.cache_level == "env"
     assert args.namespace == "swebench"
+
+
+def test_swebench_parser_accepts_none_reasoning_effort() -> None:
+    from evals.swebench import cli
+
+    args = cli.build_parser().parse_args(
+        ["run", "--run-id", "pipeline", "--subset", "small.json", "--reasoning-effort", "none"]
+    )
+
+    assert args.reasoning_effort == "none"
 
 
 def test_evaluation_defaults_to_four_workers() -> None:

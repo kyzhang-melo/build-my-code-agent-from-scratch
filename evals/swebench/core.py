@@ -462,6 +462,9 @@ async def run_agent_attempt(
     except Exception as exc:  # noqa: BLE001 - record one task failure and continue batch
         result.agent_status = "error"
         result.stop_reason = "error"
+        # agent_loop did not return a TurnOutcome, but its state still records
+        # every request that was attempted before the failure.
+        result.api_calls = state.api_call_count
         result.error = f"{type(exc).__name__}: {exc}"
 
     (attempt_dir / "final_text.txt").write_text(final_text, encoding="utf-8")

@@ -1,0 +1,8 @@
+{
+  "dataset": "SWE-bench/SWE-bench_Verified",
+  "split": "test",
+  "selection": "Temporary single-instance retry subset for diagnosing the prior API timeout.",
+  "instance_ids": [
+    "sympy__sympy-11618"
+  ]
+}
