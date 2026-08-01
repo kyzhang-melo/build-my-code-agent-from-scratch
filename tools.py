@@ -1935,6 +1935,25 @@ def _raw_arguments_fingerprint(raw_arguments) -> dict:
     return {"raw_arguments_chars": chars, "raw_arguments_sha256": digest}
 
 
+def _detect_internal_truncation(tool_name: str, output: str) -> bool:
+    """Detect whether a self-bounding tool truncated its own output.
+
+    ``bash`` renders a ``[truncated] true/false`` metadata line in its
+    header block; ``read_file``'s footer notes "Stopped at the" or
+    "truncated" when line/byte/per-line limits are hit.  Other tools do
+    not self-bound, so they always return ``False``.
+    """
+    if tool_name == "bash":
+        header = output.split("\n\n", 1)[0] if "\n\n" in output else output
+        return "[truncated] true" in header
+    if tool_name == "read_file":
+        for line in reversed(output.splitlines()):
+            if line.startswith("[Read ") and line.endswith("]"):
+                return "Stopped at the" in line or "truncated" in line
+        return False
+    return False
+
+
 async def run_tool_call_async(
     item,
     registry: dict[str, ToolRuntimeSpec],
@@ -2046,6 +2065,9 @@ async def run_tool_call_async(
                         error_type="cancelled",
                         output_chars=0,
                         output_truncated=False,
+                        runtime_output_truncated=False,
+                        tool_internal_truncated=False,
+                        truncated_chars=0,
                         api_call=api_call,
                         step_index=step_index,
                     )
@@ -2082,9 +2104,12 @@ async def run_tool_call_async(
     # structured metadata -- leave these verbatim; everything else gets
     # middle-truncated if oversized.
     original_output_length = len(output)
+    tool_internal_truncated = _detect_internal_truncation(item.name, output)
     if item.name not in ("todo", "read_file", "bash"):
         output = truncate_middle(output)
-    output_truncated = len(output) < original_output_length
+    runtime_output_truncated = len(output) < original_output_length
+    truncated_chars = original_output_length - len(output) if runtime_output_truncated else 0
+    output_truncated = runtime_output_truncated
 
     if item.name == "todo":
         print(output)
@@ -2104,6 +2129,9 @@ async def run_tool_call_async(
         error_type=error_type,
         output_chars=len(output),
         output_truncated=output_truncated,
+        runtime_output_truncated=runtime_output_truncated,
+        tool_internal_truncated=tool_internal_truncated,
+        truncated_chars=truncated_chars,
         api_call=api_call,
         step_index=step_index,
     )
