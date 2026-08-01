@@ -261,3 +261,64 @@ def test_stop_gate_trace_records_block_and_give_up(load_module, monkeypatch, wor
         "block",
         "give_up",
     ]
+
+
+def test_dispatcher_traces_validation_issues(load_module, workspace) -> None:
+    tools = load_module("tools", "tools.py")
+    sink = runtime_trace.MemoryTraceSink()
+    context = runtime_trace.TraceContext(sink=sink)
+    registry = tools.build_tool_registry(workspace, tools.TodoManager())
+
+    asyncio.run(tools.execute_tool_calls_async(
+        [_fc("grep", "g1", '{"pattern":"x","-n":true}')],
+        registry,
+        tools.TodoManager(),
+        trace_context=context,
+    ))
+
+    requested = sink.by_type("tool.requested")[0]
+    completed = sink.by_type("tool.completed")[0]
+    assert completed["status"] == "invalid_arguments"
+    assert completed["error_type"] == "validation"
+    assert requested["validation_issues"] == [
+        {"path": "-n", "type": "extra_forbidden"},
+    ]
+    # No raw input value leaked into the trace.
+    assert "true" not in json.dumps(requested["validation_issues"])
+
+
+def test_dispatcher_traces_empty_validation_issues_on_success(load_module, workspace) -> None:
+    tools = load_module("tools", "tools.py")
+    sink = runtime_trace.MemoryTraceSink()
+    context = runtime_trace.TraceContext(sink=sink)
+    registry = tools.build_tool_registry(workspace, tools.TodoManager())
+    registry["read_file"].execute = lambda _params: asyncio.sleep(0, result="ok")
+
+    asyncio.run(tools.execute_tool_calls_async(
+        [_fc("read_file", "r1", '{"path":"x.txt"}')],
+        registry,
+        tools.TodoManager(),
+        trace_context=context,
+    ))
+
+    requested = sink.by_type("tool.requested")[0]
+    assert requested["validation_issues"] == []
+
+
+def test_dispatcher_traces_empty_validation_issues_on_json_parse_error(load_module, workspace) -> None:
+    tools = load_module("tools", "tools.py")
+    sink = runtime_trace.MemoryTraceSink()
+    context = runtime_trace.TraceContext(sink=sink)
+    registry = tools.build_tool_registry(workspace, tools.TodoManager())
+
+    asyncio.run(tools.execute_tool_calls_async(
+        [_fc("bash", "b1", '{bad-json')],
+        registry,
+        tools.TodoManager(),
+        trace_context=context,
+    ))
+
+    requested = sink.by_type("tool.requested")[0]
+    # JSON parse errors have no Pydantic validation issues.
+    assert requested["validation_issues"] == []
+    assert requested["argument_error"] is not None

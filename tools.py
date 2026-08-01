@@ -1896,6 +1896,28 @@ def _tool_reported_error(tool_name: str, output: str) -> bool:
     return False
 
 
+def _extract_validation_issues(exc: Exception) -> list[dict]:
+    """Extract non-sensitive validation issues from a Pydantic ValidationError.
+
+    Only ``loc`` (as ``path``) and ``type`` are kept; ``input``, ``msg``, and
+    ``ctx`` are dropped because they may contain user content or sensitive
+    values.
+    """
+    errors_fn = getattr(exc, "errors", None)
+    if not callable(errors_fn):
+        return []
+    try:
+        raw_errors = errors_fn()
+    except Exception:
+        return []
+    issues: list[dict] = []
+    for err in raw_errors:
+        loc = err.get("loc", ())
+        loc_path = ".".join(str(part) for part in loc) if loc else ""
+        issues.append({"path": loc_path, "type": err.get("type", "")})
+    return issues
+
+
 async def run_tool_call_async(
     item,
     registry: dict[str, ToolRuntimeSpec],
@@ -1913,7 +1935,10 @@ async def run_tool_call_async(
     normalized_args = args
     todo_before = None
 
-    def emit_requested(argument_error: str | None = None) -> None:
+    def emit_requested(
+        argument_error: str | None = None,
+        validation_issues: list[dict] | None = None,
+    ) -> None:
         emit_trace(
             trace_context,
             "tool.requested",
@@ -1922,6 +1947,7 @@ async def run_tool_call_async(
             tool_name=item.name,
             arguments=_safe_trace_arguments(item.name, normalized_args),
             argument_error=argument_error,
+            validation_issues=validation_issues or [],
         )
 
     print(f"\033[33m{_tool_call_preview(item.name, args)}\033[0m")
@@ -1942,7 +1968,7 @@ async def run_tool_call_async(
         try:
             params = spec.params_model.model_validate(clean_args)
         except Exception as e:
-            emit_requested()
+            emit_requested(validation_issues=_extract_validation_issues(e))
             status = "invalid_arguments"
             error_type = "validation"
             output = f"Error: invalid arguments for tool '{item.name}': {e}"
