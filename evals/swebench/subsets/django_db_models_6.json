@@ -1,0 +1,16 @@
+{
+  "dataset": "SWE-bench/SWE-bench_Verified",
+  "split": "test",
+  "selection": "Chronological django/django sequence concentrated in django/db/models; curated without exposing gold patches.",
+  "sequence_id": "django-db-models-6",
+  "repo": "django/django",
+  "subsystem": "django/db/models",
+  "instance_ids": [
+    "django__django-15277",
+    "django__django-15280",
+    "django__django-15161",
+    "django__django-15368",
+    "django__django-15375",
+    "django__django-15382"
+  ]
+}
