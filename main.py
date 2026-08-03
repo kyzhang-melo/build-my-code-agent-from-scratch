@@ -26,9 +26,11 @@ from prompts import GLOB_DISCOVERY_RULES, build_explore_system, build_parent_sys
 from session import AgentSession, ReportStopGate, TodoStopGate, generate_session_id
 from session_store import (
     NullSessionStore,
+    SESSION_DIR_ENV,
     SessionStore,
     SessionStoreProtocol,
     find_most_recent_session,
+    get_default_session_dir,
     list_session_headers,
 )
 from tools import (
@@ -351,6 +353,7 @@ def create_parent_session(
     on_text: Callable[[str], None] | None = emit_assistant_text,
     session_id: str | None = None,
     store: SessionStoreProtocol | None = None,
+    session_dir: Path | None = None,
     max_api_calls: int = MAX_API_CALLS_PER_USER_TURN,
     reasoning_effort: str | None = None,
     max_output_tokens: int | None = DEFAULT_MAX_OUTPUT_TOKENS,
@@ -416,6 +419,7 @@ def create_parent_session(
         stop_gate=TodoStopGate(todo, TODO_CONTRACT_MAX_NUDGES),
         store=session_store,
         on_text=on_text,
+        session_dir=session_dir,
     )
 
 
@@ -769,9 +773,12 @@ async def cmd_permissions(arg: str, history: list, session: AgentSession) -> Non
 
 
 async def cmd_sessions(arg: str, history: list, session: AgentSession) -> None:
-    del arg, history, session
-    sessions_dir = Path.cwd() / ".sessions"
-    headers = list_session_headers(sessions_dir)
+    del arg, history
+    if session.session_dir is None:
+        print("[sessions] no session directory is configured")
+        return
+    sessions_dir = session.session_dir
+    headers = list_session_headers(sessions_dir, cwd=session.workspace.root)
     if not headers:
         print("[sessions] no saved sessions in this workspace")
         return
@@ -808,22 +815,27 @@ async def handle_command(query: str, history: list, session: AgentSession) -> bo
     return True
 
 
-def _resolve_session_path(session_arg: str) -> Path | None:
+def _resolve_session_path(
+    session_arg: str,
+    sessions_dir: Path,
+    cwd: Path,
+) -> Path | None:
     """Resolve a --resume argument to a session file path.
 
-    Accepts a bare session id (looked up in .sessions/), a relative path, or
-    an absolute path.
+    Accepts a bare session id (looked up in the configured session directory),
+    a relative path, or an absolute path.
     """
-    sessions_dir = Path.cwd() / ".sessions"
-    # Bare session id: look for <id>.jsonl in .sessions/
+    # Bare session id: look for <id>.jsonl in the configured directory.
     candidate = sessions_dir / f"{session_arg}.jsonl"
     if candidate.is_file():
-        return candidate
+        headers = list_session_headers(sessions_dir, cwd=cwd)
+        if any(Path(str(header["_path"])) == candidate for header in headers):
+            return candidate
     # Human-readable session name (case-insensitive within this workspace).
     folded = session_arg.casefold()
     matches = [
         Path(str(header["_path"]))
-        for header in list_session_headers(sessions_dir)
+        for header in list_session_headers(sessions_dir, cwd=cwd)
         if str(header.get("session_name", "")).casefold() == folded
     ]
     if len(matches) == 1:
@@ -835,9 +847,8 @@ def _resolve_session_path(session_arg: str) -> Path | None:
     return None
 
 
-def _print_session_list() -> None:
-    sessions_dir = Path.cwd() / ".sessions"
-    headers = list_session_headers(sessions_dir)
+def _print_session_list(sessions_dir: Path, cwd: Path) -> None:
+    headers = list_session_headers(sessions_dir, cwd=cwd)
     if not headers:
         print("No saved sessions in this workspace.")
         return
@@ -864,6 +875,16 @@ def _print_resume_diagnostics(store: SessionStoreProtocol) -> None:
         print(f"[session] resume sanitized: {', '.join(changed)}")
 
 
+def _resolve_sessions_dir(
+    workspace: Workspace,
+    override: str | Path | None,
+) -> Path:
+    configured = override or os.getenv(SESSION_DIR_ENV)
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return get_default_session_dir(workspace.root)
+
+
 async def repl(
     *,
     resume: str | None = None,
@@ -871,19 +892,20 @@ async def repl(
     list_only: bool = False,
     no_session: bool = False,
     session_name: str | None = None,
+    session_dir: str | Path | None = None,
     reasoning_effort: str | None = None,
     max_output_tokens: int | None = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> None:
+    cwd = Path.cwd()
+    workspace = Workspace(cwd)
+    sessions_dir = _resolve_sessions_dir(workspace, session_dir)
+
     if list_only:
         if session_name:
             print("Error: --name cannot be combined with --list-sessions")
             return
-        _print_session_list()
+        _print_session_list(sessions_dir, workspace.root)
         return
-
-    cwd = Path.cwd()
-    workspace = Workspace(cwd)
-    sessions_dir = cwd / ".sessions"
 
     # Determine session store: resume, continue, new, or null.
     store: SessionStoreProtocol = NullSessionStore()
@@ -899,7 +921,7 @@ async def repl(
         if session_name:
             print("Error: --name cannot be combined with --resume")
             return
-        path = _resolve_session_path(resume)
+        path = _resolve_session_path(resume, sessions_dir, workspace.root)
         if path is None:
             print(f"Error: session not found: {resume}")
             return
@@ -931,6 +953,7 @@ async def repl(
                 session_id,
                 MODEL_ID,
                 OPENROUTER_PROVIDER or "",
+                session_dir=sessions_dir,
                 acquire_lock=True,
             )
             session_id = store.session_id
@@ -959,6 +982,7 @@ async def repl(
                 MODEL_ID,
                 OPENROUTER_PROVIDER or "",
                 session_name,
+                session_dir=sessions_dir,
                 acquire_lock=True,
             )
         except ValueError as exc:
@@ -972,6 +996,7 @@ async def repl(
         approval_handler=TerminalApprovalHandler(interactive=sys.stdin.isatty()),
         session_id=session_id,
         store=store,
+        session_dir=sessions_dir,
         reasoning_effort=reasoning_effort,
         max_output_tokens=max_output_tokens,
     )
@@ -1004,6 +1029,7 @@ async def repl(
         source="parent",
         session_id=session.session_id,
         workspace_root=str(session.workspace.root),
+        session_storage_dir=str(sessions_dir),
         model_id=MODEL_ID,
         reasoning_effort=session.reasoning_effort,
         max_output_tokens=session.max_output_tokens,
@@ -1110,6 +1136,11 @@ def parse_args() -> dict:
     group.add_argument("--list-sessions", action="store_true", dest="list_only", help="List saved sessions and exit")
     group.add_argument("--no-session", action="store_true", dest="no_session", help="Disable session persistence")
     parser.add_argument("--name", dest="session_name", help="Optional name for a new session")
+    parser.add_argument(
+        "--session-dir",
+        dest="session_dir",
+        help=f"session storage directory (overrides {SESSION_DIR_ENV})",
+    )
     parser.add_argument(
         "--reasoning-effort",
         choices=("none", "minimal", "low", "medium", "high", "xhigh"),

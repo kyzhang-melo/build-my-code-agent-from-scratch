@@ -109,9 +109,15 @@ of the context window for smaller or unknown models.
 ### Session Persistence
 
 By default, each session is persisted as a logically append-only JSONL log in
-`.sessions/<session_id>.jsonl` within the workspace. The file records every
-completed turn's history and todo state; physical writes use atomic file
-replacement so compaction and crashes cannot leave a half-rewritten file.
+`~/.mycodeagent/sessions/--<encoded-workspace>--/<session_id>.jsonl`, outside
+the workspace. The file records every completed turn's history and todo state;
+physical writes use atomic file replacement so compaction and crashes cannot
+leave a half-rewritten file.
+
+Set `MYCODEAGENT_SESSION_DIR` or pass `--session-dir <dir>` to use an explicit
+session directory. The CLI flag takes precedence over the environment variable;
+either override is the final directory and is not extended with an encoded
+workspace name.
 
 CLI flags:
 
@@ -122,6 +128,7 @@ python main.py --continue         # resume the most recent session
 python main.py --resume <target>  # resume by name, id, or path
 python main.py --list-sessions    # list saved sessions and exit
 python main.py --no-session       # disable persistence for this run
+python main.py --session-dir /tmp/my-sessions
 ```
 
 In-session command:
@@ -147,14 +154,19 @@ Resume behavior:
   effects.
 - A per-session lock enforces one CLI writer at a time. A second process trying
   to resume the same active session is rejected.
+- Legacy workspace-local `.sessions` directories are not searched
+  automatically. Resume one explicitly with
+  `python main.py --resume .sessions/<session_id>.jsonl`; it continues writing
+  to that legacy file.
 
 Session names are optional, case-insensitively unique within the workspace, and
 do not replace the immutable session id. `last`, `continue`, and `new` are
 reserved names.
 
-Session and pre-compaction transcript files are treated as sensitive runtime
-state: file reads/writes and shell access are blocked, and search tools exclude
-their directories.
+External session files are outside the workspace permission boundary. Legacy
+`.sessions` and workspace-local pre-compaction transcript files remain treated
+as sensitive runtime state: file reads/writes and shell access are blocked, and
+search tools exclude their directories.
 
 ## Testing
 

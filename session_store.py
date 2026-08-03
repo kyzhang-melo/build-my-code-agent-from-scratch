@@ -1,8 +1,8 @@
 """Session persistence as append-only JSONL.
 
-Each session is one ``.sessions/<session_id>.jsonl`` file. The first line is a
-``session_header``; subsequent lines are ``message`` entries (one per history
-dict) or ``history_reset`` markers.
+Each session is one ``<session_dir>/<session_id>.jsonl`` file outside the
+workspace by default. The first line is a ``session_header``; subsequent lines
+are ``message`` entries (one per history dict) or ``history_reset`` markers.
 
 Because ``context_compact.py`` still rewrites ``state.messages`` in place, the
 store detects compaction by comparing the live history against the persisted
@@ -30,7 +30,8 @@ from message_utils import ResumeSanitizeDiagnostics, sanitize_resumed_history
 from workspace import Workspace
 
 CURRENT_SESSION_VERSION = 1
-SESSIONS_DIR_NAME = ".sessions"
+SESSION_DIR_ENV = "MYCODEAGENT_SESSION_DIR"
+DEFAULT_AGENT_DIR_NAME = ".mycodeagent"
 SESSION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 RESERVED_SESSION_NAMES = {"last", "continue", "new"}
 SESSION_ID_PATTERN = re.compile(
@@ -54,6 +55,27 @@ def _message_hash(msg: dict) -> str:
     return hashlib.sha256(
         json.dumps(msg, default=str, sort_keys=True, ensure_ascii=False).encode()
     ).hexdigest()[:16]
+
+
+def encode_workspace_path(cwd: str | Path) -> str:
+    """Encode an absolute workspace path as a readable directory name."""
+    resolved = str(Path(cwd).resolve())
+    encoded = re.sub(r"[/\\:]", "-", resolved.lstrip("/\\"))
+    return f"--{encoded}--"
+
+
+def get_default_session_dir(
+    cwd: str | Path,
+    *,
+    agent_dir: str | Path | None = None,
+) -> Path:
+    """Return the default external session directory for one workspace."""
+    root = (
+        Path(agent_dir).expanduser()
+        if agent_dir is not None
+        else Path.home() / DEFAULT_AGENT_DIR_NAME
+    )
+    return (root / "sessions" / encode_workspace_path(cwd)).resolve()
 
 
 def validate_session_id(session_id: str) -> str:
@@ -82,9 +104,10 @@ def validate_session_name(session_name: str | None) -> str:
 def ensure_session_name_available(
     session_dir: Path,
     session_name: str,
+    cwd: Path | None = None,
 ) -> None:
     folded = session_name.casefold()
-    for header in list_session_headers(session_dir):
+    for header in list_session_headers(session_dir, cwd=cwd):
         if str(header.get("session_name", "")).casefold() == folded:
             raise ValueError(f"Session name already exists: {session_name}")
 
@@ -180,24 +203,27 @@ class SessionStore:
         provider: str = "",
         session_name: str | None = None,
         *,
+        session_dir: Path,
         acquire_lock: bool = False,
     ) -> SessionStore:
         validate_session_id(session_id)
         normalized_name = validate_session_name(session_name)
+        resolved_session_dir = Path(session_dir).expanduser().resolve()
         store = cls(
             workspace=workspace,
             session_id=session_id,
             model_id=model_id,
             provider=provider,
-            path=cls._resolve_path(workspace, session_id),
+            path=cls._resolve_path(resolved_session_dir, session_id),
             session_name=normalized_name,
             created_at=_now_iso(),
             updated_at=_now_iso(),
         )
         if normalized_name:
             ensure_session_name_available(
-                workspace.root / SESSIONS_DIR_NAME,
+                resolved_session_dir,
                 normalized_name,
+                cwd=workspace.root,
             )
         if acquire_lock:
             store._acquire_lock()
@@ -463,9 +489,9 @@ class SessionStore:
     # -- internal: writing --
 
     @staticmethod
-    def _resolve_path(workspace: Workspace, session_id: str) -> Path:
+    def _resolve_path(session_dir: Path, session_id: str) -> Path:
         validate_session_id(session_id)
-        return workspace.root / SESSIONS_DIR_NAME / f"{session_id}.jsonl"
+        return session_dir / f"{session_id}.jsonl"
 
     def _history_matches_prefix(self, history: list[dict]) -> bool:
         if not self._persisted_message_hashes:
@@ -698,8 +724,11 @@ def find_most_recent_session(session_dir: Path, cwd: Path) -> Path | None:
     return candidates[0][1]
 
 
-def list_session_headers(session_dir: Path) -> list[dict[str, Any]]:
-    """List session headers (first line only) for ``--list-sessions``."""
+def list_session_headers(
+    session_dir: Path,
+    cwd: Path | None = None,
+) -> list[dict[str, Any]]:
+    """List session headers, optionally filtered to one workspace cwd."""
     if not session_dir.exists():
         return []
     headers: list[dict[str, Any]] = []
@@ -712,6 +741,10 @@ def list_session_headers(session_dir: Path) -> list[dict[str, Any]]:
             header = json.loads(first_line)
             if header.get("type") != "session_header":
                 continue
+            if cwd is not None:
+                header_cwd = Path(str(header.get("cwd", ""))).resolve()
+                if header_cwd != cwd.resolve():
+                    continue
             header["_path"] = str(f)
             header["_mtime"] = f.stat().st_mtime
             headers.append(header)

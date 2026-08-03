@@ -6,6 +6,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Protocol
 
 from permissions import PermissionService
@@ -102,3 +103,4 @@ class AgentSession:
     stop_gate: StopGate
     store: SessionStoreProtocol = field(default_factory=NullSessionStore)
     on_text: Callable[[str], None] | None = None
+    session_dir: Path | None = None

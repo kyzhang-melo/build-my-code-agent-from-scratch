@@ -11,8 +11,10 @@ import pytest
 from session_store import (
     NullSessionStore,
     SessionStore,
+    encode_workspace_path,
     ensure_session_name_available,
     find_most_recent_session,
+    get_default_session_dir,
     list_session_headers,
     validate_session_name,
 )
@@ -20,20 +22,45 @@ from workspace import Workspace
 from message_utils import drop_orphan_tool_calls, sanitize_resumed_message
 
 
+def _session_dir(workspace: Workspace) -> Path:
+    return workspace.root.parent / f"{workspace.root.name}-sessions"
+
+
+def _create_store(workspace: Workspace, *args, **kwargs) -> SessionStore:
+    kwargs.setdefault("session_dir", _session_dir(workspace))
+    return SessionStore.create(workspace, *args, **kwargs)
+
+
 # ---------------------------------------------------------------------------
 # SessionStore: create + sync + messages round-trip
 # ---------------------------------------------------------------------------
 
 
+def test_default_session_dir_is_external_and_workspace_scoped(tmp_path) -> None:
+    workspace_a = tmp_path / "projects" / "alpha"
+    workspace_b = tmp_path / "projects" / "beta"
+    agent_dir = tmp_path / "agent-home"
+
+    dir_a = get_default_session_dir(workspace_a, agent_dir=agent_dir)
+    dir_b = get_default_session_dir(workspace_b, agent_dir=agent_dir)
+
+    assert dir_a == agent_dir / "sessions" / encode_workspace_path(workspace_a)
+    assert dir_b == agent_dir / "sessions" / encode_workspace_path(workspace_b)
+    assert dir_a != dir_b
+    assert not dir_a.is_relative_to(workspace_a.resolve())
+
+
 def test_no_file_created_until_sync(workspace) -> None:
-    store = SessionStore.create(workspace, "test-id-1", "model-a")
+    store = _create_store(workspace, "test-id-1", "model-a")
     assert not store.path.exists()
     store.sync([{"role": "user", "content": "hello"}])
     assert store.path.exists()
+    assert store.path.parent == _session_dir(workspace).resolve()
+    assert not (workspace.root / ".sessions").exists()
 
 
 def test_incremental_append_no_duplicates(workspace) -> None:
-    store = SessionStore.create(workspace, "test-id-2", "model-a")
+    store = _create_store(workspace, "test-id-2", "model-a")
     h1 = [{"role": "user", "content": "hello"}]
     store.sync(h1)
     count_after_1 = store.entry_count
@@ -49,7 +76,7 @@ def test_incremental_append_no_duplicates(workspace) -> None:
 
 
 def test_messages_projection_matches_history(workspace) -> None:
-    store = SessionStore.create(workspace, "test-id-3", "model-a")
+    store = _create_store(workspace, "test-id-3", "model-a")
     history = [
         {"role": "user", "content": "hello"},
         {"role": "assistant", "content": "hi"},
@@ -61,7 +88,7 @@ def test_messages_projection_matches_history(workspace) -> None:
 
 
 def test_compaction_triggers_history_reset(workspace) -> None:
-    store = SessionStore.create(workspace, "test-id-4", "model-a")
+    store = _create_store(workspace, "test-id-4", "model-a")
     h1 = [
         {"role": "user", "content": "old request"},
         {"role": "assistant", "content": "old answer"},
@@ -87,7 +114,7 @@ def test_compaction_triggers_history_reset(workspace) -> None:
 
 
 def test_create_sync_open_roundtrip(workspace) -> None:
-    store = SessionStore.create(workspace, "test-id-5", "model-a")
+    store = _create_store(workspace, "test-id-5", "model-a")
     history = [
         {"role": "user", "content": "hello"},
         {"role": "assistant", "content": "world"},
@@ -101,7 +128,7 @@ def test_create_sync_open_roundtrip(workspace) -> None:
 
 
 def test_resume_different_model_drops_reasoning(workspace) -> None:
-    store = SessionStore.create(workspace, "test-id-6", "model-a")
+    store = _create_store(workspace, "test-id-6", "model-a")
     history = [
         {"role": "user", "content": "hello"},
         {"type": "reasoning", "id": "r1", "summary": "thinking..."},
@@ -127,7 +154,7 @@ def test_resume_different_model_drops_reasoning(workspace) -> None:
 
 
 def test_resume_same_model_preserves_reasoning_and_id(workspace) -> None:
-    store = SessionStore.create(workspace, "test-id-7", "model-a")
+    store = _create_store(workspace, "test-id-7", "model-a")
     history = [
         {"type": "reasoning", "id": "r1", "summary": "thinking..."},
         {"type": "function_call", "id": "fc1", "call_id": "c1", "name": "bash", "arguments": "{}"},
@@ -143,7 +170,7 @@ def test_resume_same_model_preserves_reasoning_and_id(workspace) -> None:
 
 
 def test_resume_same_model_different_provider_sanitizes(workspace) -> None:
-    store = SessionStore.create(
+    store = _create_store(
         workspace, "test-provider", "model-a", "provider-a",
     )
     store.sync([
@@ -171,7 +198,7 @@ def test_resume_same_model_different_provider_sanitizes(workspace) -> None:
 
 
 def test_resume_drops_orphan_trailing_function_call(workspace) -> None:
-    store = SessionStore.create(workspace, "test-id-8", "model-a")
+    store = _create_store(workspace, "test-id-8", "model-a")
     # History ends with a function_call that has no output (process died mid-tool).
     history = [
         {"role": "user", "content": "run something"},
@@ -187,7 +214,7 @@ def test_resume_drops_orphan_trailing_function_call(workspace) -> None:
 
 
 def test_resume_reports_invalid_jsonl_lines(workspace) -> None:
-    store = SessionStore.create(workspace, "test-invalid-line", "model-a")
+    store = _create_store(workspace, "test-invalid-line", "model-a")
     store.sync([{"role": "user", "content": "hello"}])
     with store.path.open("a", encoding="utf-8") as handle:
         handle.write("{not-json}\n")
@@ -216,7 +243,7 @@ def test_future_session_version_is_rejected(workspace) -> None:
 def test_resume_cwd_mismatch_rejected(tmp_path) -> None:
     ws_a = Workspace(tmp_path / "a")
     ws_a.root.mkdir()
-    store = SessionStore.create(ws_a, "test-id-9", "model-a")
+    store = _create_store(ws_a, "test-id-9", "model-a")
     store.sync([{"role": "user", "content": "hello"}])
 
     ws_b = Workspace(tmp_path / "b")
@@ -228,6 +255,19 @@ def test_resume_cwd_mismatch_rejected(tmp_path) -> None:
 def test_resume_missing_file_rejected(workspace) -> None:
     with pytest.raises(ValueError, match="not found"):
         SessionStore.open(workspace.root / ".sessions" / "nonexistent.jsonl", workspace, "model-a")
+
+
+def test_legacy_workspace_session_can_be_opened_explicitly(workspace) -> None:
+    legacy_dir = workspace.root / ".sessions"
+    store = _create_store(
+        workspace, "legacy", "model-a", session_dir=legacy_dir,
+    )
+    store.sync([{"role": "user", "content": "hello"}])
+
+    reopened = SessionStore.open(store.path, workspace, "model-a")
+
+    assert reopened.messages() == [{"role": "user", "content": "hello"}]
+    assert find_most_recent_session(_session_dir(workspace), workspace.root) is None
 
 
 def test_null_store_writes_nothing(workspace) -> None:
@@ -245,7 +285,7 @@ def test_null_store_writes_nothing(workspace) -> None:
 
 
 def test_find_most_recent_session(workspace) -> None:
-    sessions_dir = workspace.root / ".sessions"
+    sessions_dir = _session_dir(workspace)
     sessions_dir.mkdir()
 
     # Create two session files with different mtimes.
@@ -272,7 +312,7 @@ def test_find_most_recent_session(workspace) -> None:
 
 
 def test_find_most_recent_session_filters_other_cwd(workspace, tmp_path) -> None:
-    sessions_dir = workspace.root / ".sessions"
+    sessions_dir = _session_dir(workspace)
     sessions_dir.mkdir()
     other_cwd = tmp_path / "other"
     other_cwd.mkdir()
@@ -288,7 +328,7 @@ def test_find_most_recent_session_filters_other_cwd(workspace, tmp_path) -> None
 
 
 def test_list_session_headers(workspace) -> None:
-    sessions_dir = workspace.root / ".sessions"
+    sessions_dir = _session_dir(workspace)
     sessions_dir.mkdir()
     (sessions_dir / "a.jsonl").write_text(json.dumps({
         "type": "session_header", "version": 1, "session_id": "id-a",
@@ -307,16 +347,65 @@ def test_list_session_headers(workspace) -> None:
     assert ids == {"id-a", "id-b"}
 
 
+def test_list_session_headers_filters_shared_directory_by_cwd(tmp_path) -> None:
+    sessions_dir = tmp_path / "shared-sessions"
+    workspace_a = Workspace(tmp_path / "a")
+    workspace_b = Workspace(tmp_path / "b")
+    workspace_a.root.mkdir()
+    workspace_b.root.mkdir()
+    store_a = _create_store(
+        workspace_a, "shared-a", "model-a", session_dir=sessions_dir,
+    )
+    store_b = _create_store(
+        workspace_b, "shared-b", "model-a", session_dir=sessions_dir,
+    )
+    store_a.sync([{"role": "user", "content": "a"}])
+    store_b.sync([{"role": "user", "content": "b"}])
+
+    headers = list_session_headers(sessions_dir, cwd=workspace_a.root)
+
+    assert [header["session_id"] for header in headers] == ["shared-a"]
+
+
+def test_session_names_are_scoped_by_cwd_in_shared_directory(tmp_path) -> None:
+    sessions_dir = tmp_path / "shared-sessions"
+    workspace_a = Workspace(tmp_path / "a")
+    workspace_b = Workspace(tmp_path / "b")
+    workspace_a.root.mkdir()
+    workspace_b.root.mkdir()
+    store_a = _create_store(
+        workspace_a,
+        "named-a",
+        "model-a",
+        session_name="same-name",
+        session_dir=sessions_dir,
+    )
+    store_a.sync([{"role": "user", "content": "a"}])
+
+    store_b = _create_store(
+        workspace_b,
+        "named-b",
+        "model-a",
+        session_name="same-name",
+        session_dir=sessions_dir,
+    )
+    store_b.sync([{"role": "user", "content": "b"}])
+
+    assert store_b.path.exists()
+
+
 def test_session_name_is_persisted_and_must_be_unique(workspace) -> None:
-    store = SessionStore.create(
+    store = _create_store(
         workspace, "named-id", "model-a", session_name="kevin",
     )
     store.sync([{"role": "user", "content": "hello"}])
 
-    header = list_session_headers(workspace.root / ".sessions")[0]
+    header = list_session_headers(_session_dir(workspace))[0]
     assert header["session_name"] == "kevin"
     with pytest.raises(ValueError, match="already exists"):
-        ensure_session_name_available(workspace.root / ".sessions", "KEVIN")
+        ensure_session_name_available(
+            _session_dir(workspace), "KEVIN", cwd=workspace.root,
+        )
 
 
 @pytest.mark.parametrize("name", ["last", "continue", "new", "../kevin", "two words"])
@@ -326,25 +415,25 @@ def test_invalid_or_reserved_session_names_are_rejected(name) -> None:
 
 
 def test_session_lock_rejects_a_second_writer(workspace) -> None:
-    store = SessionStore.create(
+    store = _create_store(
         workspace, "locked", "model-a", acquire_lock=True,
     )
     try:
         with pytest.raises(ValueError, match="already open"):
-            SessionStore.create(
+            _create_store(
                 workspace, "locked", "model-a", acquire_lock=True,
             )
     finally:
         store.close()
 
-    replacement = SessionStore.create(
+    replacement = _create_store(
         workspace, "locked", "model-a", acquire_lock=True,
     )
     replacement.close()
 
 
 def test_session_lock_reclaims_stale_owner(workspace) -> None:
-    store = SessionStore.create(workspace, "stale-lock", "model-a")
+    store = _create_store(workspace, "stale-lock", "model-a")
     store.sync([{"role": "user", "content": "hello"}])
     lock_path = store.path.with_suffix(".lock")
     lock_path.write_text(json.dumps({
@@ -368,7 +457,7 @@ def test_session_lock_reclaims_stale_owner(workspace) -> None:
 
 
 def test_invalid_session_lock_is_rejected_without_deleting_it(workspace) -> None:
-    store = SessionStore.create(workspace, "invalid-lock", "model-a")
+    store = _create_store(workspace, "invalid-lock", "model-a")
     store.sync([{"role": "user", "content": "hello"}])
     lock_path = store.path.with_suffix(".lock")
     lock_path.write_text("{not-json}")
@@ -483,7 +572,7 @@ def test_drop_orphan_rejects_output_that_precedes_call() -> None:
 
 
 def test_todo_state_persisted_and_restored(workspace) -> None:
-    store = SessionStore.create(workspace, "test-todo-1", "model-a")
+    store = _create_store(workspace, "test-todo-1", "model-a")
     store.sync([{"role": "user", "content": "do something"}])
     todo_items = [
         {"content": "step 1", "status": "completed", "activeForm": ""},
@@ -500,7 +589,7 @@ def test_todo_state_persisted_and_restored(workspace) -> None:
 
 
 def test_todo_state_empty_clears_previous_plan(workspace) -> None:
-    store = SessionStore.create(workspace, "test-todo-2", "model-a")
+    store = _create_store(workspace, "test-todo-2", "model-a")
     store.sync([{"role": "user", "content": "hello"}])
     store.sync_todo([{"content": "old step", "status": "pending"}])
     store.sync_todo([])
@@ -512,7 +601,7 @@ def test_todo_state_empty_clears_previous_plan(workspace) -> None:
 
 
 def test_todo_state_not_in_message_projection(workspace) -> None:
-    store = SessionStore.create(workspace, "test-todo-3", "model-a")
+    store = _create_store(workspace, "test-todo-3", "model-a")
     store.sync([{"role": "user", "content": "hello"}])
     store.sync_todo([{"content": "step 1", "status": "pending"}])
 
@@ -522,7 +611,7 @@ def test_todo_state_not_in_message_projection(workspace) -> None:
 
 
 def test_resume_with_todo_does_not_create_spurious_history_reset(workspace) -> None:
-    store = SessionStore.create(workspace, "test-todo-prefix", "model-a")
+    store = _create_store(workspace, "test-todo-prefix", "model-a")
     history = [
         {"role": "user", "content": "hello"},
         {"role": "assistant", "content": "world"},
@@ -544,7 +633,7 @@ def test_resume_with_todo_does_not_create_spurious_history_reset(workspace) -> N
 
 
 def test_history_prefix_change_is_detected_even_when_tail_is_unchanged(workspace) -> None:
-    store = SessionStore.create(workspace, "test-prefix", "model-a")
+    store = _create_store(workspace, "test-prefix", "model-a")
     original = [
         {"role": "user", "content": "old"},
         {"role": "assistant", "content": "same tail"},

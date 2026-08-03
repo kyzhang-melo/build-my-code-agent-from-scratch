@@ -998,10 +998,11 @@ def test_repl_discards_interrupted_turn_and_todo_mutation(
         raise KeyboardInterrupt
 
     monkeypatch.setattr(main_module, "agent_loop", interrupted_loop)
-    _run(main_module.repl())
+    sessions_dir = tmp_path / "session-data"
+    _run(main_module.repl(session_dir=sessions_dir))
 
     session_path = main_module.find_most_recent_session(
-        tmp_path / ".sessions", tmp_path.resolve(),
+        sessions_dir, tmp_path.resolve(),
     )
     assert session_path is not None
     reopened = main_module.SessionStore.open(
@@ -1014,6 +1015,49 @@ def test_repl_discards_interrupted_turn_and_todo_mutation(
     assert reopened.last_todo_items() == []
 
 
+def test_session_directory_precedence(load_module, monkeypatch, tmp_path) -> None:
+    main_module = load_module("main", "main.py")
+    workspace = main_module.Workspace(tmp_path)
+    env_dir = tmp_path / "from-env"
+    cli_dir = tmp_path / "from-cli"
+    monkeypatch.setenv(main_module.SESSION_DIR_ENV, str(env_dir))
+
+    assert main_module._resolve_sessions_dir(workspace, cli_dir) == cli_dir.resolve()
+    assert main_module._resolve_sessions_dir(workspace, None) == env_dir.resolve()
+
+    monkeypatch.delenv(main_module.SESSION_DIR_ENV)
+    assert main_module._resolve_sessions_dir(
+        workspace, None,
+    ) == main_module.get_default_session_dir(workspace.root)
+
+
+def test_sessions_command_uses_configured_external_directory(
+    load_module, tmp_path, capsys,
+) -> None:
+    main_module = load_module("main", "main.py")
+    workspace = main_module.Workspace(tmp_path)
+    sessions_dir = tmp_path.parent / f"{tmp_path.name}-sessions"
+    store = main_module.SessionStore.create(
+        workspace,
+        "external-session",
+        main_module.MODEL_ID,
+        session_dir=sessions_dir,
+    )
+    store.sync([{"role": "user", "content": "hello"}])
+    session = main_module.create_parent_session(
+        tmp_path,
+        approval_handler=None,
+        store=store,
+        session_dir=sessions_dir,
+    )
+
+    _run(main_module.cmd_sessions("", [], session))
+
+    output = capsys.readouterr().out
+    assert "external-session" in output
+    assert str(sessions_dir) in output
+
+
 def test_repl_no_session_does_not_claim_it_saved(
     load_module, monkeypatch, tmp_path, capsys,
 ) -> None:
@@ -1021,12 +1065,14 @@ def test_repl_no_session_does_not_claim_it_saved(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("builtins.input", lambda _prompt: "exit")
 
-    _run(main_module.repl(no_session=True))
+    sessions_dir = tmp_path / "session-data"
+    _run(main_module.repl(no_session=True, session_dir=sessions_dir))
 
     output = capsys.readouterr().out
     assert "persistence disabled" in output
     assert "[session] saved" not in output
     assert not (tmp_path / ".sessions").exists()
+    assert not sessions_dir.exists()
 
 
 def test_repl_prints_complete_resume_sanitization_diagnostics(
@@ -1040,6 +1086,7 @@ def test_repl_prints_complete_resume_sanitization_diagnostics(
         "resume-diagnostics",
         "old-model",
         "old-provider",
+        session_dir=tmp_path / "session-data",
     )
     store.sync([
         {"role": "user", "content": "continue"},
@@ -1095,6 +1142,7 @@ def test_repl_warns_and_clears_invalid_restored_todo_state(
         "invalid-todo",
         main_module.MODEL_ID,
         main_module.OPENROUTER_PROVIDER or "",
+        session_dir=tmp_path / "session-data",
     )
     store.sync([{"role": "user", "content": "continue"}])
     store.sync_todo([{
@@ -1128,6 +1176,7 @@ def test_repl_reports_session_lock_conflict_without_claiming_save(
         "locked-repl",
         main_module.MODEL_ID,
         main_module.OPENROUTER_PROVIDER or "",
+        session_dir=tmp_path / "session-data",
         acquire_lock=True,
     )
     owner.sync([{"role": "user", "content": "hello"}])
