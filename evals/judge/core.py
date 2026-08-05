@@ -8,16 +8,18 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from pydantic import ValidationError
 
 from .models import AggregateJudgment, PairJudgment
 from .prompts import (
     AGGREGATE_PROMPT_VERSION,
+    REPAIR_PROMPT_VERSION,
     RUBRIC_VERSION,
     build_aggregate_prompt,
     build_pair_prompt,
+    build_repair_prompt,
 )
 
 
@@ -212,6 +214,64 @@ def _parse_aggregate(text: str) -> AggregateJudgment:
     return AggregateJudgment.model_validate_json(text.strip())
 
 
+async def _parse_with_one_repair(
+    *,
+    raw: str,
+    parser: Callable[[str], Any],
+    schema: dict,
+    create_response: ResponseCreate,
+    semaphore: asyncio.Semaphore,
+    artifact_dir: Path,
+) -> tuple[Any | None, dict]:
+    try:
+        return parser(raw), {"response_repaired": False}
+    except ValidationError as initial_error:
+        initial_text = str(initial_error)
+        (artifact_dir / "validation-error.txt").write_text(
+            initial_text + "\n", encoding="utf-8"
+        )
+        repair_prompt = build_repair_prompt(
+            raw_response=raw,
+            validation_error=initial_text,
+            schema=schema,
+        )
+        (artifact_dir / "repair-prompt.txt").write_text(
+            repair_prompt, encoding="utf-8"
+        )
+        try:
+            async with semaphore:
+                repaired_raw = await _judge_call(create_response, repair_prompt)
+        except Exception as exc:  # noqa: BLE001 - provider boundary
+            return None, {
+                "status": "repair_provider_error",
+                "response_repaired": False,
+                "initial_validation_error": initial_text,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+        (artifact_dir / "repair-response.txt").write_text(
+            repaired_raw, encoding="utf-8"
+        )
+        try:
+            return parser(repaired_raw), {
+                "response_repaired": True,
+                "initial_validation_error": initial_text,
+            }
+        except ValidationError as repair_error:
+            repair_text = str(repair_error)
+            (artifact_dir / "repair-validation-error.txt").write_text(
+                repair_text + "\n", encoding="utf-8"
+            )
+            return None, {
+                "status": "invalid_response",
+                "response_repaired": False,
+                "initial_validation_error": initial_text,
+                "repair_validation_error": repair_text,
+                "error_type": type(repair_error).__name__,
+                "error": repair_text,
+            }
+
+
 async def _judge_call(create_response: ResponseCreate, prompt: str) -> str:
     last_error: Exception | None = None
     for attempt in range(4):
@@ -291,6 +351,7 @@ async def run_comparison(
         "concurrency": config.concurrency,
         "rubric_version": RUBRIC_VERSION,
         "aggregate_prompt_version": AGGREGATE_PROMPT_VERSION,
+        "repair_prompt_version": REPAIR_PROMPT_VERSION,
         "generation_settings": {
             "provider_defaults": True,
             "max_output_tokens": None,
@@ -325,6 +386,7 @@ async def run_comparison(
             existing.get("schema_version") != JUDGE_ARTIFACT_SCHEMA_VERSION
             or previous_aggregate_version != AGGREGATE_PROMPT_VERSION
             or "generation_settings" not in existing
+            or existing.get("repair_prompt_version") != REPAIR_PROMPT_VERSION
         ):
             history = list(existing.get("protocol_history", []))
             if previous_aggregate_version != AGGREGATE_PROMPT_VERSION:
@@ -335,6 +397,7 @@ async def run_comparison(
             existing.update({
                 "schema_version": JUDGE_ARTIFACT_SCHEMA_VERSION,
                 "aggregate_prompt_version": AGGREGATE_PROMPT_VERSION,
+                "repair_prompt_version": REPAIR_PROMPT_VERSION,
                 "generation_settings": judge_manifest["generation_settings"],
                 "protocol_history": history,
                 "protocol_updated_at": datetime.now(timezone.utc).isoformat(),
@@ -351,7 +414,13 @@ async def run_comparison(
         if existing_record is not None and (
             existing_record.get("status") == "completed" or not config.rerun_failed
         ):
+            action = "reused" if existing_record.get("status") == "completed" else "retained"
+            print(
+                f"[judge] {instance_id} {action} status={existing_record.get('status')}",
+                flush=True,
+            )
             return existing_record
+        print(f"[judge] {instance_id} started", flush=True)
         target_dir = result_path.parent
         target_dir.mkdir(parents=True, exist_ok=True)
         a_first = _a_is_first(config, instance_id)
@@ -385,6 +454,7 @@ async def run_comparison(
                     "mapping": mapping, "attempts": {"A": meta_a["attempt"], "B": meta_b["attempt"]},
                 }
                 atomic_write_json(result_path, record)
+                print(f"[judge] {instance_id} input_too_large", flush=True)
                 return record
         except (FileNotFoundError, json.JSONDecodeError, ValueError) as exc:
             record = {
@@ -394,6 +464,7 @@ async def run_comparison(
                 "error_type": type(exc).__name__, "error": str(exc),
             }
             atomic_write_json(result_path, record)
+            print(f"[judge] {instance_id} missing_or_invalid_artifact", flush=True)
             return record
         try:
             async with semaphore:
@@ -407,24 +478,35 @@ async def run_comparison(
                 "error_type": type(exc).__name__, "error": str(exc),
             }
             atomic_write_json(result_path, record)
+            print(f"[judge] {instance_id} provider_error", flush=True)
             return record
-        try:
-            judgment = _parse_pair(raw)
+        judgment, parse_meta = await _parse_with_one_repair(
+            raw=raw,
+            parser=_parse_pair,
+            schema=PairJudgment.model_json_schema(),
+            create_response=create_response,
+            semaphore=semaphore,
+            artifact_dir=target_dir,
+        )
+        if judgment is not None:
             record = {
                 "schema_version": JUDGE_ARTIFACT_SCHEMA_VERSION,
                 "instance_id": instance_id, "status": "completed",
                 "input_chars": len(prompt), "mapping": mapping,
                 "attempts": {"A": meta_a["attempt"], "B": meta_b["attempt"]},
                 "judgment": judgment.model_dump(),
+                **parse_meta,
             }
-        except ValidationError as exc:
+        else:
             record = {
                 "schema_version": JUDGE_ARTIFACT_SCHEMA_VERSION,
                 "instance_id": instance_id,
-                "status": "invalid_response", "mapping": mapping,
-                "error_type": type(exc).__name__, "error": str(exc),
+                "mapping": mapping,
+                **parse_meta,
             }
         atomic_write_json(result_path, record)
+        label = "repaired" if record.get("response_repaired") else record["status"]
+        print(f"[judge] {instance_id} {label}", flush=True)
         return record
 
     records = await asyncio.gather(*(judge_instance(i) for i in instance_ids))
@@ -482,17 +564,36 @@ async def run_comparison(
     aggregate_record: dict
     if not any(record["status"] == "completed" for record in records):
         aggregate_record = {"status": "no_completed_instances"}
+        print("[judge] aggregate skipped status=no_completed_instances", flush=True)
     else:
+        print("[judge] aggregate started", flush=True)
         try:
             async with semaphore:
                 raw = await _judge_call(create_response, aggregate_prompt)
             (aggregate_dir / "raw-response.txt").write_text(raw, encoding="utf-8")
-            aggregate = _parse_aggregate(raw)
-            aggregate_record = {"status": "completed", "judgment": aggregate.model_dump()}
         except Exception as exc:  # noqa: BLE001
             aggregate_record = {
                 "status": "judge_error", "error_type": type(exc).__name__, "error": str(exc)
             }
+        else:
+            aggregate, parse_meta = await _parse_with_one_repair(
+                raw=raw,
+                parser=_parse_aggregate,
+                schema=AggregateJudgment.model_json_schema(),
+                create_response=create_response,
+                semaphore=semaphore,
+                artifact_dir=aggregate_dir,
+            )
+            aggregate_record = (
+                {"status": "completed", "judgment": aggregate.model_dump(), **parse_meta}
+                if aggregate is not None
+                else parse_meta
+            )
+        label = (
+            "repaired" if aggregate_record.get("response_repaired")
+            else aggregate_record["status"]
+        )
+        print(f"[judge] aggregate {label}", flush=True)
     atomic_write_json(aggregate_dir / "judgment.json", aggregate_record)
 
     summary = {
@@ -503,6 +604,9 @@ async def run_comparison(
         "second_value": value_b,
         "calibration_status": "uncalibrated",
         "status_counts": dict(sorted(Counter(r["status"] for r in records).items())),
+        "repaired_responses": sum(
+            bool(record.get("response_repaired")) for record in records
+        ) + bool(aggregate_record.get("response_repaired")),
         "preference_counts": dict(sorted(preference_counts.items())),
         "instances": revealed_rows,
         "aggregate": aggregate_record,
@@ -513,6 +617,7 @@ async def run_comparison(
         f"- Factor: `{config.factor}` (`{value_a}` vs `{value_b}`)",
         f"- Judge: `{config.judge_model}`", "- Calibration: **uncalibrated**", 
         f"- Statuses: `{json.dumps(summary['status_counts'], sort_keys=True)}`",
+        f"- Repaired responses: **{summary['repaired_responses']}**",
         f"- Process preferences: `{json.dumps(summary['preference_counts'], sort_keys=True)}`", "",
         f"| Instance | Judge status | Preferred factor value | {value_a} outcome | {value_b} outcome |",
         "|---|---|---|---|---|",

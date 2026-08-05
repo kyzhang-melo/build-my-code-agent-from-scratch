@@ -46,6 +46,21 @@ invalid, missing-artifact, or oversized entries. Inputs larger than
 `--max-input-chars` are marked `input_too_large`; the runner never silently
 truncates or summarizes a trajectory.
 
+If a judge response fails schema validation, the runner makes one small repair
+call containing only the invalid JSON, validation errors, and target schema. It
+does not resend or reassess the trajectories. The original and repaired
+responses remain available in the instance artifacts. Progress is printed as
+each pair starts, completes, is reused, or fails, followed by the aggregate
+stage.
+
+Judge generation currently uses provider defaults: the runner does not force a
+temperature or an output-token cap. This is recorded in the judge manifest.
+
+The A/B ordering prevents presentation-order bias; reversing `--run-a` and
+`--run-b` does not create an independent experiment or remove run-level
+confounding. Claims about a reasoning or context factor require independently
+repeated eval runs for each factor value.
+
 Judge output is marked `uncalibrated` until it has been checked against human
 labels. It describes effects observed in the supplied runs and must not be
 treated as proof of a universal or causal effect.

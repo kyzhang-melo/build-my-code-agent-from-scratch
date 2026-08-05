@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import evals.judge.core as judge_core
 from evals.judge.core import CompareConfig, run_comparison, validate_compatible_runs
 from evals.judge.models import (
     AggregateJudgment,
@@ -245,6 +246,8 @@ def test_existing_v1_manifest_is_upgraded_without_rerunning_completed_pair(
     upgraded = json.loads((output / "manifest.json").read_text())
     assert upgraded["schema_version"] == 2
     assert upgraded["aggregate_prompt_version"] == "factor-review-v2"
+    assert upgraded["repair_prompt_version"] == "schema-repair-v1"
+    assert upgraded["generation_settings"]["provider_defaults"] is True
     assert upgraded["protocol_history"] == [{
         "schema_version": 1,
         "aggregate_prompt_version": "factor-review-v1",
@@ -270,6 +273,107 @@ def test_input_too_large_skips_all_judge_calls(tmp_path: Path) -> None:
     assert calls == 0
     assert summary["status_counts"] == {"input_too_large": 1}
     assert summary["aggregate"]["status"] == "no_completed_instances"
+
+
+def test_invalid_pair_response_gets_one_small_schema_repair(
+    tmp_path: Path, capsys
+) -> None:
+    run_a = _make_run(tmp_path, run_id="low", reasoning="low")
+    run_b = _make_run(tmp_path, run_id="xhigh", reasoning="xhigh")
+    prompts: list[str] = []
+
+    async def create(prompt: str) -> str:
+        prompts.append(prompt)
+        if "Repair the structure" in prompt:
+            return _pair_json()
+        if "after experimental labels were revealed" in prompt:
+            return _aggregate_json()
+        return '{"wrong_field": true}'
+
+    config = _config(tmp_path, run_a, run_b)
+    summary = asyncio.run(run_comparison(config, create))
+
+    assert len(prompts) == 3
+    repair_prompt = prompts[1]
+    assert "wrong_field" in repair_prompt
+    assert "Fix the broken behavior" not in repair_prompt
+    result_dir = config.output_dir / "instances" / "repo__issue-1"
+    result = json.loads((result_dir / "judgment.json").read_text())
+    assert result["status"] == "completed"
+    assert result["response_repaired"] is True
+    assert (result_dir / "repair-prompt.txt").is_file()
+    assert (result_dir / "repair-response.txt").is_file()
+    assert summary["repaired_responses"] == 1
+    output = capsys.readouterr().out
+    assert "[judge] repo__issue-1 started" in output
+    assert "[judge] repo__issue-1 repaired" in output
+    assert "[judge] aggregate completed" in output
+
+
+def test_invalid_repair_remains_invalid_and_does_not_aggregate(tmp_path: Path) -> None:
+    run_a = _make_run(tmp_path, run_id="low", reasoning="low")
+    run_b = _make_run(tmp_path, run_id="xhigh", reasoning="xhigh")
+    calls = 0
+
+    async def create(_prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        return "{}"
+
+    config = _config(tmp_path, run_a, run_b)
+    summary = asyncio.run(run_comparison(config, create))
+
+    assert calls == 2
+    assert summary["status_counts"] == {"invalid_response": 1}
+    assert summary["aggregate"]["status"] == "no_completed_instances"
+
+
+def test_repair_provider_error_is_recorded_per_instance(
+    tmp_path: Path, monkeypatch
+) -> None:
+    run_a = _make_run(tmp_path, run_id="low", reasoning="low")
+    run_b = _make_run(tmp_path, run_id="xhigh", reasoning="xhigh")
+
+    async def fake_judge_call(_create, prompt: str) -> str:
+        if "Repair the structure" in prompt:
+            raise RuntimeError("repair unavailable")
+        return "{}"
+
+    monkeypatch.setattr(judge_core, "_judge_call", fake_judge_call)
+
+    async def unused_create(_prompt: str) -> str:
+        raise AssertionError("fake_judge_call owns this test")
+
+    summary = asyncio.run(run_comparison(
+        _config(tmp_path, run_a, run_b), unused_create
+    ))
+
+    assert summary["status_counts"] == {"repair_provider_error": 1}
+    assert summary["aggregate"]["status"] == "no_completed_instances"
+
+
+def test_invalid_aggregate_response_gets_one_schema_repair(tmp_path: Path) -> None:
+    run_a = _make_run(tmp_path, run_id="low", reasoning="low")
+    run_b = _make_run(tmp_path, run_id="xhigh", reasoning="xhigh")
+    aggregate_calls = 0
+
+    async def create(prompt: str) -> str:
+        nonlocal aggregate_calls
+        if "Repair the structure" in prompt:
+            assert "observed_effect" in prompt
+            return _aggregate_json()
+        if "after experimental labels were revealed" in prompt:
+            aggregate_calls += 1
+            return '{"summary": "incomplete"}'
+        return _pair_json()
+
+    config = _config(tmp_path, run_a, run_b)
+    summary = asyncio.run(run_comparison(config, create))
+
+    assert aggregate_calls == 1
+    assert summary["aggregate"]["status"] == "completed"
+    assert summary["aggregate"]["response_repaired"] is True
+    assert summary["repaired_responses"] == 1
 
 
 def test_completed_pair_is_reused_and_failed_pair_requires_flag(tmp_path: Path) -> None:

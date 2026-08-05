@@ -7,6 +7,7 @@ from .models import AggregateJudgment, PairJudgment
 
 RUBRIC_VERSION = "process-pair-v1"
 AGGREGATE_PROMPT_VERSION = "factor-review-v2"
+REPAIR_PROMPT_VERSION = "schema-repair-v1"
 
 
 def build_pair_prompt(*, problem: str, trajectory_a: str, trajectory_b: str) -> str:
@@ -71,4 +72,27 @@ Per-instance evidence:
 
 Return ONLY one JSON object matching this schema, without markdown fences or commentary:
 {schema}
+"""
+
+
+def build_repair_prompt(*, raw_response: str, validation_error: str, schema: dict) -> str:
+    rendered_schema = json.dumps(schema, ensure_ascii=False)
+    return f"""Repair the structure of an LLM judge response so it matches the required JSON schema.
+
+Make only the minimum structural corrections required by the validation errors. Preserve all
+preferences, explanations, confidence values, claims, and evidence meanings. Do not add new
+trajectory evidence or reassess the original comparison.
+
+Validation errors:
+<validation-errors>
+{validation_error}
+</validation-errors>
+
+Original response:
+<original-response>
+{raw_response}
+</original-response>
+
+Return ONLY one JSON object matching this schema, without markdown fences or commentary:
+{rendered_schema}
 """
