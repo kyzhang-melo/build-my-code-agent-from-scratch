@@ -42,6 +42,55 @@ def response_item_to_dict(item) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _usage_attr(source, name):
+    if source is None:
+        return None
+    if isinstance(source, dict):
+        return source.get(name)
+    return getattr(source, name, None)
+
+
+def extract_usage(response) -> dict:
+    """Return provider-reported usage for one response as a flat dict.
+
+    Every field is preserved verbatim or left ``None``. A missing field means
+    the provider did not report it, which is not the same as a reported zero;
+    collapsing the two would silently fabricate cache hits and free calls.
+    Nothing here is estimated -- callers that need a fallback token count must
+    compute it separately.
+    """
+    usage = _usage_attr(response, "usage")
+    # Responses API nests cache counters under ``input_tokens_details``; the
+    # Chat Completions shape uses ``prompt_tokens_details``. Accept either so
+    # the same reader works if the request style changes.
+    input_details = _usage_attr(usage, "input_tokens_details")
+    if input_details is None:
+        input_details = _usage_attr(usage, "prompt_tokens_details")
+    output_details = _usage_attr(usage, "output_tokens_details")
+    if output_details is None:
+        output_details = _usage_attr(usage, "completion_tokens_details")
+
+    def first(*names, source=usage):
+        for name in names:
+            value = _usage_attr(source, name)
+            if value is not None:
+                return value
+        return None
+
+    return {
+        "cost": first("cost"),
+        "input_tokens": first("input_tokens", "prompt_tokens"),
+        "output_tokens": first("output_tokens", "completion_tokens"),
+        "total_tokens": first("total_tokens"),
+        "cached_tokens": first("cached_tokens", source=input_details),
+        "cache_write_tokens": first("cache_write_tokens", source=input_details),
+        "reasoning_tokens": first("reasoning_tokens", source=output_details),
+        # Which upstream host actually served the call. Cache counters are
+        # uninterpretable without it: a routing change invalidates the cache.
+        "provider": _usage_attr(response, "provider"),
+    }
+
+
 def normalize_messages(messages: list[dict]) -> list[dict]:
     """Normalize history before API call.
 

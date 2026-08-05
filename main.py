@@ -20,7 +20,7 @@ from typing import Literal
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from message_utils import normalize_messages, response_item_to_dict
+from message_utils import extract_usage, normalize_messages, response_item_to_dict
 from permissions import PermissionManager, PermissionMode, PermissionService, TerminalApprovalHandler
 from prompts import GLOB_DISCOVERY_RULES, build_explore_system, build_parent_system
 from session import AgentSession, ReportStopGate, TodoStopGate, generate_session_id
@@ -506,6 +506,19 @@ async def run_one_turn(state: LoopState, session: AgentSession) -> StepOutcome |
         else len(json.dumps(input_messages, default=str)) // 4
     )
 
+    # Record what the call actually cost. This is observational only: the
+    # estimate above still drives compaction, and no estimated value is ever
+    # reported as usage.
+    emit_trace(
+        session.trace_context,
+        "llm.usage",
+        kind="turn",
+        api_call=state.api_call_count,
+        model=MODEL_ID or "",
+        configured_provider=OPENROUTER_PROVIDER or "default",
+        **extract_usage(response),
+    )
+
     output_text = getattr(response, "output_text", "") or ""
     response_output = getattr(response, "output", None) or []
 
@@ -684,6 +697,7 @@ async def agent_loop(state: LoopState, session: AgentSession) -> TurnOutcome:
             result = await compact_history_async(
                 state, source="auto", focus=None, client=client, model=MODEL_ID,
                 extra_body=PROVIDER_EXTRA_BODY, todo=session.todo,
+                trace_context=session.trace_context,
             )
             if result is not None:
                 print(
@@ -726,6 +740,7 @@ async def cmd_compact(arg: str, history: list, session: AgentSession) -> None:
     result = await compact_history_async(
         state, source="manual", focus=arg or None, client=client, model=MODEL_ID,
         extra_body=PROVIDER_EXTRA_BODY, todo=session.todo,
+        trace_context=session.trace_context,
     )
     if result is None:
         print("[compact] nothing to compact yet.")

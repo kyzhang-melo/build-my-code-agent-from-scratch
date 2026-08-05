@@ -18,8 +18,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from message_utils import normalize_messages
+from message_utils import extract_usage, normalize_messages
 from tools import TodoManager
+from trace import emit_trace
 
 TEMPLATE_PATH = Path(__file__).parent / "templates" / "compact.md"
 TRANSCRIPT_DIR = Path(__file__).parent / ".transcripts"
@@ -194,8 +195,14 @@ async def summarize_async(
     model: str,
     extra_body: dict | None = None,
     previous_summary: str | None = None,
+    trace_context=None,
 ) -> str:
-    """Async side-call for a handoff summary. No tools. Raises on empty output."""
+    """Async side-call for a handoff summary. No tools. Raises on empty output.
+
+    This is a real billed API call that replays the history being summarized,
+    so it is traced like a normal turn. Compaction fires more often as history
+    grows, which is exactly when omitting it would understate the real cost.
+    """
     api_input = normalize_messages(
         messages + [{"role": "user", "content": render_prompt(focus, previous_summary)}]
     )
@@ -205,6 +212,13 @@ async def summarize_async(
         input=api_input,
         max_output_tokens=SUMMARY_MAX_OUTPUT_TOKENS,
         extra_body=extra_body,
+    )
+    emit_trace(
+        trace_context,
+        "llm.usage",
+        kind="compaction",
+        model=model,
+        **extract_usage(response),
     )
     summary = (getattr(response, "output_text", "") or "").strip()
     if not summary:
@@ -269,6 +283,7 @@ async def compact_history_async(
     client,
     model: str,
     extra_body: dict | None = None,
+    trace_context=None,
 ) -> CompactionResult | None:
     """Summarize and start-fresh-rebuild ``state.messages``.
 
@@ -295,6 +310,7 @@ async def compact_history_async(
             model=model,
             extra_body=extra_body,
             previous_summary=previous_summary,
+            trace_context=trace_context,
         )
     except Exception as exc:  # any failure -> keep the original history
         print(f"[compact] summarization failed ({exc}); history left unchanged")

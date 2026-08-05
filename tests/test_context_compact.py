@@ -472,7 +472,10 @@ def test_handle_command_dispatch(load_module, tmp_path) -> None:
     session = main.create_parent_session(tmp_path, approval_handler=None, on_text=None)
     calls: list = []
 
-    async def fake_compact(state, *, todo, source, focus=None, client, model, extra_body=None):
+    async def fake_compact(
+        state, *, todo, source, focus=None, client, model, extra_body=None,
+        trace_context=None,
+    ):
         assert todo is session.todo
         calls.append((source, focus))
         state.messages[:] = [{"role": "user", "content": main.SUMMARY_PREFIX + "\ns"}]
@@ -523,7 +526,10 @@ def test_auto_compaction_fires_and_kill_switch(load_module, tmp_path) -> None:
     main.MODEL_ID = "nope/unknown"  # budget 20000, threshold 17000
     compact_calls: list = []
 
-    async def fake_compact(state, *, todo, source, focus=None, client, model, extra_body=None):
+    async def fake_compact(
+        state, *, todo, source, focus=None, client, model, extra_body=None,
+        trace_context=None,
+    ):
         assert todo is session.todo
         compact_calls.append(source)
         state.messages[:] = [{"role": "user", "content": main.SUMMARY_PREFIX + "\ns"}]
