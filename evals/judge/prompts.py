@@ -6,7 +6,7 @@ from .models import AggregateJudgment, PairJudgment
 
 
 RUBRIC_VERSION = "process-pair-v1"
-AGGREGATE_PROMPT_VERSION = "factor-review-v1"
+AGGREGATE_PROMPT_VERSION = "factor-review-v2"
 
 
 def build_pair_prompt(*, problem: str, trajectory_a: str, trajectory_b: str) -> str:
@@ -59,6 +59,8 @@ Factor: {factor}
 First value: {first_value}
 Second value: {second_value}
 
+Each trajectory's revealed factor value, source run, and official outcome are aligned in the
+`trajectories` object; do not reinterpret `A` or `B` as the caller's original run order.
 Use only the supplied judgments, mappings, operational metrics, and official outcomes. Describe the
 observed effect in these runs, possible process mechanisms, counterexamples, interactions, alternative
 explanations, and limitations. Do not claim a universal or causal effect. Official outcome is contextual
@@ -70,4 +72,3 @@ Per-instance evidence:
 Return ONLY one JSON object matching this schema, without markdown fences or commentary:
 {schema}
 """
-

@@ -7,7 +7,12 @@ from pathlib import Path
 import pytest
 
 from evals.judge.core import CompareConfig, run_comparison, validate_compatible_runs
-from evals.judge.models import AggregateJudgment, DimensionJudgment, PairJudgment
+from evals.judge.models import (
+    AggregateJudgment,
+    DimensionJudgment,
+    EvidenceRef,
+    PairJudgment,
+)
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -149,6 +154,17 @@ def test_validate_reasoning_and_context_pairs() -> None:
         validate_compatible_runs(low, _manifest(run_id="warm-x", reasoning="xhigh", warm=True), "context")
 
 
+@pytest.mark.parametrize("ref", ["A:L10", "B:L10-L18", "A:T10", "B:T10-T18", "A:T10-18"])
+def test_evidence_reference_accepts_log_and_trace_ranges(ref: str) -> None:
+    assert EvidenceRef(ref=ref, claim="Evidence.").ref == ref
+
+
+@pytest.mark.parametrize("ref", ["A:L", "A:T1-L2", "C:T1", "A:T1-"])
+def test_evidence_reference_rejects_invalid_ranges(ref: str) -> None:
+    with pytest.raises(ValueError):
+        EvidenceRef(ref=ref, claim="Evidence.")
+
+
 def test_compare_blinds_inputs_and_reveals_outcomes_afterward(tmp_path: Path) -> None:
     run_a = _make_run(tmp_path, run_id="secret-low-run", reasoning=None)
     run_b = _make_run(tmp_path, run_id="secret-xhigh-run", reasoning="xhigh")
@@ -170,10 +186,72 @@ def test_compare_blinds_inputs_and_reveals_outcomes_afterward(tmp_path: Path) ->
     assert "reasoning_tokens" not in blind_prompt
     assert "<WORKSPACE>" in blind_prompt
     assert "T1:" in blind_prompt
-    assert summary["instances"][0]["run_a_outcome"]["official_status"] == "unresolved"
-    assert summary["instances"][0]["run_b_outcome"]["official_status"] == "resolved"
+    row = summary["instances"][0]
+    assert row["outcomes_by_factor_value"]["default"]["official_status"] == "unresolved"
+    assert row["outcomes_by_factor_value"]["xhigh"]["official_status"] == "resolved"
+    for side in ("A", "B"):
+        factor_value = row["trajectories"][side]["factor_value"]
+        assert (
+            row["trajectories"][side]["outcome"]
+            == row["outcomes_by_factor_value"][factor_value]
+        )
+    aggregate_prompt = prompts[1]
+    assert '"run_a_outcome"' not in aggregate_prompt
+    assert '"run_b_outcome"' not in aggregate_prompt
+    assert '"trajectories"' in aggregate_prompt
     assert summary["aggregate"]["status"] == "completed"
     assert (tmp_path / "judge-1" / "summary.md").is_file()
+
+
+def test_existing_v1_manifest_is_upgraded_without_rerunning_completed_pair(
+    tmp_path: Path,
+) -> None:
+    run_a = _make_run(tmp_path, run_id="low", reasoning=None)
+    run_b = _make_run(tmp_path, run_id="xhigh", reasoning="xhigh")
+    config = _config(tmp_path, run_a, run_b)
+    output = config.output_dir
+    _write_json(output / "manifest.json", {
+        "schema_version": 1,
+        "factor": "reasoning",
+        "run_a": str(run_a),
+        "run_b": str(run_b),
+        "judge_model": "independent/judge",
+        "judge_provider": "judge-provider",
+        "seed": 0,
+        "max_input_chars": 400_000,
+        "rubric_version": "process-pair-v1",
+        "aggregate_prompt_version": "factor-review-v1",
+    })
+    result_path = output / "instances" / "repo__issue-1" / "judgment.json"
+    _write_json(result_path, {
+        "schema_version": 1,
+        "instance_id": "repo__issue-1",
+        "status": "completed",
+        "mapping": {
+            "A": {"run": "low", "factor_value": "default"},
+            "B": {"run": "xhigh", "factor_value": "xhigh"},
+        },
+        "judgment": json.loads(_pair_json()),
+    })
+    calls: list[str] = []
+
+    async def create(prompt: str) -> str:
+        calls.append(prompt)
+        return _aggregate_json()
+
+    summary = asyncio.run(run_comparison(config, create))
+
+    assert len(calls) == 1
+    upgraded = json.loads((output / "manifest.json").read_text())
+    assert upgraded["schema_version"] == 2
+    assert upgraded["aggregate_prompt_version"] == "factor-review-v2"
+    assert upgraded["protocol_history"] == [{
+        "schema_version": 1,
+        "aggregate_prompt_version": "factor-review-v1",
+    }]
+    row = summary["instances"][0]
+    assert row["trajectories"]["A"]["outcome"]["official_status"] == "unresolved"
+    assert row["trajectories"]["B"]["outcome"]["official_status"] == "resolved"
 
 
 def test_input_too_large_skips_all_judge_calls(tmp_path: Path) -> None:

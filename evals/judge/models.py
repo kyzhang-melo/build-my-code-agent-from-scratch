@@ -11,7 +11,7 @@ Preference = Literal["A", "B", "equivalent", "unclear"]
 class EvidenceRef(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    ref: str = Field(pattern=r"^[AB]:(?:L\d+(?:-L?\d+)?|T\d+)$")
+    ref: str = Field(pattern=r"^[AB]:(?:L\d+(?:-L?\d+)?|T\d+(?:-T?\d+)?)$")
     claim: str
 
 

@@ -23,6 +23,7 @@ from .prompts import (
 
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 ResponseCreate = Callable[[str], Awaitable[str]]
+JUDGE_ARTIFACT_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -274,7 +275,7 @@ async def run_comparison(
         )
 
     judge_manifest = {
-        "schema_version": 1,
+        "schema_version": JUDGE_ARTIFACT_SCHEMA_VERSION,
         "judge_run_id": config.judge_run_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "factor": config.factor,
@@ -290,6 +291,11 @@ async def run_comparison(
         "concurrency": config.concurrency,
         "rubric_version": RUBRIC_VERSION,
         "aggregate_prompt_version": AGGREGATE_PROMPT_VERSION,
+        "generation_settings": {
+            "provider_defaults": True,
+            "max_output_tokens": None,
+            "temperature": None,
+        },
         "calibration_status": "uncalibrated",
     }
     manifest_path = config.output_dir / "manifest.json"
@@ -299,7 +305,7 @@ async def run_comparison(
             raise ValueError("judge manifest must contain a JSON object")
         comparison_keys = (
             "factor", "run_a", "run_b", "judge_model", "judge_provider", "seed",
-            "max_input_chars", "rubric_version", "aggregate_prompt_version",
+            "max_input_chars", "rubric_version",
         )
         conflicts = [
             key for key in comparison_keys
@@ -307,6 +313,33 @@ async def run_comparison(
         ]
         if conflicts:
             raise ValueError(f"judge manifest conflicts in: {', '.join(conflicts)}")
+        previous_aggregate_version = existing.get("aggregate_prompt_version")
+        if previous_aggregate_version not in {
+            "factor-review-v1", AGGREGATE_PROMPT_VERSION,
+        }:
+            raise ValueError(
+                "judge manifest has unsupported aggregate_prompt_version: "
+                f"{previous_aggregate_version!r}"
+            )
+        if (
+            existing.get("schema_version") != JUDGE_ARTIFACT_SCHEMA_VERSION
+            or previous_aggregate_version != AGGREGATE_PROMPT_VERSION
+            or "generation_settings" not in existing
+        ):
+            history = list(existing.get("protocol_history", []))
+            if previous_aggregate_version != AGGREGATE_PROMPT_VERSION:
+                history.append({
+                    "schema_version": existing.get("schema_version", 1),
+                    "aggregate_prompt_version": previous_aggregate_version,
+                })
+            existing.update({
+                "schema_version": JUDGE_ARTIFACT_SCHEMA_VERSION,
+                "aggregate_prompt_version": AGGREGATE_PROMPT_VERSION,
+                "generation_settings": judge_manifest["generation_settings"],
+                "protocol_history": history,
+                "protocol_updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+            atomic_write_json(manifest_path, existing)
     else:
         atomic_write_json(manifest_path, judge_manifest)
 
@@ -325,8 +358,16 @@ async def run_comparison(
         source_a = config.run_a if a_first else config.run_b
         source_b = config.run_b if a_first else config.run_a
         mapping = {
-            "A": {"run": source_a.name, "factor_value": value_a if a_first else value_b},
-            "B": {"run": source_b.name, "factor_value": value_b if a_first else value_a},
+            "A": {
+                "source": "run_a" if a_first else "run_b",
+                "run": manifest_a["run_id"] if a_first else manifest_b["run_id"],
+                "factor_value": value_a if a_first else value_b,
+            },
+            "B": {
+                "source": "run_b" if a_first else "run_a",
+                "run": manifest_b["run_id"] if a_first else manifest_a["run_id"],
+                "factor_value": value_b if a_first else value_a,
+            },
         }
         try:
             trajectory_a, meta_a = _trajectory(source_a, instance_id, "A")
@@ -338,7 +379,8 @@ async def run_comparison(
             (target_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
             if len(prompt) > config.max_input_chars:
                 record = {
-                    "schema_version": 1, "instance_id": instance_id,
+                    "schema_version": JUDGE_ARTIFACT_SCHEMA_VERSION,
+                    "instance_id": instance_id,
                     "status": "input_too_large", "input_chars": len(prompt),
                     "mapping": mapping, "attempts": {"A": meta_a["attempt"], "B": meta_b["attempt"]},
                 }
@@ -346,7 +388,8 @@ async def run_comparison(
                 return record
         except (FileNotFoundError, json.JSONDecodeError, ValueError) as exc:
             record = {
-                "schema_version": 1, "instance_id": instance_id,
+                "schema_version": JUDGE_ARTIFACT_SCHEMA_VERSION,
+                "instance_id": instance_id,
                 "status": "missing_or_invalid_artifact", "mapping": mapping,
                 "error_type": type(exc).__name__, "error": str(exc),
             }
@@ -358,7 +401,8 @@ async def run_comparison(
             (target_dir / "raw-response.txt").write_text(raw, encoding="utf-8")
         except Exception as exc:  # noqa: BLE001 - provider boundary
             record = {
-                "schema_version": 1, "instance_id": instance_id,
+                "schema_version": JUDGE_ARTIFACT_SCHEMA_VERSION,
+                "instance_id": instance_id,
                 "status": "provider_error", "mapping": mapping,
                 "error_type": type(exc).__name__, "error": str(exc),
             }
@@ -367,14 +411,16 @@ async def run_comparison(
         try:
             judgment = _parse_pair(raw)
             record = {
-                "schema_version": 1, "instance_id": instance_id, "status": "completed",
+                "schema_version": JUDGE_ARTIFACT_SCHEMA_VERSION,
+                "instance_id": instance_id, "status": "completed",
                 "input_chars": len(prompt), "mapping": mapping,
                 "attempts": {"A": meta_a["attempt"], "B": meta_b["attempt"]},
                 "judgment": judgment.model_dump(),
             }
         except ValidationError as exc:
             record = {
-                "schema_version": 1, "instance_id": instance_id,
+                "schema_version": JUDGE_ARTIFACT_SCHEMA_VERSION,
+                "instance_id": instance_id,
                 "status": "invalid_response", "mapping": mapping,
                 "error_type": type(exc).__name__, "error": str(exc),
             }
@@ -394,12 +440,36 @@ async def run_comparison(
                 if preference in {"A", "B"} else preference
             )
             preference_counts[preferred_value] += 1
+            mapping = record["mapping"]
+            source_outcomes = {
+                "run_a": _official_row(summary_a, instance_id),
+                "run_b": _official_row(summary_b, instance_id),
+            }
+            legacy_source_by_run = {
+                str(manifest_a["run_id"]): "run_a",
+                str(manifest_b["run_id"]): "run_b",
+            }
+            trajectories = {
+                side: {
+                    **mapping[side],
+                    "source": mapping[side].get("source")
+                    or legacy_source_by_run[mapping[side]["run"]],
+                    "outcome": source_outcomes[
+                        mapping[side].get("source")
+                        or legacy_source_by_run[mapping[side]["run"]]
+                    ],
+                }
+                for side in ("A", "B")
+            }
+            outcomes_by_factor_value = {
+                details["factor_value"]: details["outcome"]
+                for details in trajectories.values()
+            }
             row.update({
-                "mapping": record["mapping"],
+                "trajectories": trajectories,
+                "outcomes_by_factor_value": outcomes_by_factor_value,
                 "blind_judgment": record["judgment"],
                 "preferred_factor_value": preferred_value,
-                "run_a_outcome": _official_row(summary_a, instance_id),
-                "run_b_outcome": _official_row(summary_b, instance_id),
             })
         revealed_rows.append(row)
 
@@ -426,7 +496,7 @@ async def run_comparison(
     atomic_write_json(aggregate_dir / "judgment.json", aggregate_record)
 
     summary = {
-        "schema_version": 1,
+        "schema_version": JUDGE_ARTIFACT_SCHEMA_VERSION,
         "judge_run_id": config.judge_run_id,
         "factor": config.factor,
         "first_value": value_a,
@@ -444,15 +514,15 @@ async def run_comparison(
         f"- Judge: `{config.judge_model}`", "- Calibration: **uncalibrated**", 
         f"- Statuses: `{json.dumps(summary['status_counts'], sort_keys=True)}`",
         f"- Process preferences: `{json.dumps(summary['preference_counts'], sort_keys=True)}`", "",
-        "| Instance | Judge status | Preferred factor value | Run A outcome | Run B outcome |",
+        f"| Instance | Judge status | Preferred factor value | {value_a} outcome | {value_b} outcome |",
         "|---|---|---|---|---|",
     ]
     for row in revealed_rows:
         lines.append(
             f"| {row['instance_id']} | {row['status']} | "
             f"{row.get('preferred_factor_value', '-')} | "
-            f"{row.get('run_a_outcome', {}).get('official_status', '-')} | "
-            f"{row.get('run_b_outcome', {}).get('official_status', '-')} |"
+            f"{row.get('outcomes_by_factor_value', {}).get(value_a, {}).get('official_status', '-')} | "
+            f"{row.get('outcomes_by_factor_value', {}).get(value_b, {}).get('official_status', '-')} |"
         )
     if aggregate_record.get("status") == "completed":
         lines.extend(["", "## Aggregate review", "", aggregate_record["judgment"]["summary"]])
