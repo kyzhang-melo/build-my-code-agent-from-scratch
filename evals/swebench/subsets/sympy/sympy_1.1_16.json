@@ -1,0 +1,26 @@
+{
+  "dataset": "SWE-bench/SWE-bench_Verified",
+  "split": "test",
+  "selection": "Chronological sympy/sympy sequence; sympy 1.1 instances only; curated without exposing gold patches.",
+  "sequence_id": "sympy-1.1-16",
+  "repo": "sympy/sympy",
+  "subsystem": "sympy",
+  "instance_ids": [
+    "sympy__sympy-13031",
+    "sympy__sympy-13091",
+    "sympy__sympy-13372",
+    "sympy__sympy-13480",
+    "sympy__sympy-13551",
+    "sympy__sympy-13615",
+    "sympy__sympy-13647",
+    "sympy__sympy-13757",
+    "sympy__sympy-13798",
+    "sympy__sympy-13852",
+    "sympy__sympy-13878",
+    "sympy__sympy-13974",
+    "sympy__sympy-13877",
+    "sympy__sympy-14248",
+    "sympy__sympy-14531",
+    "sympy__sympy-14711"
+  ]
+}

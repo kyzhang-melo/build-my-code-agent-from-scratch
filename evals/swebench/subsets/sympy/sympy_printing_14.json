@@ -1,0 +1,24 @@
+{
+  "dataset": "SWE-bench/SWE-bench_Verified",
+  "split": "test",
+  "selection": "Chronological sympy/sympy sequence concentrated in sympy/printing; curated without exposing gold patches.",
+  "sequence_id": "sympy-printing-14",
+  "repo": "sympy/sympy",
+  "subsystem": "sympy/printing",
+  "instance_ids": [
+    "sympy__sympy-13798",
+    "sympy__sympy-14248",
+    "sympy__sympy-14531",
+    "sympy__sympy-14976",
+    "sympy__sympy-15345",
+    "sympy__sympy-15976",
+    "sympy__sympy-16597",
+    "sympy__sympy-16766",
+    "sympy__sympy-18763",
+    "sympy__sympy-19346",
+    "sympy__sympy-20916",
+    "sympy__sympy-21612",
+    "sympy__sympy-22080",
+    "sympy__sympy-22914"
+  ]
+}

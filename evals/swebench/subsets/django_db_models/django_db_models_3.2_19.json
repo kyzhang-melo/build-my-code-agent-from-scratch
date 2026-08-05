@@ -1,0 +1,29 @@
+{
+  "dataset": "SWE-bench/SWE-bench_Verified",
+  "split": "test",
+  "selection": "Chronological django/django sequence concentrated in django/db/models; Django 3.2 instances only; curated without exposing gold patches.",
+  "sequence_id": "django-db-models-3.2-19",
+  "repo": "django/django",
+  "subsystem": "django/db/models",
+  "instance_ids": [
+    "django__django-12965",
+    "django__django-13012",
+    "django__django-13023",
+    "django__django-13028",
+    "django__django-13033",
+    "django__django-13109",
+    "django__django-13112",
+    "django__django-13121",
+    "django__django-13128",
+    "django__django-13158",
+    "django__django-13346",
+    "django__django-13363",
+    "django__django-13343",
+    "django__django-13401",
+    "django__django-13406",
+    "django__django-13417",
+    "django__django-13449",
+    "django__django-13569",
+    "django__django-13590"
+  ]
+}

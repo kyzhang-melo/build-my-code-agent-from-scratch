@@ -1,0 +1,24 @@
+{
+  "dataset": "SWE-bench/SWE-bench_Verified",
+  "split": "test",
+  "selection": "Chronological sympy/sympy sequence concentrated in sympy/core; curated without exposing gold patches.",
+  "sequence_id": "sympy-core-14",
+  "repo": "sympy/sympy",
+  "subsystem": "sympy/core",
+  "instance_ids": [
+    "sympy__sympy-12096",
+    "sympy__sympy-13091",
+    "sympy__sympy-13372",
+    "sympy__sympy-15599",
+    "sympy__sympy-15875",
+    "sympy__sympy-16597",
+    "sympy__sympy-18211",
+    "sympy__sympy-19637",
+    "sympy__sympy-20590",
+    "sympy__sympy-20438",
+    "sympy__sympy-20801",
+    "sympy__sympy-21379",
+    "sympy__sympy-23534",
+    "sympy__sympy-24562"
+  ]
+}

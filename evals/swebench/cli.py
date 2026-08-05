@@ -140,6 +140,12 @@ async def cmd_generate(args: argparse.Namespace) -> int:
             f"[{result.agent_status}] {task.instance_id} "
             f"patch={result.patch_status} api_calls={result.api_calls}"
         )
+        if result.agent_status == "error":
+            print(
+                f"[abort] {task.instance_id} failed with error: {result.error}\n"
+                "[abort] Stopping eval. Inspect the error and re-run when ready."
+            )
+            break
     return 0
 
 

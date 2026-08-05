@@ -1,0 +1,19 @@
+{
+  "dataset": "SWE-bench/SWE-bench_Verified",
+  "split": "test",
+  "selection": "Chronological django/django sequence concentrated in django/db/models; Django 4.2 instances only; curated without exposing gold patches.",
+  "sequence_id": "django-db-models-4.2-9",
+  "repo": "django/django",
+  "subsystem": "django/db/models",
+  "instance_ids": [
+    "django__django-15731",
+    "django__django-15814",
+    "django__django-15930",
+    "django__django-15957",
+    "django__django-16032",
+    "django__django-16082",
+    "django__django-16256",
+    "django__django-16263",
+    "django__django-16315"
+  ]
+}
