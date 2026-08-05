@@ -59,7 +59,6 @@ async def cmd_compare(args: argparse.Namespace) -> int:
         response = await client.responses.create(
             model=model,
             input=[{"role": "user", "content": prompt}],
-            max_output_tokens=4000,
             extra_body=extra_body,
         )
         return getattr(response, "output_text", "") or ""
