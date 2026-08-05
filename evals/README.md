@@ -127,7 +127,9 @@ Trace sink failures are isolated and never change tool or permission behavior.
 ## Notes / limitations (by design)
 
 - Single run per scenario (no `pass@k` / multi-trial metrics yet).
-- No LLM-as-judge; assertions are deterministic (files, tool trajectory, text).
+- Scenario assertions are deterministic (files, tool trajectory, text). The
+  optional `evals/judge/` runner performs separate, post-eval trajectory review
+  and never replaces official correctness results.
 - No external-codebase / Docker layer. These can be added as the project
   matures.
 
