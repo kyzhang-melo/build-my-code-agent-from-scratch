@@ -7,7 +7,7 @@ import json
 import os
 import re
 import shlex
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -182,10 +182,10 @@ class TerminalApprovalHandler:
         self,
         *,
         interactive: bool,
-        input_fn: Callable[[str], str] = input,
+        prompt_fn: Callable[[str], Awaitable[str]] | None = None,
     ) -> None:
         self.interactive = interactive
-        self._input_fn = input_fn
+        self._prompt_fn = prompt_fn
         self._lock = asyncio.Lock()
 
     async def request(self, request: ApprovalRequest) -> ApprovalResponse:
@@ -193,6 +193,11 @@ class TerminalApprovalHandler:
             return ApprovalResponse(
                 "reject",
                 "Interactive approval is unavailable in headless mode.",
+            )
+        if self._prompt_fn is None:
+            return ApprovalResponse(
+                "reject",
+                "Interactive approval prompt is not configured.",
             )
 
         options = "[y]es / [n]o"
@@ -203,7 +208,7 @@ class TerminalApprovalHandler:
         async with self._lock:
             for _ in range(3):
                 try:
-                    answer = (await asyncio.to_thread(self._input_fn, prompt)).strip()
+                    answer = (await self._prompt_fn(prompt)).strip()
                 except (EOFError, KeyboardInterrupt, asyncio.CancelledError):
                     return ApprovalResponse("reject", "Approval was cancelled.")
 

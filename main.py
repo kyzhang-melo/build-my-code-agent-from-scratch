@@ -20,6 +20,8 @@ from typing import Literal
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
+from prompt_toolkit.formatted_text import FormattedText
+from prompt_toolkit.styles import Style
 from message_utils import extract_usage, normalize_messages, response_item_to_dict
 from permissions import PermissionManager, PermissionMode, PermissionService, TerminalApprovalHandler
 from prompts import GLOB_DISCOVERY_RULES, build_explore_system, build_parent_system
@@ -43,6 +45,7 @@ from tools import (
     execute_tool_calls_async,
     select_tool_schemas,
 )
+from terminal_input import TerminalInput
 from trace import TraceContext, emit_trace
 from workspace import Workspace
 from context_compact import (
@@ -105,7 +108,8 @@ SUMMARY_CONTINUATION_PROMPT = (
 )
 MAX_API_CALLS_PER_USER_TURN = 30
 MAX_SUBAGENT_API_CALLS = 30
-INPUT_PROMPT = "\001\033[36m\002s01 >> \001\033[0m\002"
+INPUT_PROMPT = FormattedText([("class:input-prompt", "s01 >> ")])
+INPUT_STYLE = Style.from_dict({"input-prompt": "ansicyan"})
 
 # --- Context compaction config ---
 # Per-model context windows, resolved by PREFIX match against a normalized
@@ -138,6 +142,12 @@ COMPACT_TRIGGER_RATIO = 0.85
 # On by default; AUTO_COMPACT=0 disables automatic compaction (manual /compact
 # still works). The destructive rewrite is backed by a .transcripts/ snapshot.
 AUTO_COMPACT_ENABLED = os.getenv("AUTO_COMPACT", "1") != "0"
+
+
+def create_terminal_input() -> TerminalInput:
+    """Create one terminal input owner for a CLI run."""
+    return TerminalInput(style=INPUT_STYLE)
+
 
 def normalize_model_id(model_id: str) -> str:
     """vendor/model:route -> model  (moonshotai/kimi-k2.5:exacto -> kimi-k2.5)."""
@@ -1005,10 +1015,15 @@ async def repl(
             return
         session_id = store.session_id
 
+    terminal_input = create_terminal_input()
+
     history = list(resumed_history)
     session = create_parent_session(
         cwd,
-        approval_handler=TerminalApprovalHandler(interactive=sys.stdin.isatty()),
+        approval_handler=TerminalApprovalHandler(
+            interactive=sys.stdin.isatty(),
+            prompt_fn=terminal_input.prompt,
+        ),
         session_id=session_id,
         store=store,
         session_dir=sessions_dir,
@@ -1054,7 +1069,7 @@ async def repl(
     try:
         while True:
             try:
-                query = input(INPUT_PROMPT)
+                query = await terminal_input.prompt(INPUT_PROMPT)
                 print(f"[debug] query: {query!r}")
             except EOFError:
                 end_reason = "eof"
@@ -1084,7 +1099,8 @@ async def repl(
 
             state = LoopState(history)
             try:
-                outcome = await agent_loop(state, session)
+                with terminal_input.processing():
+                    outcome = await agent_loop(state, session)
             except KeyboardInterrupt:
                 end_reason = "interrupt"
                 history[:] = copy.deepcopy(committed_history)
@@ -1113,6 +1129,7 @@ async def repl(
         end_reason = "interrupt"
         history[:] = copy.deepcopy(committed_history)
     finally:
+        await terminal_input.close()
         store.sync(committed_history)
         store.sync_todo(committed_todo)
         emit_trace(

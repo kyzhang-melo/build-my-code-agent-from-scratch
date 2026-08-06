@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
-import threading
 import types
 from pathlib import Path
 
@@ -205,16 +204,6 @@ def test_headless_ask_is_denied(load_module) -> None:
 
 def test_terminal_handler_does_not_block_event_loop(load_module) -> None:
     permissions = permission_module
-    release = threading.Event()
-
-    def blocking_input(_prompt: str) -> str:
-        release.wait(timeout=1)
-        return "y"
-
-    handler = permissions.TerminalApprovalHandler(
-        interactive=True,
-        input_fn=blocking_input,
-    )
     request = permissions.ApprovalRequest(
         tool_name="bash",
         action="bash:echo hi",
@@ -223,6 +212,16 @@ def test_terminal_handler_does_not_block_event_loop(load_module) -> None:
     )
 
     async def scenario():
+        release = asyncio.Event()
+
+        async def delayed_prompt(_prompt: str) -> str:
+            await release.wait()
+            return "y"
+
+        handler = permissions.TerminalApprovalHandler(
+            interactive=True,
+            prompt_fn=delayed_prompt,
+        )
         task = asyncio.create_task(handler.request(request))
         await asyncio.sleep(0.01)
         assert not task.done()
@@ -232,6 +231,74 @@ def test_terminal_handler_does_not_block_event_loop(load_module) -> None:
     response = asyncio.run(scenario())
 
     assert response.kind == "approve"
+
+
+@pytest.mark.parametrize(
+    ("answers", "expected_kind"),
+    [
+        (["y"], "approve"),
+        (["n"], "reject"),
+        (["a"], "approve_for_session"),
+        (["invalid", "still invalid", "nope"], "reject"),
+    ],
+)
+def test_terminal_handler_async_prompt_choices(answers, expected_kind) -> None:
+    iterator = iter(answers)
+
+    async def prompt(_message: str) -> str:
+        return next(iterator)
+
+    handler = permission_module.TerminalApprovalHandler(
+        interactive=True,
+        prompt_fn=prompt,
+    )
+    request = permission_module.ApprovalRequest(
+        tool_name="write_file",
+        action="write:/tmp/x",
+        description="write x",
+        allow_for_session=True,
+    )
+
+    response = asyncio.run(handler.request(request))
+
+    assert response.kind == expected_kind
+
+
+@pytest.mark.parametrize("error", [EOFError(), KeyboardInterrupt(), asyncio.CancelledError()])
+def test_terminal_handler_async_prompt_cancellation(error) -> None:
+    async def cancelled_prompt(_message: str) -> str:
+        raise error
+
+    handler = permission_module.TerminalApprovalHandler(
+        interactive=True,
+        prompt_fn=cancelled_prompt,
+    )
+    request = permission_module.ApprovalRequest(
+        tool_name="bash",
+        action="bash:echo hi",
+        description="echo hi",
+        allow_for_session=False,
+    )
+
+    response = asyncio.run(handler.request(request))
+
+    assert response.kind == "reject"
+    assert "cancelled" in response.feedback.lower()
+
+
+def test_terminal_handler_without_prompt_provider_fails_closed() -> None:
+    handler = permission_module.TerminalApprovalHandler(interactive=True)
+    request = permission_module.ApprovalRequest(
+        tool_name="bash",
+        action="bash:echo hi",
+        description="echo hi",
+        allow_for_session=False,
+    )
+
+    response = asyncio.run(handler.request(request))
+
+    assert response.kind == "reject"
+    assert "not configured" in response.feedback.lower()
 
 
 def test_permission_denial_short_circuits_tool_execution(load_module, workspace) -> None:

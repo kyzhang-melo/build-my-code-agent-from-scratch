@@ -4,14 +4,39 @@ import asyncio
 import json
 import sys
 import types
+from contextlib import nullcontext
 
 import pytest
 
 
-def test_input_prompt_marks_ansi_sequences_as_nonprinting(load_module) -> None:
+def test_input_prompt_uses_formatted_text_without_raw_control_bytes(load_module) -> None:
     main_module = load_module("main", "main.py")
 
-    assert main_module.INPUT_PROMPT == "\001\033[36m\002s01 >> \001\033[0m\002"
+    fragments = list(main_module.INPUT_PROMPT)
+    assert fragments == [("class:input-prompt", "s01 >> ")]
+    rendered_text = "".join(text for _, text in fragments)
+    assert "\x01" not in rendered_text
+    assert "\x02" not in rendered_text
+    assert "\x1b" not in rendered_text
+
+
+def test_prompt_toolkit_session_accepts_mixed_unicode_input(load_module) -> None:
+    main_module = load_module("main_prompt_toolkit", "main.py")
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    async def scenario() -> str:
+        with create_pipe_input() as pipe_input:
+            session = PromptSession(
+                input=pipe_input,
+                output=DummyOutput(),
+                multiline=False,
+            )
+            pipe_input.send_text("hello中文world\n")
+            return await session.prompt_async(main_module.INPUT_PROMPT)
+
+    assert _run(scenario()) == "hello中文world"
 
 
 def test_permission_mode_commands(load_module, capsys, tmp_path) -> None:
@@ -33,6 +58,29 @@ def _todo_params(items: list[dict]):
 
 def _run(awaitable):
     return asyncio.run(awaitable)
+
+
+def _set_prompt_inputs(monkeypatch, main_module, *values) -> None:
+    iterator = iter(values)
+
+    class ScriptedTerminalInput:
+        async def prompt(self, _message):
+            value = next(iterator)
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        def processing(self):
+            return nullcontext()
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(
+        main_module,
+        "create_terminal_input",
+        ScriptedTerminalInput,
+    )
 
 
 def _parent(main_module, tmp_path, on_text=None):
@@ -983,7 +1031,7 @@ def test_repl_discards_interrupted_turn_and_todo_mutation(
 ) -> None:
     main_module = load_module("main", "main.py")
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("builtins.input", lambda _prompt: "do work")
+    _set_prompt_inputs(monkeypatch, main_module, "do work")
 
     async def interrupted_loop(state, session):
         state.messages.append({
@@ -1058,12 +1106,13 @@ def test_sessions_command_uses_configured_external_directory(
     assert str(sessions_dir) in output
 
 
-def test_repl_no_session_does_not_claim_it_saved(
-    load_module, monkeypatch, tmp_path, capsys,
+@pytest.mark.parametrize("query", ["exit", ""])
+def test_repl_no_session_exit_does_not_claim_it_saved(
+    load_module, monkeypatch, tmp_path, capsys, query,
 ) -> None:
     main_module = load_module("main", "main.py")
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("builtins.input", lambda _prompt: "exit")
+    _set_prompt_inputs(monkeypatch, main_module, query)
 
     sessions_dir = tmp_path / "session-data"
     _run(main_module.repl(no_session=True, session_dir=sessions_dir))
@@ -1073,6 +1122,20 @@ def test_repl_no_session_does_not_claim_it_saved(
     assert "[session] saved" not in output
     assert not (tmp_path / ".sessions").exists()
     assert not sessions_dir.exists()
+
+
+@pytest.mark.parametrize("error", [EOFError(), KeyboardInterrupt()])
+def test_repl_handles_prompt_termination(
+    load_module, monkeypatch, tmp_path, capsys, error,
+) -> None:
+    main_module = load_module("main_prompt_termination", "main.py")
+    monkeypatch.chdir(tmp_path)
+    _set_prompt_inputs(monkeypatch, main_module, error)
+
+    _run(main_module.repl(no_session=True, session_dir=tmp_path / "session-data"))
+
+    output = capsys.readouterr().out
+    assert "[session] saved" not in output
 
 
 def test_repl_prints_complete_resume_sanitization_diagnostics(
@@ -1119,7 +1182,7 @@ def test_repl_prints_complete_resume_sanitization_diagnostics(
     with store.path.open("a", encoding="utf-8") as handle:
         handle.write("{invalid-json}\n")
 
-    monkeypatch.setattr("builtins.input", lambda _prompt: "exit")
+    _set_prompt_inputs(monkeypatch, main_module, "exit")
     _run(main_module.repl(resume=str(store.path)))
 
     output = capsys.readouterr().out
@@ -1150,7 +1213,7 @@ def test_repl_warns_and_clears_invalid_restored_todo_state(
         "status": "not-a-valid-status",
     }])
 
-    monkeypatch.setattr("builtins.input", lambda _prompt: "exit")
+    _set_prompt_inputs(monkeypatch, main_module, "exit")
     _run(main_module.repl(resume=str(store.path)))
 
     output = capsys.readouterr().out

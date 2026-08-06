@@ -20,6 +20,7 @@ venv/
 .ruff_cache/
 
 # Local agent configuration
+.chat/
 .claude/settings.local.json
 .devin/config.local.json
 

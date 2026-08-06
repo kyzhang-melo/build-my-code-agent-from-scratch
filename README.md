@@ -21,6 +21,7 @@ A learning project that refactors a monolithic code-agent loop into a multi-file
 
 - Python 3.10+
 - `openai`
+- `prompt-toolkit==3.0.52`
 - `python-dotenv`
 - `pytest`
 
@@ -29,7 +30,7 @@ Install dependencies (example):
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install openai python-dotenv
+pip install openai "prompt-toolkit==3.0.52" python-dotenv
 ```
 
 Or install from file:

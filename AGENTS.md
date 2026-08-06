@@ -81,7 +81,7 @@ Keep changes simple and educational.
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install openai python-dotenv
+pip install openai "prompt-toolkit==3.0.52" python-dotenv
 python main.py
 ```
 
