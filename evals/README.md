@@ -1,15 +1,43 @@
-# Mini-Fixture Evals
+# Eval System
 
-Behavioral evaluations that run the **real parent agent** against small,
-self-contained scenarios and check what it actually did. They complement the
-`tests/` suite: `tests/` verify component correctness (no LLM), while these
-verify end-to-end agent *behavior* (with a live model).
+The eval system complements the deterministic `tests/` suite with manually
+invoked behavioral experiments. It covers small fixture scenarios, focused
+harness experiments, cold and warm-context SWE-bench runs, artifact analysis,
+and post-eval process review.
 
-Because each run calls a real model, these evals cost tokens and are
-non-deterministic. The runner is a standalone script and is **not** collected by
-pytest, so a normal `pytest` run never triggers it.
+Official SWE-bench grading is the outcome signal. The optional LLM judge
+reviews how two agents worked and must not replace correctness grading. Live
+model runs cost tokens and are non-deterministic; none are collected by pytest.
 
-## Layout
+## Evaluation layers
+
+- `run_evals.py` and `scenarios/`: small end-to-end behavioral fixtures with
+  trace-backed assertions.
+- `micro/`: deterministic decision-point checks and paired live-model harness
+  experiments.
+- `swebench/`: cold SWE-bench runs with an independent session per instance.
+- `swebench_sequence/`: chronological warm-context runs that preserve session
+  history while resetting the repository for every instance.
+- `analyze/`: diagnostic reporting over completed SWE-bench artifacts.
+- `judge/`: blind, process-based comparison of two compatible eval runs.
+
+A typical larger experiment is:
+
+```text
+cold or warm-context generation
+              |
+              +--> official SWE-bench outcome grading
+              |
+              +--> optional process-based LLM judge
+```
+
+Use the focused guides for
+[`swebench/`](swebench/README.md),
+[`swebench_sequence/`](swebench_sequence/README.md), and
+[`judge/`](judge/README.md). The rest of this document describes the
+mini-fixture runner and micro evals.
+
+## Mini-fixture layout
 
 ```
 evals/
@@ -56,10 +84,11 @@ For each scenario the runner:
 
 1. Creates a fresh workspace under `evals/.runs/<timestamp>/<name>/workspace`
    and copies in `template/` (if present).
-2. Points the tools' `WORKDIR` at that workspace, resets the shared `todo`
-   state, and installs a scenario-scoped permission service with an
-   **auto-approve** handler (so writes/shell run headlessly). Hard denials in
-   the permission layer still apply.
+2. Creates a fresh `AgentSession` whose workspace, todo manager, tool registry,
+   permission service, trace context, stop gate, and null session store are all
+   scoped to that scenario. Its permission service uses an **auto-approve**
+   handler so writes and shell commands run headlessly; hard denials still
+   apply.
 3. Runs the parent agent loop in-process on the scenario `prompt`.
 4. Reads structured runtime trace events from an in-memory sink and evaluates
    the `expect` block together with workspace state and the final message.
@@ -113,9 +142,19 @@ A scenario passes only if **all** of its expectations hold.
 
 Normal CLI runs use a no-op trace sink and do not create files. Evals inject an
 in-memory sink per scenario. For manual debugging, Python callers can construct
-`JsonlTraceSink(path)` and place it in an `AgentConfig` through
-`TraceContext`; each emitted event is then appended as one JSON object per line.
-Trace sink failures are isolated and never change tool or permission behavior.
+`JsonlTraceSink(path)`, wrap it in a `TraceContext`, and pass that context into
+the session factory; each emitted event is then appended as one JSON object per
+line. Trace sink failures are isolated and never change tool or permission
+behavior.
+
+Live eval traces also contain one `llm.usage` event per model call. The event
+records provider-reported `cost`, input/output/total tokens, cached and
+cache-write tokens, reasoning tokens, and the actual provider when available.
+It also identifies the owning parent or explore-subagent call. Unavailable
+fields are `null`; the trace never substitutes locally estimated tokens for
+provider-reported usage. SWE-bench attempts persist these events in their
+`trace.jsonl` artifacts. Normal interactive CLI sessions still use the no-op
+sink, so they do not create a usage report on disk.
 
 ## Adding a scenario
 
@@ -124,14 +163,28 @@ Trace sink failures are isolated and never change tool or permission behavior.
 3. Add any starting files under `template/`.
 4. Verify: `./.venv/bin/python evals/run_evals.py --scenario <NN-name>`.
 
-## Notes / limitations (by design)
+## Mini-fixture notes and limitations
 
 - Single run per scenario (no `pass@k` / multi-trial metrics yet).
 - Scenario assertions are deterministic (files, tool trajectory, text). The
   optional `evals/judge/` runner performs separate, post-eval trajectory review
   and never replaces official correctness results.
-- No external-codebase / Docker layer. These can be added as the project
-  matures.
+- The mini-fixture runner has no external-codebase or Docker layer; use the
+  SWE-bench runners for that workflow.
+
+## Cold and warm-context comparisons
+
+Use the same ordered subset, contestant model, reasoning setting, provider,
+generation limits, and API-call budget when comparing cold and warm-context
+runs. The cold runner creates a fresh session for every issue. The warm runner
+persists conversation and todo context between episodes but recreates each
+issue's code workspace from its own clean base commit, so patches never leak
+between instances.
+
+One cold/warm pair is an observed comparison, not proof of a universal context
+effect. Independently repeat generation runs before making causal claims. After
+official grading, `evals/judge/` can compare the paired trajectories while
+hiding the factor value and official outcome during the instance-level pass.
 
 ## Phase 2 paired harness micro-eval
 

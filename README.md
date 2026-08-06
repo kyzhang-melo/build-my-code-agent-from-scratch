@@ -14,7 +14,8 @@ A learning project that refactors a monolithic code-agent loop into a multi-file
 - `session_store.py`: append-only JSONL session persistence and resume.
 - `workspace.py`: `Workspace` value object with path-escape check.
 - `context_compact.py`: token estimation and conversation-history compaction.
-- `evals/`: live-model behavioral scenarios, assertions, and reports.
+- `evals/`: mini-fixture, SWE-bench, warm-context, analysis, and process-judge
+  evaluation workflows.
 
 ## Requirements
 
@@ -186,8 +187,12 @@ pytest -m "integration or slow or not (integration or slow)"
 
 The runtime trace records structured facts at the agent's execution boundaries.
 It captures session start/end, requested and completed tool calls, permission
-decisions, todo transitions, and stop-gate decisions. Trace events contain safe
-metadata such as paths, modes, counts, durations, and statuses; they do not
+decisions, todo transitions, stop-gate decisions, and per-model-call usage.
+`llm.usage` events retain provider-reported cost and token details when
+available, including cached, cache-write, and reasoning tokens. Calls are
+attributed to the parent agent or the explore subagent; missing provider fields
+remain `null` rather than being reported as zero. Other trace events contain
+safe metadata such as paths, modes, counts, durations, and statuses; they do not
 retain full file contents, shell commands, edit text, task prompts, or tool
 output.
 
@@ -233,6 +238,25 @@ kept for debugging. Preserve every workspace with:
 Reports are written to `evals/.runs/<timestamp>/report.json` and
 `summary.md`. See [`evals/README.md`](evals/README.md) for the scenario format,
 trace-backed assertions, and implementation notes.
+
+### Eval System
+
+The repository has several deliberately separate evaluation layers:
+
+- Mini-fixture evals exercise end-to-end agent behavior in small local
+  workspaces.
+- Micro evals isolate deterministic or paired harness decisions.
+- Cold SWE-bench runs measure behavior with a fresh session per instance.
+- Warm-context SWE-bench sequences preserve conversation context across an
+  ordered set of instances while resetting the code workspace each time.
+- Official SWE-bench grading remains the correctness signal. The optional LLM
+  judge compares the recorded processes after eval completion; it does not
+  replace outcome grading.
+
+Start with [`evals/README.md`](evals/README.md), then see the focused guides for
+[`evals/swebench/`](evals/swebench/README.md),
+[`evals/swebench_sequence/`](evals/swebench_sequence/README.md), and
+[`evals/judge/`](evals/judge/README.md).
 
 ### SWE-bench
 
