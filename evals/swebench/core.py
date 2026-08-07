@@ -497,6 +497,38 @@ async def run_agent_attempt(
     return result
 
 
+def run_agent_attempt_worker(
+    task: Task,
+    mirror: Path,
+    attempt_dir: Path,
+    *,
+    run_id: str,
+    model: str,
+    max_api_calls: int,
+    reasoning_effort: str | None,
+    max_output_tokens: int | None,
+    timeout: int | None,
+) -> AgentResult:
+    """Run one attempt in a dedicated worker process.
+
+    Process isolation is intentional: the agent runtime currently configures
+    the model and redirects stdout/stderr at process scope.
+    """
+    return asyncio.run(
+        run_agent_attempt(
+            task,
+            mirror,
+            attempt_dir,
+            run_id=run_id,
+            model=model,
+            max_api_calls=max_api_calls,
+            reasoning_effort=reasoning_effort,
+            max_output_tokens=max_output_tokens,
+            timeout=timeout,
+        )
+    )
+
+
 def run_official_evaluator(
     *,
     swebench_python: Path,

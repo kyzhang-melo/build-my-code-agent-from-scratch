@@ -80,11 +80,13 @@ timeout.
 
 The command generates predictions, starts the official Docker evaluator only
 when at least one prediction exists, and then writes the merged report. It
-stops at the failed stage while preserving all artifacts, so the same command
-can be run again after correcting an infrastructure problem.
+preserves per-instance failures and continues the batch, so the same command
+can be run again with `--rerun-failed` after correcting a problem.
 
-Official evaluation runs with four workers by default. Override the concurrency
-for a particular machine with `--max-workers`.
+Patch generation runs in five isolated agent processes by default. Override it
+with `--agent-workers`. Official Docker evaluation also uses five workers by
+default and can be changed independently with `--max-workers`. The two pools
+run in separate pipeline phases, so their resource usage does not overlap.
 
 Instance images are retained by default so later evaluations can reuse them
 without downloading them again. This can consume substantial Docker disk

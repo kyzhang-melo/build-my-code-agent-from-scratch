@@ -3,8 +3,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import multiprocessing
 import os
 import sys
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -22,7 +25,7 @@ from .core import (
     load_tasks_via_bridge,
     next_attempt,
     remove_prediction,
-    run_agent_attempt,
+    run_agent_attempt_worker,
     run_official_evaluator,
     should_run,
     upsert_prediction,
@@ -92,6 +95,9 @@ async def cmd_generate(args: argparse.Namespace) -> int:
     )
 
     cache_dir = Path(args.repo_cache).expanduser().resolve()
+    predictions_path = target / "predictions.jsonl"
+    mirrors = {}
+    pending = []
     for task in tasks:
         instance_dir = target / "instances" / task.instance_id
         if not should_run(instance_dir, args.rerun_failed):
@@ -101,18 +107,10 @@ async def cmd_generate(args: argparse.Namespace) -> int:
         attempt_dir = instance_dir / f"attempt-{attempt}"
         print(f"[run] {task.instance_id} attempt={attempt}")
         try:
-            mirror = ensure_mirror(task, cache_dir)
-            result = await run_agent_attempt(
-                task,
-                mirror,
-                attempt_dir,
-                run_id=args.run_id,
-                model=model,
-                max_api_calls=args.max_api_calls,
-                reasoning_effort=args.reasoning_effort,
-                max_output_tokens=args.max_output_tokens,
-                timeout=args.instance_timeout,
-            )
+            mirror = mirrors.get(task.repo)
+            if mirror is None:
+                mirror = ensure_mirror(task, cache_dir)
+                mirrors[task.repo] = mirror
         except Exception as exc:  # noqa: BLE001 - isolate batch failures
             attempt_dir.mkdir(parents=True, exist_ok=True)
             result = AgentResult(
@@ -124,29 +122,109 @@ async def cmd_generate(args: argparse.Namespace) -> int:
                 error=f"{type(exc).__name__}: {exc}",
             )
             atomic_write_json(attempt_dir / "result.json", result.to_dict())
-        if result.patch_status == "produced":
-            patch = (attempt_dir / "patch.diff").read_text(encoding="utf-8")
-            upsert_prediction(
-                target / "predictions.jsonl",
-                {
-                    "instance_id": task.instance_id,
-                    "model_name_or_path": model,
-                    "model_patch": patch,
-                },
+            _record_generation_result(
+                result, task.instance_id, attempt_dir, predictions_path, model
             )
-        else:
-            remove_prediction(target / "predictions.jsonl", task.instance_id)
-        print(
-            f"[{result.agent_status}] {task.instance_id} "
-            f"patch={result.patch_status} api_calls={result.api_calls}"
+            continue
+        pending.append((task, mirror, attempt_dir))
+
+    if not pending:
+        return 0
+
+    loop = asyncio.get_running_loop()
+    executor = ProcessPoolExecutor(
+        max_workers=args.agent_workers,
+        mp_context=multiprocessing.get_context("spawn"),
+    )
+    futures = {}
+    jobs = iter(pending)
+
+    def submit_next() -> bool:
+        try:
+            task, mirror, attempt_dir = next(jobs)
+        except StopIteration:
+            return False
+        call = partial(
+            run_agent_attempt_worker,
+            task,
+            mirror,
+            attempt_dir,
+            run_id=args.run_id,
+            model=model,
+            max_api_calls=args.max_api_calls,
+            reasoning_effort=args.reasoning_effort,
+            max_output_tokens=args.max_output_tokens,
+            timeout=args.instance_timeout,
         )
-        if result.agent_status == "error":
-            print(
-                f"[abort] {task.instance_id} failed with error: {result.error}\n"
-                "[abort] Stopping eval. Inspect the error and re-run when ready."
+        future = loop.run_in_executor(executor, call)
+        futures[future] = (task, attempt_dir)
+        return True
+
+    try:
+        for _ in range(args.agent_workers):
+            if not submit_next():
+                break
+        while futures:
+            done, _ = await asyncio.wait(
+                futures, return_when=asyncio.FIRST_COMPLETED
             )
-            break
+            for future in done:
+                task, attempt_dir = futures.pop(future)
+                attempt = int(attempt_dir.name.split("-", 1)[1])
+                try:
+                    result = future.result()
+                except Exception as exc:  # noqa: BLE001 - isolate worker failures
+                    attempt_dir.mkdir(parents=True, exist_ok=True)
+                    result = AgentResult(
+                        task.instance_id,
+                        attempt,
+                        "error",
+                        "not_exported",
+                        stop_reason="error",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    atomic_write_json(
+                        attempt_dir / "result.json", result.to_dict()
+                    )
+                _record_generation_result(
+                    result,
+                    task.instance_id,
+                    attempt_dir,
+                    predictions_path,
+                    model,
+                )
+                submit_next()
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
     return 0
+
+
+def _record_generation_result(
+    result: AgentResult,
+    instance_id: str,
+    attempt_dir: Path,
+    predictions_path: Path,
+    model: str,
+) -> None:
+    """Update shared batch artifacts from the coordinator process only."""
+    if result.patch_status == "produced":
+        patch = (attempt_dir / "patch.diff").read_text(encoding="utf-8")
+        upsert_prediction(
+            predictions_path,
+            {
+                "instance_id": instance_id,
+                "model_name_or_path": model,
+                "model_patch": patch,
+            },
+        )
+    else:
+        remove_prediction(predictions_path, instance_id)
+    print(
+        f"[{result.agent_status}] {instance_id} "
+        f"patch={result.patch_status} api_calls={result.api_calls}"
+    )
+    if result.agent_status == "error":
+        print(f"[error] {instance_id}: {result.error}")
 
 
 def cmd_evaluate(args: argparse.Namespace) -> int:
@@ -237,11 +315,22 @@ def _generate_args(parser: argparse.ArgumentParser) -> None:
         help="optional agent instance timeout in seconds (default: no limit)",
     )
     parser.add_argument("--rerun-failed", action="store_true")
+    parser.add_argument(
+        "--agent-workers",
+        type=_positive_int,
+        default=5,
+        help="parallel agent processes used to generate patches (default: 5)",
+    )
 
 
 def _evaluate_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--namespace", default="swebench")
-    parser.add_argument("--max-workers", type=int, default=4)
+    parser.add_argument(
+        "--max-workers",
+        type=_positive_int,
+        default=5,
+        help="parallel Docker workers used by the official evaluator (default: 5)",
+    )
     parser.add_argument(
         "--cache-level",
         choices=("none", "base", "env", "instance"),

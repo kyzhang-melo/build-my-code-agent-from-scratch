@@ -5,6 +5,9 @@ import asyncio
 import json
 import os
 import subprocess
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -584,6 +587,8 @@ def test_run_parser_combines_generation_and_evaluation_options() -> None:
             "7",
             "--max-workers",
             "2",
+            "--agent-workers",
+            "3",
             "--reasoning-effort",
             "high",
             "--max-output-tokens",
@@ -596,6 +601,7 @@ def test_run_parser_combines_generation_and_evaluation_options() -> None:
     assert args.func is cli.cmd_run
     assert args.max_api_calls == 7
     assert args.max_workers == 2
+    assert args.agent_workers == 3
     assert args.reasoning_effort == "high"
     assert args.max_output_tokens == 16000
     assert args.cache_level == "env"
@@ -612,7 +618,7 @@ def test_swebench_parser_accepts_none_reasoning_effort() -> None:
     assert args.reasoning_effort == "none"
 
 
-def test_evaluation_defaults_to_four_workers() -> None:
+def test_swebench_defaults_to_five_workers() -> None:
     from evals.swebench import cli
 
     evaluate = cli.build_parser().parse_args(["evaluate", "--run-id", "pipeline"])
@@ -620,13 +626,96 @@ def test_evaluation_defaults_to_four_workers() -> None:
         ["run", "--run-id", "pipeline", "--subset", "small.json"]
     )
 
-    assert evaluate.max_workers == 4
-    assert pipeline.max_workers == 4
+    assert evaluate.max_workers == 5
+    assert pipeline.max_workers == 5
+    assert pipeline.agent_workers == 5
     assert pipeline.reasoning_effort is None
     assert pipeline.max_output_tokens is None
     assert pipeline.instance_timeout is None
     assert evaluate.cache_level == "instance"
     assert pipeline.cache_level == "instance"
+
+
+@pytest.mark.parametrize("option", ["--agent-workers", "--max-workers"])
+def test_swebench_cli_rejects_nonpositive_worker_counts(option) -> None:
+    from evals.swebench import cli
+
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(
+            ["run", "--run-id", "invalid", "--subset", "small.json", option, "0"]
+        )
+
+
+def test_generate_runs_five_workers_and_continues_after_error(
+    monkeypatch, tmp_path
+) -> None:
+    from evals.swebench import cli
+    from evals.swebench.models import AgentResult
+
+    tasks = [Task(f"task-{index}", "owner/repo", "abc", "Fix it") for index in range(7)]
+    active = 0
+    maximum = 0
+    calls = []
+    lock = threading.Lock()
+
+    def fake_worker(task, _mirror, attempt_dir, **_kwargs):
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+            calls.append(task.instance_id)
+        time.sleep(0.03)
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        status = "error" if task.instance_id == "task-1" else "completed"
+        result = AgentResult(
+            task.instance_id,
+            1,
+            status,
+            "empty",
+            stop_reason=status,
+            error="boom" if status == "error" else "",
+        )
+        core.atomic_write_json(attempt_dir / "result.json", result.to_dict())
+        with lock:
+            active -= 1
+        return result
+
+    monkeypatch.setattr(cli, "resolve_swebench_repo", lambda _value: tmp_path)
+    monkeypatch.setattr(cli, "resolve_swebench_python", lambda _value, _repo: tmp_path / "python")
+    monkeypatch.setattr(
+        cli,
+        "load_subset",
+        lambda _path: ("dataset", "test", [task.instance_id for task in tasks], "test"),
+    )
+    monkeypatch.setattr(cli, "create_manifest", lambda **_kwargs: {})
+    monkeypatch.setattr(cli, "ensure_manifest", lambda *_args: {})
+    monkeypatch.setattr(cli, "load_tasks_via_bridge", lambda *_args: tasks)
+    monkeypatch.setattr(cli, "ensure_mirror", lambda _task, _cache: tmp_path / "mirror")
+    monkeypatch.setattr(cli, "run_agent_attempt_worker", fake_worker)
+    monkeypatch.setattr(
+        cli,
+        "ProcessPoolExecutor",
+        lambda max_workers, mp_context: ThreadPoolExecutor(max_workers=max_workers),
+    )
+    args = argparse.Namespace(
+        run_id="parallel",
+        runs_dir=str(tmp_path / "runs"),
+        swebench_repo=None,
+        swebench_python=None,
+        subset="subset.json",
+        model="test-model",
+        repo_cache=str(tmp_path / "cache"),
+        max_api_calls=3,
+        reasoning_effort=None,
+        max_output_tokens=None,
+        instance_timeout=None,
+        rerun_failed=False,
+        agent_workers=5,
+    )
+
+    assert asyncio.run(cli.cmd_generate(args)) == 0
+    assert maximum == 5
+    assert sorted(calls) == sorted(task.instance_id for task in tasks)
 
 
 def test_swebench_cli_rejects_nonpositive_output_tokens() -> None:
