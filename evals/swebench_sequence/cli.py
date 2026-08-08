@@ -197,7 +197,7 @@ def _generate(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--subset", required=True)
     parser.add_argument("--model")
     parser.add_argument("--repo-cache", default=str(DEFAULT_CACHE_DIR))
-    parser.add_argument("--max-api-calls", type=_positive_int, default=30)
+    parser.add_argument("--max-api-calls", type=_positive_int, default=60)
     parser.add_argument(
         "--reasoning-effort",
         choices=("none", "minimal", "low", "medium", "high", "xhigh"),

@@ -739,6 +739,132 @@ def test_run_one_turn_budget_exhausted_returns_max_api_calls_outcome(load_module
     assert state.messages[-1]["content"] == outcome.final_text
 
 
+def test_agent_loop_injects_optional_turn_steering(
+    load_module, monkeypatch, tmp_path,
+) -> None:
+    from dataclasses import replace
+    from trace import MemoryTraceSink, TraceContext
+
+    main_module = load_module("main_steering", "main.py")
+    sink = MemoryTraceSink()
+
+    class Policy:
+        name = "test"
+
+        def after_turn(self, api_call_count):
+            if api_call_count == 1:
+                return types.SimpleNamespace(
+                    content="Converge now.",
+                    reason="test_threshold",
+                )
+            return None
+
+    session = replace(
+        _parent(main_module, tmp_path),
+        steering_policy=Policy(),
+        trace_context=TraceContext(sink=sink),
+    )
+    tool_call = types.SimpleNamespace(
+        type="function_call",
+        call_id="c1",
+        id="fc1",
+        name="git_diff",
+        arguments="{}",
+    )
+    responses = [
+        types.SimpleNamespace(output=[tool_call], output_text=""),
+        _no_tool_response("Done."),
+    ]
+    captured_inputs = []
+
+    async def fake_create(**kwargs):
+        captured_inputs.append(kwargs["input"])
+        return responses.pop(0)
+
+    async def fake_execute(*_args, **_kwargs):
+        return ([{
+            "type": "function_call_output",
+            "call_id": "c1",
+            "output": "No changes",
+        }], False)
+
+    monkeypatch.setattr(
+        main_module,
+        "client",
+        types.SimpleNamespace(responses=types.SimpleNamespace(create=fake_create)),
+    )
+    monkeypatch.setattr(main_module, "execute_tool_calls_async", fake_execute)
+
+    outcome = _run(main_module.agent_loop(
+        main_module.LoopState(messages=[{"role": "user", "content": "task"}]),
+        session,
+    ))
+
+    assert outcome.final_text == "Done."
+    assert captured_inputs[1][-1] == {"role": "user", "content": "Converge now."}
+    event = sink.by_type("steering.injected")[0]
+    assert event["api_call"] == 1
+    assert event["reason"] == "test_threshold"
+
+
+def test_agent_loop_ignores_steering_policy_failure(
+    load_module, monkeypatch, tmp_path,
+) -> None:
+    from dataclasses import replace
+    from trace import MemoryTraceSink, TraceContext
+
+    main_module = load_module("main_steering_failure", "main.py")
+    sink = MemoryTraceSink()
+
+    class BrokenPolicy:
+        name = "broken"
+
+        def after_turn(self, _api_call_count):
+            raise RuntimeError("broken policy")
+
+    session = replace(
+        _parent(main_module, tmp_path),
+        steering_policy=BrokenPolicy(),
+        trace_context=TraceContext(sink=sink),
+    )
+    tool_call = types.SimpleNamespace(
+        type="function_call",
+        call_id="c1",
+        id="fc1",
+        name="git_diff",
+        arguments="{}",
+    )
+    responses = [
+        types.SimpleNamespace(output=[tool_call], output_text=""),
+        _no_tool_response("Done."),
+    ]
+
+    async def fake_create(**_kwargs):
+        return responses.pop(0)
+
+    async def fake_execute(*_args, **_kwargs):
+        return ([{
+            "type": "function_call_output",
+            "call_id": "c1",
+            "output": "No changes",
+        }], False)
+
+    monkeypatch.setattr(
+        main_module,
+        "client",
+        types.SimpleNamespace(responses=types.SimpleNamespace(create=fake_create)),
+    )
+    monkeypatch.setattr(main_module, "execute_tool_calls_async", fake_execute)
+
+    outcome = _run(main_module.agent_loop(
+        main_module.LoopState(messages=[{"role": "user", "content": "task"}]),
+        session,
+    ))
+
+    assert outcome.final_text == "Done."
+    assert sink.by_type("steering.failed")[0]["error_type"] == "RuntimeError"
+
+
 def test_malformed_json_arguments_normalized_in_history(load_module, monkeypatch, tmp_path) -> None:
     """A malformed function_call must not be replayed to the Provider as-is.
 

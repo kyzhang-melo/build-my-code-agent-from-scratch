@@ -39,6 +39,23 @@ class StopGate(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class SteeringDirective:
+    """A user-visible instruction injected before the next model call."""
+
+    content: str
+    reason: str
+
+
+class TurnSteeringPolicy(Protocol):
+    """Optionally steer an agent after a completed turn."""
+
+    name: str
+
+    def after_turn(self, api_call_count: int) -> SteeringDirective | None:
+        ...
+
+
 class TodoStopGate:
     name = "todo"
 
@@ -101,6 +118,7 @@ class AgentSession:
     reasoning_effort: str | None
     max_output_tokens: int | None
     stop_gate: StopGate
+    steering_policy: TurnSteeringPolicy | None = None
     store: SessionStoreProtocol = field(default_factory=NullSessionStore)
     on_text: Callable[[str], None] | None = None
     session_dir: Path | None = None

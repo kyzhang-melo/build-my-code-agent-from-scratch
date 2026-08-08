@@ -78,6 +78,15 @@ Agent instances have no overall timeout by default. Use
 This setting applies to the host-side agent loop, not the official Docker test
 timeout.
 
+Generation uses staged steering by default. After model calls 45 and 60, the
+eval injects a session-local instruction to converge and deliver a patch; the
+second instruction distinguishes workspaces with and without changes. The hard
+limit defaults to 90 calls. Use `--steering-policy none` for an unsteered
+control run, or `--max-api-calls` to override the hard limit. Steering applies
+only to the parent SWE-bench agent, not ordinary CLI sessions, exploration
+subagents, or sequence evals. The policy and thresholds are recorded in the run
+manifest.
+
 The command generates predictions, starts the official Docker evaluator only
 when at least one prediction exists, and then writes the merged report. It
 preserves per-instance failures and continues the batch, so the same command

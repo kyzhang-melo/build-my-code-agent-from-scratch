@@ -235,8 +235,14 @@ def test_agent_attempt_records_api_calls_when_the_agent_errors(
         state.api_call_count = 7
         raise json.JSONDecodeError("Expecting value", "not-json", 0)
 
+    captured_session = {}
+
+    def fake_create_parent_session(*_args, **kwargs):
+        captured_session.update(kwargs)
+        return object()
+
     monkeypatch.setattr(main, "LoopState", FakeState)
-    monkeypatch.setattr(main, "create_parent_session", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(main, "create_parent_session", fake_create_parent_session)
     monkeypatch.setattr(main, "agent_loop", fail_agent_loop)
 
     result = asyncio.run(core.run_agent_attempt(
@@ -246,6 +252,7 @@ def test_agent_attempt_records_api_calls_when_the_agent_errors(
         run_id="test",
         model="test-model",
         max_api_calls=30,
+        steering_policy="staged",
         reasoning_effort=None,
         max_output_tokens=None,
         timeout=None,
@@ -253,6 +260,9 @@ def test_agent_attempt_records_api_calls_when_the_agent_errors(
 
     assert result.agent_status == "error"
     assert result.api_calls == 7
+    assert isinstance(
+        captured_session["steering_policy"], core.SwebenchSteeringPolicy
+    )
 
 
 def test_successful_attempt_is_never_rerun(tmp_path) -> None:
@@ -275,6 +285,8 @@ def test_manifest_rejects_material_config_changes(tmp_path) -> None:
         "instance_ids": ["a"],
         "model": "m",
         "max_api_calls": 30,
+        "steering_policy": "staged",
+        "steering_thresholds": [45, 60],
         "reasoning_effort": None,
         "max_output_tokens": None,
         "instance_timeout_seconds": 10,
@@ -287,6 +299,13 @@ def test_manifest_rejects_material_config_changes(tmp_path) -> None:
         core.ensure_manifest(path, changed)
     changed = {**base, "reasoning_effort": "high"}
     with pytest.raises(ValueError, match="reasoning_effort"):
+        core.ensure_manifest(path, changed)
+    changed = {
+        **base,
+        "steering_policy": "none",
+        "steering_thresholds": [],
+    }
+    with pytest.raises(ValueError, match="steering_policy"):
         core.ensure_manifest(path, changed)
     changed = {**base, "max_output_tokens": 8000}
     with pytest.raises(ValueError, match="max_output_tokens"):
@@ -600,6 +619,7 @@ def test_run_parser_combines_generation_and_evaluation_options() -> None:
 
     assert args.func is cli.cmd_run
     assert args.max_api_calls == 7
+    assert args.steering_policy == "staged"
     assert args.max_workers == 2
     assert args.agent_workers == 3
     assert args.reasoning_effort == "high"
@@ -629,11 +649,51 @@ def test_swebench_defaults_to_five_workers() -> None:
     assert evaluate.max_workers == 5
     assert pipeline.max_workers == 5
     assert pipeline.agent_workers == 5
+    assert pipeline.max_api_calls == 90
+    assert pipeline.steering_policy == "staged"
     assert pipeline.reasoning_effort is None
     assert pipeline.max_output_tokens is None
     assert pipeline.instance_timeout is None
     assert evaluate.cache_level == "instance"
     assert pipeline.cache_level == "instance"
+
+
+def test_swebench_parser_can_disable_staged_steering() -> None:
+    from evals.swebench import cli
+
+    args = cli.build_parser().parse_args([
+        "generate",
+        "--run-id",
+        "pipeline",
+        "--subset",
+        "small.json",
+        "--steering-policy",
+        "none",
+    ])
+
+    assert args.steering_policy == "none"
+
+
+def test_staged_steering_uses_patch_aware_second_message(
+    monkeypatch, tmp_path,
+) -> None:
+    monkeypatch.setattr(core, "export_patch", lambda *_args: "")
+    policy = core.SwebenchSteeringPolicy(tmp_path, "base")
+
+    first = policy.after_turn(45)
+    no_patch = policy.after_turn(60)
+
+    assert first is not None
+    assert first.reason == "converge_on_root_cause"
+    assert no_patch is not None
+    assert no_patch.reason == "implement_patch_and_finish"
+    assert policy.after_turn(60) is None
+
+    monkeypatch.setattr(core, "export_patch", lambda *_args: "diff --git a/x b/x")
+    patch_policy = core.SwebenchSteeringPolicy(tmp_path, "base")
+    has_patch = patch_policy.after_turn(60)
+    assert has_patch is not None
+    assert has_patch.reason == "review_patch_and_finish"
 
 
 @pytest.mark.parametrize("option", ["--agent-workers", "--max-workers"])
@@ -706,6 +766,7 @@ def test_generate_runs_five_workers_and_continues_after_error(
         model="test-model",
         repo_cache=str(tmp_path / "cache"),
         max_api_calls=3,
+        steering_policy="staged",
         reasoning_effort=None,
         max_output_tokens=None,
         instance_timeout=None,

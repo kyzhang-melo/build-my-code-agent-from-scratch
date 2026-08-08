@@ -73,6 +73,7 @@ def validate_compatible_runs(a: dict, b: dict, factor: str) -> tuple[str, str]:
         raise ValueError("factor must be 'reasoning' or 'context'")
     common = (
         "dataset", "split", "instance_ids", "model", "provider", "max_api_calls",
+        "steering_policy", "steering_thresholds",
         "max_output_tokens", "instance_timeout_seconds", "harness_commit",
         "swebench_commit", "auto_compact",
     )

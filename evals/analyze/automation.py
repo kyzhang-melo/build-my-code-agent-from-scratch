@@ -24,6 +24,8 @@ COMPARISON_FIELDS = (
     "provider",
     "instance_ids",
     "max_api_calls",
+    "steering_policy",
+    "steering_thresholds",
     "reasoning_effort",
     "max_output_tokens",
     "instance_timeout_seconds",

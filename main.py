@@ -25,7 +25,13 @@ from prompt_toolkit.styles import Style
 from message_utils import extract_usage, normalize_messages, response_item_to_dict
 from permissions import PermissionManager, PermissionMode, PermissionService, TerminalApprovalHandler
 from prompts import GLOB_DISCOVERY_RULES, build_explore_system, build_parent_system
-from session import AgentSession, ReportStopGate, TodoStopGate, generate_session_id
+from session import (
+    AgentSession,
+    ReportStopGate,
+    TodoStopGate,
+    TurnSteeringPolicy,
+    generate_session_id,
+)
 from session_store import (
     NullSessionStore,
     SESSION_DIR_ENV,
@@ -106,8 +112,8 @@ SUMMARY_CONTINUATION_PROMPT = (
     "summary that includes specific technical details, findings, and all "
     "important information that the parent agent should know."
 )
-MAX_API_CALLS_PER_USER_TURN = 30
-MAX_SUBAGENT_API_CALLS = 30
+MAX_API_CALLS_PER_USER_TURN = 60
+MAX_SUBAGENT_API_CALLS = 60
 INPUT_PROMPT = FormattedText([("class:input-prompt", "s01 >> ")])
 INPUT_STYLE = Style.from_dict({"input-prompt": "ansicyan"})
 
@@ -367,6 +373,7 @@ def create_parent_session(
     max_api_calls: int = MAX_API_CALLS_PER_USER_TURN,
     reasoning_effort: str | None = None,
     max_output_tokens: int | None = DEFAULT_MAX_OUTPUT_TOKENS,
+    steering_policy: TurnSteeringPolicy | None = None,
     system_addendum: str | None = None,
     tool_names: set[str] | frozenset[str] | None = None,
 ) -> AgentSession:
@@ -427,6 +434,7 @@ def create_parent_session(
         reasoning_effort=reasoning_effort,
         max_output_tokens=max_output_tokens,
         stop_gate=TodoStopGate(todo, TODO_CONTRACT_MAX_NUDGES),
+        steering_policy=steering_policy,
         store=session_store,
         on_text=on_text,
         session_dir=session_dir,
@@ -721,6 +729,34 @@ async def agent_loop(state: LoopState, session: AgentSession) -> TurnOutcome:
                     state, session.max_output_tokens
                 ) and _drop_oldest_user_message(state):
                     state.last_input_tokens = estimate_tokens(state.messages)
+        if session.steering_policy is not None:
+            try:
+                directive = session.steering_policy.after_turn(
+                    state.api_call_count
+                )
+            except Exception as exc:  # noqa: BLE001 - optional policy is best effort
+                emit_trace(
+                    session.trace_context,
+                    "steering.failed",
+                    source=session.permission_source,
+                    policy=session.steering_policy.name,
+                    api_call=state.api_call_count,
+                    error_type=type(exc).__name__,
+                )
+            else:
+                if directive is not None:
+                    state.messages.append({
+                        "role": "user",
+                        "content": directive.content,
+                    })
+                    emit_trace(
+                        session.trace_context,
+                        "steering.injected",
+                        source=session.permission_source,
+                        policy=session.steering_policy.name,
+                        api_call=state.api_call_count,
+                        reason=directive.reason,
+                    )
     return TurnOutcome(
         stop_reason=outcome.stop_reason,
         final_text=outcome.final_text,

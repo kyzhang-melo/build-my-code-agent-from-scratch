@@ -85,6 +85,8 @@ expected.
 python main.py
 ```
 
+On macOS, iTerm2 is the recommended terminal for running `python main.py`.
+
 Type your request at `s01 >>`.
 
 - `q`, `exit`, or empty input will quit.

@@ -78,6 +78,7 @@ async def cmd_generate(args: argparse.Namespace) -> int:
         instance_ids=instance_ids,
         model=model,
         max_api_calls=args.max_api_calls,
+        steering_policy=args.steering_policy,
         reasoning_effort=args.reasoning_effort,
         max_output_tokens=args.max_output_tokens,
         timeout=args.instance_timeout,
@@ -152,6 +153,7 @@ async def cmd_generate(args: argparse.Namespace) -> int:
             run_id=args.run_id,
             model=model,
             max_api_calls=args.max_api_calls,
+            steering_policy=args.steering_policy,
             reasoning_effort=args.reasoning_effort,
             max_output_tokens=args.max_output_tokens,
             timeout=args.instance_timeout,
@@ -303,7 +305,13 @@ def _generate_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--subset", required=True)
     parser.add_argument("--model")
     parser.add_argument("--repo-cache", default=str(DEFAULT_CACHE_DIR))
-    parser.add_argument("--max-api-calls", type=int, default=30)
+    parser.add_argument("--max-api-calls", type=int, default=90)
+    parser.add_argument(
+        "--steering-policy",
+        choices=("staged", "none"),
+        default="staged",
+        help="turn-boundary steering policy (default: staged at calls 45 and 60)",
+    )
     parser.add_argument(
         "--reasoning-effort",
         choices=("none", "minimal", "low", "medium", "high", "xhigh"),

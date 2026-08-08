@@ -13,6 +13,8 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
+from session import SteeringDirective
+
 from .models import AgentResult, Task
 
 
@@ -42,6 +44,60 @@ SWEBENCH_TOOL_NAMES = frozenset({
     "todo",
     "task",
 })
+STAGED_STEERING_THRESHOLDS = (45, 60)
+
+
+class SwebenchSteeringPolicy:
+    """Prompt an eval agent to converge at fixed call-count milestones."""
+
+    name = "staged"
+
+    def __init__(self, workspace: Path, base_commit: str):
+        self.workspace = workspace
+        self.base_commit = base_commit
+        self._emitted: set[int] = set()
+
+    def after_turn(self, api_call_count: int) -> SteeringDirective | None:
+        if api_call_count in self._emitted:
+            return None
+        if api_call_count == STAGED_STEERING_THRESHOLDS[0]:
+            directive = SteeringDirective(
+                content=(
+                    "You have used 45 model calls. Stop broad exploration and "
+                    "converge on the most likely root cause. Inspect only the "
+                    "files needed to validate that hypothesis, then implement "
+                    "the smallest correct source patch."
+                ),
+                reason="converge_on_root_cause",
+            )
+        elif api_call_count == STAGED_STEERING_THRESHOLDS[1]:
+            has_patch = bool(
+                export_patch(self.workspace, self.base_commit).strip()
+            )
+            if has_patch:
+                directive = SteeringDirective(
+                    content=(
+                        "You have used 60 model calls and the workspace already "
+                        "contains a patch. Prioritize delivery now: review the "
+                        "final diff, correct only concrete issues, and finish "
+                        "without starting optional investigation."
+                    ),
+                    reason="review_patch_and_finish",
+                )
+            else:
+                directive = SteeringDirective(
+                    content=(
+                        "You have used 60 model calls and the workspace still "
+                        "has no patch. Stop open-ended searching, choose the "
+                        "most defensible diagnosis, implement the smallest "
+                        "correct source fix, review its diff, and finish."
+                    ),
+                    reason="implement_patch_and_finish",
+                )
+        else:
+            return None
+        self._emitted.add(api_call_count)
+        return directive
 
 
 def run_command(
@@ -338,6 +394,7 @@ def create_manifest(
     instance_ids: list[str],
     model: str,
     max_api_calls: int,
+    steering_policy: str,
     reasoning_effort: str | None,
     max_output_tokens: int | None,
     timeout: int | None,
@@ -357,6 +414,12 @@ def create_manifest(
         "model": model,
         "provider": provider or "",
         "max_api_calls": max_api_calls,
+        "steering_policy": steering_policy,
+        "steering_thresholds": (
+            list(STAGED_STEERING_THRESHOLDS)
+            if steering_policy == "staged"
+            else []
+        ),
         "reasoning_effort": reasoning_effort,
         "max_output_tokens": max_output_tokens,
         "instance_timeout_seconds": timeout,
@@ -381,6 +444,8 @@ def ensure_manifest(path: Path, proposed: dict) -> dict:
         "model",
         "provider",
         "max_api_calls",
+        "steering_policy",
+        "steering_thresholds",
         "reasoning_effort",
         "max_output_tokens",
         "instance_timeout_seconds",
@@ -418,6 +483,7 @@ async def run_agent_attempt(
     run_id: str,
     model: str,
     max_api_calls: int,
+    steering_policy: str,
     reasoning_effort: str | None,
     max_output_tokens: int | None,
     timeout: int | None,
@@ -446,6 +512,11 @@ async def run_agent_attempt(
         trace_context=trace,
         on_text=None,
         max_api_calls=max_api_calls,
+        steering_policy=(
+            SwebenchSteeringPolicy(workspace, task.base_commit)
+            if steering_policy == "staged"
+            else None
+        ),
         reasoning_effort=reasoning_effort,
         max_output_tokens=max_output_tokens,
         system_addendum=SWEBENCH_SYSTEM_ADDENDUM,
@@ -505,6 +576,7 @@ def run_agent_attempt_worker(
     run_id: str,
     model: str,
     max_api_calls: int,
+    steering_policy: str,
     reasoning_effort: str | None,
     max_output_tokens: int | None,
     timeout: int | None,
@@ -522,6 +594,7 @@ def run_agent_attempt_worker(
             run_id=run_id,
             model=model,
             max_api_calls=max_api_calls,
+            steering_policy=steering_policy,
             reasoning_effort=reasoning_effort,
             max_output_tokens=max_output_tokens,
             timeout=timeout,
