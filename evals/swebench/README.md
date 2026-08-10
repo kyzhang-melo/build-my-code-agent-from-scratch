@@ -119,6 +119,41 @@ Run the official Docker evaluator:
   --run-id verified-smoke-001
 ```
 
+### Pre-pulling evaluation images
+
+The `evaluate` phase downloads a Docker image for each instance on demand. When
+running the full 500-instance set, this can be slow and may hit Docker Hub rate
+limits (`429 Too Many Requests`). The `prepare_remote_images.py` helper pulls all
+required images before the evaluator starts and re-tags them to the names the
+SWE-bench harness expects.
+
+Dry-run to see what would be pulled:
+
+```bash
+./.venv/bin/python evals/swebench/prepare_remote_images.py --dry-run
+```
+
+Pull from Docker Hub (default, four concurrent workers):
+
+```bash
+./.venv/bin/python evals/swebench/prepare_remote_images.py
+```
+
+Pull from Epoch AI's GHCR mirror to avoid Docker Hub rate limits. Reduce
+`--max-workers` if pulling to a slow disk, such as an SMR HDD:
+
+```bash
+./.venv/bin/python evals/swebench/prepare_remote_images.py \
+  --source ghcr \
+  --max-workers 1
+```
+
+`--source ghcr` pulls from `ghcr.io/epoch-research/swe-bench.eval.*` and re-tags
+to `swebench/sweb.eval.*` so the official harness can use them unchanged.
+`--subset` defaults to `evals/swebench/subsets/verified_500.json`.
+`--max-workers` controls the number of concurrent `docker pull` operations, and
+`--force` re-pulls images that are already present locally.
+
 Merge the agent and official results:
 
 ```bash
