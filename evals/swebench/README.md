@@ -60,8 +60,11 @@ configuration:
   --max-output-tokens 16000
 ```
 
-The effective settings are recorded in the run manifest. Resuming the same run
-ID with different settings is rejected.
+The effective settings, including resolved model context/input/output limits,
+are recorded in the run manifest. Resuming the same run ID with different
+settings is rejected. A compatible older manifest is upgraded once by recording
+the limits resolved for the resumed run and an auditable old/new harness-commit
+migration record. Later resumes again require the recorded harness commit.
 
 Use `--reasoning-effort none` to explicitly send
 `reasoning: {"effort": "none"}`. Omitting the option leaves the API field
@@ -172,8 +175,9 @@ harness-diagnostic-diff.md    # new, disappeared, and changed diagnostic signals
 ```
 
 A previous run is used only when dataset, split, exact instance set, model,
-provider, API-call budget, reasoning effort, and output-token configuration all
-match; timeout and auto-compaction settings must match as well. Harness commits
+provider, resolved model limits, API-call budget, reasoning effort, and
+output-token configuration all match; timeout and auto-compaction settings must
+match as well. Harness commits
 are deliberately allowed to differ so a harness change can be measured. If no
 like-for-like baseline exists, the diff says so instead of comparing unrelated
 runs. Dirty runs remain visible with a warning and should not independently be

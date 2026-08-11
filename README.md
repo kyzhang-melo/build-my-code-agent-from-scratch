@@ -66,18 +66,26 @@ OPENROUTER_PROVIDER="moonshotai/int4"
 
 Leave `OPENROUTER_PROVIDER` empty if you want OpenRouter's default routing.
 
-### Model Choice and Context Window
+### Model Choice and Context Limits
 
 For debugging this agent harness, prefer `kimi-k2.5`, `tencent/hy3`, or another
 model with strong agentic capability. Models with weaker tool-use and
 long-context behavior may fail on prompt cases that require reading several
 files and summarizing the results.
 
-Also check the context-window detection logic in `main.py` when changing
-`MODEL_ID`. The project resolves known model IDs to their configured context
-window sizes there. If a model is not recognized, the agent falls back to the
-default context window of `32k`, which can trigger compaction much earlier than
-expected.
+Also check the model-limit detection logic in `main.py` when changing
+`MODEL_ID`. The project resolves known model IDs to a total context window,
+maximum input, and (when known) maximum output. For example, hy3 has a 256k
+total context window but accepts at most 192k input tokens, so compaction uses
+the lower input limit. Unknown models fall back to a conservative 32k limit.
+
+For one run, `MODEL_LIMITS_OVERRIDE` can replace the catalog with a complete
+JSON value. All three fields are required so the input/output budget remains
+consistent:
+
+```env
+MODEL_LIMITS_OVERRIDE='{"context_window_tokens":262144,"max_input_tokens":192000,"max_output_tokens":128000}'
+```
 
 ## Run
 
@@ -108,7 +116,8 @@ field unset.
 Omit `--max-output-tokens` to leave the API field unset. Passing
 `--max-output-tokens 8000` sends an explicit limit of 8,000. When the field is
 unset, context compaction reserves up to 32,768 output tokens, capped at half
-of the context window for smaller or unknown models.
+of the context window for smaller or unknown models. If a model has a known
+maximum output limit, an explicit value above that limit is rejected locally.
 
 ### Session Persistence
 

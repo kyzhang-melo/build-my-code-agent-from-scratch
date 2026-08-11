@@ -48,6 +48,8 @@ async def cmd_generate(args: argparse.Namespace) -> int:
     model = args.model or os.getenv("MODEL_ID")
     if not model:
         raise SystemExit("MODEL_ID is not set; pass --model or configure .env")
+    import main
+
     provider = os.getenv("OPENROUTER_PROVIDER", "")
     target.mkdir(parents=True)
     tasks = load_tasks_via_bridge(
@@ -70,10 +72,12 @@ async def cmd_generate(args: argparse.Namespace) -> int:
         instance_ids=spec.instance_ids,
         model=model,
         max_api_calls=args.max_api_calls,
+        steering_policy="none",
         reasoning_effort=args.reasoning_effort,
         max_output_tokens=args.max_output_tokens,
         timeout=args.instance_timeout,
         swebench_repo=swebench_repo,
+        model_limits=main.model_limits(model).as_dict(),
         provider=provider,
     )
     manifest.update(

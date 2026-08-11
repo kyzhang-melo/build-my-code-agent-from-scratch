@@ -399,12 +399,13 @@ def create_manifest(
     max_output_tokens: int | None,
     timeout: int | None,
     swebench_repo: Path,
+    model_limits: dict[str, int | None],
     provider: str | None = None,
 ) -> dict:
     harness_commit, harness_dirty = repository_state(PROJECT_ROOT)
     swebench_commit, swebench_dirty = repository_state(swebench_repo)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": run_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "dataset": dataset,
@@ -422,6 +423,7 @@ def create_manifest(
         ),
         "reasoning_effort": reasoning_effort,
         "max_output_tokens": max_output_tokens,
+        "model_limits": model_limits,
         "instance_timeout_seconds": timeout,
         "harness_commit": harness_commit,
         "harness_worktree_dirty": harness_dirty,
@@ -437,6 +439,7 @@ def ensure_manifest(path: Path, proposed: dict) -> dict:
         atomic_write_json(path, proposed)
         return proposed
     existing = json.loads(path.read_text(encoding="utf-8"))
+    needs_model_limits_migration = "model_limits" not in existing
     keys = (
         "dataset",
         "split",
@@ -448,6 +451,7 @@ def ensure_manifest(path: Path, proposed: dict) -> dict:
         "steering_thresholds",
         "reasoning_effort",
         "max_output_tokens",
+        "model_limits",
         "instance_timeout_seconds",
         "harness_commit",
         "swebench_commit",
@@ -455,6 +459,10 @@ def ensure_manifest(path: Path, proposed: dict) -> dict:
     conflicts = [
         key
         for key in keys
+        if not (
+            needs_model_limits_migration
+            and key in {"model_limits", "harness_commit"}
+        )
         if (
             (existing.get(key) or "") != (proposed.get(key) or "")
             if key == "provider"
@@ -463,6 +471,22 @@ def ensure_manifest(path: Path, proposed: dict) -> dict:
     ]
     if conflicts:
         raise ValueError(f"run manifest conflicts in: {', '.join(conflicts)}")
+    if needs_model_limits_migration:
+        previous_harness_commit = existing.get("harness_commit")
+        existing["schema_version"] = 2
+        existing["model_limits"] = proposed["model_limits"]
+        existing["harness_commit"] = proposed["harness_commit"]
+        existing["harness_worktree_dirty"] = proposed["harness_worktree_dirty"]
+        migrations = existing.setdefault("migrations", [])
+        if not isinstance(migrations, list):
+            raise ValueError("run manifest has invalid migrations metadata")
+        migrations.append({
+            "kind": "model_limits_and_harness_upgrade",
+            "migrated_at": datetime.now(timezone.utc).isoformat(),
+            "previous_harness_commit": previous_harness_commit,
+            "new_harness_commit": proposed["harness_commit"],
+        })
+        atomic_write_json(path, existing)
     return existing
 
 

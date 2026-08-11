@@ -118,28 +118,48 @@ INPUT_PROMPT = FormattedText([("class:input-prompt", "s01 >> ")])
 INPUT_STYLE = Style.from_dict({"input-prompt": "ansicyan"})
 
 # --- Context compaction config ---
-# Per-model context windows, resolved by PREFIX match against a normalized
+# Per-model limits, resolved by PREFIX match against a normalized
 # model id (most-specific pattern first, first match wins). Normalizing first
 # (drop the "vendor/" prefix and any ":route" suffix like ":exacto"/":nitro")
 # means routing/quant tags can't defeat the lookup the way an exact-key dict
 # does — e.g. "moonshotai/kimi-k2.5:exacto" still resolves to kimi's 262144
 # instead of silently falling through to DEFAULT_CONTEXT_WINDOW. Unknown models
 # fall back to a conservative default so they compact early rather than overflow.
-CONTEXT_WINDOW_PATTERNS: list[tuple[re.Pattern[str], int]] = [
-    (re.compile(r"^hy3$"), 262144),
-    (re.compile(r"^kimi-"), 262144),
-    (re.compile(r"^deepseek-v4"), 1_000_000),
-    (re.compile(r"^minimax-m3"), 524_288),
-    (re.compile(r"^glm-5\.2"), 1_000_000),
-    (re.compile(r"^glm-5"), 202_800),
-    (re.compile(r"^nemotron-3-ultra"), 1_048_576),
-    (re.compile(r"^laguna-m"), 262_144),
-    (re.compile(r"^longcat-"), 1_048_576),
+@dataclass(frozen=True)
+class ModelLimits:
+    context_window_tokens: int
+    max_input_tokens: int
+    max_output_tokens: int | None
+
+    def as_dict(self) -> dict[str, int | None]:
+        return {
+            "context_window_tokens": self.context_window_tokens,
+            "max_input_tokens": self.max_input_tokens,
+            "max_output_tokens": self.max_output_tokens,
+        }
+
+
+def _limits(context_window_tokens: int, max_output_tokens: int | None = None) -> ModelLimits:
+    return ModelLimits(context_window_tokens, context_window_tokens, max_output_tokens)
+
+
+MODEL_LIMIT_PATTERNS: list[tuple[re.Pattern[str], ModelLimits]] = [
+    # TokenHub documents hy3's maximum input separately from its total window.
+    (re.compile(r"^hy3$"), ModelLimits(262_144, 192_000, 128_000)),
+    (re.compile(r"^kimi-"), _limits(262_144)),
+    (re.compile(r"^deepseek-v4"), _limits(1_000_000)),
+    (re.compile(r"^minimax-m3"), _limits(524_288)),
+    (re.compile(r"^glm-5\.2"), _limits(1_000_000)),
+    (re.compile(r"^glm-5"), _limits(202_800)),
+    (re.compile(r"^nemotron-3-ultra"), _limits(1_048_576)),
+    (re.compile(r"^laguna-m"), _limits(262_144)),
+    (re.compile(r"^longcat-"), _limits(1_048_576)),
 ]
-DEFAULT_CONTEXT_WINDOW = 32000
-# Deliberate override, e.g. shrink the window in tests so auto-compaction is
-# easy to trigger. 0/unset -> resolve from MODEL_ID via the patterns above.
-CONTEXT_WINDOW_OVERRIDE = int(os.getenv("CONTEXT_WINDOW_OVERRIDE", "0"))
+DEFAULT_MODEL_LIMITS = _limits(32_000)
+DEFAULT_CONTEXT_WINDOW = DEFAULT_MODEL_LIMITS.context_window_tokens
+# Full JSON override for a single run. It replaces the model catalog result;
+# partial overrides are rejected so related limits cannot become inconsistent.
+MODEL_LIMITS_OVERRIDE = os.getenv("MODEL_LIMITS_OVERRIDE", "")
 DEFAULT_MAX_OUTPUT_TOKENS: int | None = None
 AUTO_MAX_OUTPUT_TOKEN_RESERVATION = 32768
 REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
@@ -163,19 +183,70 @@ def normalize_model_id(model_id: str) -> str:
     return s
 
 
-def context_window() -> int:
-    if CONTEXT_WINDOW_OVERRIDE > 0:
-        return CONTEXT_WINDOW_OVERRIDE
-    norm = normalize_model_id(MODEL_ID)
-    for pattern, window in CONTEXT_WINDOW_PATTERNS:
+def _parse_model_limits_override(raw: str) -> ModelLimits | None:
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("MODEL_LIMITS_OVERRIDE must be valid JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError("MODEL_LIMITS_OVERRIDE must be a JSON object")
+    required = {"context_window_tokens", "max_input_tokens", "max_output_tokens"}
+    if set(value) != required:
+        raise ValueError(
+            "MODEL_LIMITS_OVERRIDE must contain exactly: "
+            "context_window_tokens, max_input_tokens, max_output_tokens"
+        )
+    context_window_tokens = value["context_window_tokens"]
+    max_input_tokens = value["max_input_tokens"]
+    max_output_tokens = value["max_output_tokens"]
+    if (
+        isinstance(context_window_tokens, bool)
+        or not isinstance(context_window_tokens, int)
+        or context_window_tokens <= 0
+        or isinstance(max_input_tokens, bool)
+        or not isinstance(max_input_tokens, int)
+        or max_input_tokens <= 0
+        or max_input_tokens > context_window_tokens
+        or (
+            max_output_tokens is not None
+            and (isinstance(max_output_tokens, bool) or not isinstance(max_output_tokens, int)
+                 or max_output_tokens <= 0)
+        )
+    ):
+        raise ValueError(
+            "MODEL_LIMITS_OVERRIDE requires positive integer context_window_tokens "
+            "and max_input_tokens (max_input_tokens <= context_window_tokens), "
+            "and a positive integer or null max_output_tokens"
+        )
+    return ModelLimits(context_window_tokens, max_input_tokens, max_output_tokens)
+
+
+def model_limits(model_id: str | None = None) -> ModelLimits:
+    override = _parse_model_limits_override(MODEL_LIMITS_OVERRIDE)
+    if override is not None:
+        return override
+    norm = normalize_model_id(model_id if model_id is not None else MODEL_ID)
+    for pattern, limits in MODEL_LIMIT_PATTERNS:
         if pattern.match(norm):
-            return window
-    return DEFAULT_CONTEXT_WINDOW
+            return limits
+    return DEFAULT_MODEL_LIMITS
+
+
+def context_window() -> int:
+    """Compatibility helper for callers that only need the total window."""
+    return model_limits().context_window_tokens
 
 
 def output_token_reservation(max_output_tokens: int | None) -> int:
+    limits = model_limits()
     return (
-        min(AUTO_MAX_OUTPUT_TOKEN_RESERVATION, context_window() // 2)
+        min(
+            AUTO_MAX_OUTPUT_TOKEN_RESERVATION,
+            limits.context_window_tokens // 2,
+            limits.max_output_tokens or AUTO_MAX_OUTPUT_TOKEN_RESERVATION,
+        )
         if max_output_tokens is None
         else max_output_tokens
     )
@@ -187,20 +258,23 @@ def input_budget(
     # Tokens available for input once the response reservation and fixed overhead
     # are carved out. The trigger ratio applies to THIS, not the raw window, so
     # the output reservation can't be eaten away on small-context models.
-    return (
-        context_window()
-        - output_token_reservation(max_output_tokens)
-        - RESERVED_OVERHEAD_TOKENS
-    )
+    limits = model_limits()
+    return min(
+        limits.max_input_tokens,
+        limits.context_window_tokens - output_token_reservation(max_output_tokens),
+    ) - RESERVED_OVERHEAD_TOKENS
 
 
 def should_auto_compact(
     state: "LoopState",
     max_output_tokens: int | None = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> bool:
-    return (
-        state.last_input_tokens
-        >= COMPACT_TRIGGER_RATIO * input_budget(max_output_tokens)
+    # API usage describes the previous request. New tool results and steering
+    # directives are not represented there, so also estimate the payload that
+    # would be sent on the next request.
+    current_estimate = estimate_tokens(normalize_messages(state.messages))
+    return max(state.last_input_tokens, current_estimate) >= (
+        COMPACT_TRIGGER_RATIO * input_budget(max_output_tokens)
     )
 
 
@@ -215,6 +289,16 @@ def validate_generation_config(
         raise ValueError(f"unsupported reasoning_effort: {reasoning_effort}")
     if max_output_tokens is not None and max_output_tokens <= 0:
         raise ValueError("max_output_tokens must be positive")
+    known_max_output = model_limits().max_output_tokens
+    if (
+        max_output_tokens is not None
+        and known_max_output is not None
+        and max_output_tokens > known_max_output
+    ):
+        raise ValueError(
+            f"max_output_tokens={max_output_tokens} exceeds this model's "
+            f"maximum of {known_max_output}"
+        )
     if input_budget(max_output_tokens) <= 0:
         raise ValueError(
             "max_output_tokens plus reserved overhead must be smaller than "
@@ -706,29 +790,6 @@ def _drop_oldest_user_message(state: LoopState) -> bool:
 
 async def agent_loop(state: LoopState, session: AgentSession) -> TurnOutcome:
     while (outcome := await run_one_turn(state, session)) is None:
-        # Each `None` outcome is a clean turn boundary: the turn's tool outputs
-        # are already appended, so the history is well-formed (no orphaned tool
-        # call) -- a safe point to compact.
-        if AUTO_COMPACT_ENABLED and should_auto_compact(
-            state, session.max_output_tokens
-        ):
-            result = await compact_history_async(
-                state, source="auto", focus=None, client=client, model=MODEL_ID,
-                extra_body=PROVIDER_EXTRA_BODY, todo=session.todo,
-                trace_context=session.trace_context,
-            )
-            if result is not None:
-                print(
-                    f"[compact] auto-compacted: ~{result.tokens_before} -> "
-                    f"~{result.tokens_after} tokens (backup: {result.transcript_path})"
-                )
-                # If even a fresh summary still doesn't fit, the surviving user
-                # messages are the bulk: drop the oldest until we fit, rather
-                # than re-summarizing on every subsequent turn.
-                while should_auto_compact(
-                    state, session.max_output_tokens
-                ) and _drop_oldest_user_message(state):
-                    state.last_input_tokens = estimate_tokens(state.messages)
         if session.steering_policy is not None:
             try:
                 directive = session.steering_policy.after_turn(
@@ -757,6 +818,29 @@ async def agent_loop(state: LoopState, session: AgentSession) -> TurnOutcome:
                         api_call=state.api_call_count,
                         reason=directive.reason,
                     )
+        # This is a clean turn boundary: tool outputs and any steering directive
+        # have already been appended, so history is well-formed and represents
+        # the next request exactly enough for a conservative preflight check.
+        if AUTO_COMPACT_ENABLED and should_auto_compact(
+            state, session.max_output_tokens
+        ):
+            result = await compact_history_async(
+                state, source="auto", focus=None, client=client, model=MODEL_ID,
+                extra_body=PROVIDER_EXTRA_BODY, todo=session.todo,
+                trace_context=session.trace_context,
+            )
+            if result is not None:
+                print(
+                    f"[compact] auto-compacted: ~{result.tokens_before} -> "
+                    f"~{result.tokens_after} tokens (backup: {result.transcript_path})"
+                )
+                # If even a fresh summary still doesn't fit, the surviving user
+                # messages are the bulk: drop the oldest until we fit, rather
+                # than re-summarizing on every subsequent turn.
+                while should_auto_compact(
+                    state, session.max_output_tokens
+                ) and _drop_oldest_user_message(state):
+                    state.last_input_tokens = estimate_tokens(state.messages)
     return TurnOutcome(
         stop_reason=outcome.stop_reason,
         final_text=outcome.final_text,

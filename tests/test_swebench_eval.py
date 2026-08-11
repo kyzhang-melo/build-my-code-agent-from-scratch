@@ -280,6 +280,7 @@ def test_successful_attempt_is_never_rerun(tmp_path) -> None:
 def test_manifest_rejects_material_config_changes(tmp_path) -> None:
     path = tmp_path / "manifest.json"
     base = {
+        "schema_version": 2,
         "dataset": "verified",
         "split": "test",
         "instance_ids": ["a"],
@@ -289,6 +290,11 @@ def test_manifest_rejects_material_config_changes(tmp_path) -> None:
         "steering_thresholds": [45, 60],
         "reasoning_effort": None,
         "max_output_tokens": None,
+        "model_limits": {
+            "context_window_tokens": 32000,
+            "max_input_tokens": 32000,
+            "max_output_tokens": None,
+        },
         "instance_timeout_seconds": 10,
         "harness_commit": "h",
         "swebench_commit": "s",
@@ -310,11 +316,46 @@ def test_manifest_rejects_material_config_changes(tmp_path) -> None:
     changed = {**base, "max_output_tokens": 8000}
     with pytest.raises(ValueError, match="max_output_tokens"):
         core.ensure_manifest(path, changed)
+    changed = {**base, "model_limits": {**base["model_limits"], "max_input_tokens": 16000}}
+    with pytest.raises(ValueError, match="model_limits"):
+        core.ensure_manifest(path, changed)
     # Legacy manifests without provider remain resumable when no pin is used.
     core.ensure_manifest(path, {**base, "provider": ""})
     changed = {**base, "provider": "provider/fp8"}
     with pytest.raises(ValueError, match="provider"):
         core.ensure_manifest(path, changed)
+
+
+def test_manifest_migrates_legacy_resume_after_config_check(tmp_path) -> None:
+    path = tmp_path / "manifest.json"
+    core.atomic_write_json(path, {
+        "schema_version": 1,
+        "dataset": "verified",
+        "model": "hy3",
+        "harness_commit": "old-harness",
+    })
+    proposed = {
+        "schema_version": 2,
+        "dataset": "verified",
+        "model": "hy3",
+        "harness_commit": "new-harness",
+        "harness_worktree_dirty": True,
+        "model_limits": {
+            "context_window_tokens": 262144,
+            "max_input_tokens": 192000,
+            "max_output_tokens": 128000,
+        },
+    }
+    assert core.ensure_manifest(path, proposed)["schema_version"] == 2
+    migrated = json.loads(path.read_text(encoding="utf-8"))
+    assert migrated["model_limits"] == proposed["model_limits"]
+    assert migrated["harness_commit"] == "new-harness"
+    assert migrated["migrations"][-1]["previous_harness_commit"] == "old-harness"
+
+    with pytest.raises(ValueError, match="model"):
+        core.ensure_manifest(path, {**proposed, "model": "other"})
+    with pytest.raises(ValueError, match="harness_commit"):
+        core.ensure_manifest(path, {**proposed, "harness_commit": "another-harness"})
 
 
 def test_report_merges_agent_and_official_statuses(tmp_path) -> None:

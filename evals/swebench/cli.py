@@ -70,6 +70,8 @@ async def cmd_generate(args: argparse.Namespace) -> int:
     model = args.model or os.getenv("MODEL_ID")
     if not model:
         raise SystemExit("MODEL_ID is not set; pass --model or configure .env")
+    import main
+
     manifest = create_manifest(
         run_id=args.run_id,
         dataset=dataset,
@@ -83,6 +85,7 @@ async def cmd_generate(args: argparse.Namespace) -> int:
         max_output_tokens=args.max_output_tokens,
         timeout=args.instance_timeout,
         swebench_repo=swebench_repo,
+        model_limits=main.model_limits(model).as_dict(),
         provider=os.getenv("OPENROUTER_PROVIDER"),
     )
     ensure_manifest(target / "manifest.json", manifest)

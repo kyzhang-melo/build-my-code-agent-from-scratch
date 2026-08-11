@@ -389,7 +389,7 @@ def test_compact_history_async_noop_when_nothing_to_compact(load_module) -> None
 
 def test_input_budget_and_threshold(load_module) -> None:
     main = load_module("main", "main.py")
-    main.CONTEXT_WINDOW_OVERRIDE = 0
+    main.MODEL_LIMITS_OVERRIDE = ""
     main.MODEL_ID = "moonshotai/kimi-k2.5"
     assert main.context_window() == 262144
     assert main.input_budget() == 262144 - main.AUTO_MAX_OUTPUT_TOKEN_RESERVATION - main.RESERVED_OVERHEAD_TOKENS
@@ -409,12 +409,21 @@ def test_input_budget_and_threshold(load_module) -> None:
     state.last_input_tokens = 10199
     assert main.should_auto_compact(state) is False
 
+    main.MODEL_ID = "tencent/hy3"
+    assert main.model_limits() == main.ModelLimits(262_144, 192_000, 128_000)
+    assert main.input_budget() == 192_000 - main.RESERVED_OVERHEAD_TOKENS
+    with pytest.raises(ValueError, match="maximum of 128000"):
+        main.validate_generation_config(None, 128_001)
+
 
 def test_session_rejects_output_budget_that_consumes_context(
     load_module, tmp_path
 ) -> None:
     main = load_module("main", "main.py")
-    main.CONTEXT_WINDOW_OVERRIDE = 20000
+    main.MODEL_LIMITS_OVERRIDE = (
+        '{"context_window_tokens":20000,"max_input_tokens":20000,'
+        '"max_output_tokens":null}'
+    )
     try:
         with pytest.raises(ValueError, match="reserved overhead"):
             main.create_parent_session(
@@ -423,12 +432,12 @@ def test_session_rejects_output_budget_that_consumes_context(
                 max_output_tokens=16000,
             )
     finally:
-        main.CONTEXT_WINDOW_OVERRIDE = 0
+        main.MODEL_LIMITS_OVERRIDE = ""
 
 
 def test_context_window_normalizes_routing_and_quant_suffixes(load_module) -> None:
     main = load_module("main", "main.py")
-    main.CONTEXT_WINDOW_OVERRIDE = 0
+    main.MODEL_LIMITS_OVERRIDE = ""
 
     assert main.normalize_model_id("moonshotai/kimi-k2.5:exacto") == "kimi-k2.5"
     assert main.normalize_model_id("moonshotai/kimi-k2.5") == "kimi-k2.5"
@@ -457,14 +466,22 @@ def test_context_window_normalizes_routing_and_quant_suffixes(load_module) -> No
     assert main.context_window() == main.DEFAULT_CONTEXT_WINDOW
 
 
-def test_context_window_override_wins(load_module) -> None:
+def test_model_limits_override_wins_and_is_validated(load_module) -> None:
     main = load_module("main", "main.py")
     main.MODEL_ID = "moonshotai/kimi-k2.5"  # would resolve to 262144
-    main.CONTEXT_WINDOW_OVERRIDE = 20000
+    main.MODEL_LIMITS_OVERRIDE = (
+        '{"context_window_tokens":20000,"max_input_tokens":18000,'
+        '"max_output_tokens":4000}'
+    )
     try:
         assert main.context_window() == 20000
+        assert main.model_limits().max_input_tokens == 18000
     finally:
-        main.CONTEXT_WINDOW_OVERRIDE = 0
+        main.MODEL_LIMITS_OVERRIDE = ""
+
+    main.MODEL_LIMITS_OVERRIDE = '{"context_window_tokens":20000}'
+    with pytest.raises(ValueError, match="exactly"):
+        main.model_limits()
 
 
 def test_handle_command_dispatch(load_module, tmp_path) -> None:
@@ -566,3 +583,50 @@ def test_auto_compaction_fires_and_kill_switch(load_module, tmp_path) -> None:
         session,
     ))
     assert compact_calls == []
+
+
+def test_auto_compaction_preflights_tool_output_and_steering(load_module, tmp_path) -> None:
+    main = load_module("main", "main.py")
+    main.MODEL_LIMITS_OVERRIDE = (
+        '{"context_window_tokens":10000,"max_input_tokens":10000,'
+        '"max_output_tokens":100}'
+    )
+    steering_policy = types.SimpleNamespace(
+        name="test",
+        after_turn=lambda _api_call: types.SimpleNamespace(
+            content="s" * 12_000, reason="test"
+        ),
+    )
+    session = main.create_parent_session(
+        tmp_path, approval_handler=None, on_text=None,
+        steering_policy=steering_policy,
+    )
+    compact_calls: list[str] = []
+
+    async def fake_compact(state, **_kwargs):
+        compact_calls.append("auto")
+        state.messages[:] = [{"role": "user", "content": main.SUMMARY_PREFIX + "\ns"}]
+        state.last_input_tokens = 0
+        return types.SimpleNamespace(tokens_before=500, tokens_after=10, transcript_path=".t/x")
+
+    turns = iter([None, main.StepOutcome(stop_reason="completed", final_text="done")])
+
+    async def fake_turn(state, _session):
+        state.last_input_tokens = 1
+        return next(turns)
+
+    main.compact_history_async = fake_compact
+    main.run_one_turn = fake_turn
+    main.AUTO_COMPACT_ENABLED = True
+    try:
+        outcome = _run(main.agent_loop(
+            main.LoopState(messages=[
+                {"role": "user", "content": "start"},
+                {"type": "function_call_output", "call_id": "c", "output": "o" * 12_000},
+            ]),
+            session,
+        ))
+        assert outcome.final_text == "done"
+        assert compact_calls == ["auto"]
+    finally:
+        main.MODEL_LIMITS_OVERRIDE = ""
