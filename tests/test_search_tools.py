@@ -66,6 +66,39 @@ def test_run_glob_rejects_escape(load_module, workspace) -> None:
     assert tools.run_glob(workspace, "*.py", "../").startswith("Error: Path escapes workspace")
 
 
+def test_run_glob_allows_external_absolute_directory(
+    load_module,
+    workspace,
+    tmp_path,
+) -> None:
+    tools = load_module("tools", "tools.py")
+    external = tmp_path.parent / f"{tmp_path.name}-external-glob"
+    external.mkdir()
+    (external / "found.py").write_text("pass", encoding="utf-8")
+
+    output = tools.run_glob(workspace, "*.py", str(external))
+
+    assert "found.py" in output
+
+
+def test_run_glob_prunes_external_sensitive_paths(
+    load_module,
+    workspace,
+    tmp_path,
+) -> None:
+    tools = load_module("tools", "tools.py")
+    external = tmp_path.parent / f"{tmp_path.name}-external-sensitive-glob"
+    ssh_dir = external / ".ssh"
+    ssh_dir.mkdir(parents=True)
+    (ssh_dir / "secret.txt").write_text("secret", encoding="utf-8")
+    (external / "visible.txt").write_text("ok", encoding="utf-8")
+
+    output = tools.run_glob(workspace, "**/*.txt", str(external))
+
+    assert "visible.txt" in output
+    assert ".ssh" not in output
+
+
 def test_run_glob_broad_pattern_returns_top_level_listing(load_module, workspace) -> None:
     tools = load_module("tools", "tools.py")
     (workspace.root / "pkg").mkdir()
@@ -227,6 +260,30 @@ def test_run_grep_rejects_workspace_escape(load_module, monkeypatch, workspace) 
     output = tools.run_grep(workspace, "needle", path="../")
 
     assert output.startswith("Error: Path escapes workspace")
+
+
+def test_run_grep_allows_external_absolute_path(
+    load_module,
+    monkeypatch,
+    workspace,
+    tmp_path,
+) -> None:
+    tools = load_module("tools", "tools.py")
+    external = tmp_path.parent / f"{tmp_path.name}-external-grep"
+    external.mkdir()
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="")
+
+    monkeypatch.setattr(tools.shutil, "which", lambda _name: "/usr/bin/rg")
+    monkeypatch.setattr(tools.subprocess, "run", fake_run)
+
+    output = tools.run_grep(workspace, "needle", path=str(external))
+
+    assert output == "No matches found."
+    assert str(external.resolve()) in captured["args"]
 
 
 @pytest.mark.parametrize(

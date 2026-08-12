@@ -20,9 +20,13 @@ class Workspace:
     def __post_init__(self) -> None:
         object.__setattr__(self, "root", Path(self.root).resolve())
 
-    def resolve(self, path: str) -> Path:
-        """Resolve a workspace-relative path, rejecting anything that escapes."""
-        resolved = (self.root / path).resolve()
+    def resolve(self, path: str, *, allow_external_absolute: bool = False) -> Path:
+        """Resolve a path, optionally allowing explicit absolute external paths."""
+        expanded = Path(path).expanduser()
+        is_absolute = expanded.is_absolute()
+        resolved = (self.root / expanded).resolve()
         if not resolved.is_relative_to(self.root):
+            if allow_external_absolute and is_absolute:
+                return resolved
             raise ValueError(f"Path escapes workspace: {path}")
         return resolved

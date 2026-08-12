@@ -143,17 +143,23 @@ class PermissionManager:
         return decision.reason
 
     def _core_guard(self, tool_name: str, tool_input: dict) -> PermissionDecision | None:
-        if tool_name in {"read_file", "write_file", "edit_file"}:
-            raw_path = str(tool_input.get("path", ""))
+        if tool_name in {"read_file", "glob", "grep", "write_file", "edit_file"}:
+            path_key = "directory" if tool_name == "glob" else "path"
+            default_path = "." if tool_name in {"glob", "grep"} else ""
+            raw_path = str(tool_input.get(path_key, default_path) or default_path)
+            allow_external = tool_name in {"read_file", "glob", "grep"}
             try:
-                target = self._resolve_path(raw_path)
+                target = self._resolve_path(
+                    raw_path,
+                    allow_external_absolute=allow_external,
+                )
             except ValueError as exc:
                 return PermissionDecision(PermissionBehavior.DENY, str(exc))
 
-            if tool_name == "read_file" and is_sensitive_path(target, self.workdir):
+            if allow_external and is_sensitive_path(target, self.workdir):
                 return PermissionDecision(
                     PermissionBehavior.DENY,
-                    f"Reading sensitive file '{raw_path}' is blocked.",
+                    f"Reading sensitive path '{raw_path}' is blocked.",
                 )
 
             if tool_name in {"write_file", "edit_file"}:
@@ -170,9 +176,18 @@ class PermissionManager:
 
         return None
 
-    def _resolve_path(self, value: str) -> Path:
-        target = (self.workdir / os.path.expanduser(value)).resolve()
+    def _resolve_path(
+        self,
+        value: str,
+        *,
+        allow_external_absolute: bool = False,
+    ) -> Path:
+        expanded = Path(os.path.expanduser(value))
+        is_absolute = expanded.is_absolute()
+        target = (self.workdir / expanded).resolve()
         if not target.is_relative_to(self.workdir):
+            if allow_external_absolute and is_absolute:
+                return target
             raise ValueError(f"Path escapes workspace: {value}")
         return target
 
@@ -340,16 +355,16 @@ def permission_denied_output(tool_name: str, decision: PermissionDecision) -> st
 
 
 def is_sensitive_path(path: Path, workdir: Path) -> bool:
+    del workdir  # Kept in the signature for callers; sensitivity is path-global.
     name = path.name.lower()
     if name in SENSITIVE_BASENAMES or name.startswith(".env."):
         return True
     if path.suffix.lower() in SENSITIVE_SUFFIXES:
         return True
-    try:
-        parts = tuple(part.lower() for part in path.relative_to(workdir).parts)
-    except ValueError:
-        return True
+    parts = tuple(part.lower() for part in path.parts)
     if ".sessions" in parts or ".transcripts" in parts:
+        return True
+    if ".ssh" in parts:
         return True
     return len(parts) >= 2 and parts[-2:] == (".git", "config")
 

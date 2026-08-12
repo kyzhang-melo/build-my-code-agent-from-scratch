@@ -17,6 +17,9 @@ A learning project that refactors a monolithic code-agent loop into a multi-file
 - `evals/`: mini-fixture, SWE-bench, warm-context, analysis, and process-judge
   evaluation workflows.
 
+Read-only access outside the workdir requires an absolute path; write operations
+remain restricted to the workdir.
+
 ## Requirements
 
 - Python 3.10+

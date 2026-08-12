@@ -64,8 +64,15 @@ SENSITIVE_GLOB_PATTERNS = (
     "id_rsa",
     ".sessions",
     ".sessions/**",
+    "**/.sessions/**",
     ".transcripts",
     ".transcripts/**",
+    "**/.transcripts/**",
+    ".ssh",
+    ".ssh/**",
+    "**/.ssh/**",
+    ".git/config",
+    "**/.git/config",
 )
 
 # Budget for a single tool output handed back to the model. Char-based (chars
@@ -171,7 +178,8 @@ TOOLS = [
         "type": "function",
         "name": "read_file",
         "description": (
-            "Read text file contents from the workspace. Output is line-numbered "
+            "Read text file contents. Relative paths resolve within the workspace; "
+            "a path outside the workspace must be absolute. Output is line-numbered "
             "(line_number<TAB>content) and ends with a summary (total lines, and a "
             "'use offset=N to continue' hint when the file is longer than what was "
             "returned). To page through a large file, pass offset/limit instead of "
@@ -268,7 +276,8 @@ TOOLS = [
         "type": "function",
         "name": "glob",
         "description": (
-            "Find files or directories in the workspace by glob pattern. "
+            "Find files or directories by glob pattern. Relative search directories "
+            "resolve within the workspace; a directory outside it must be absolute. "
             "Recursive patterns like '**/config.json' are supported and search the "
             "whole tree (noisy dirs such as .venv/node_modules are skipped). "
             "When the user names a search directory, pass it as directory instead of "
@@ -293,8 +302,9 @@ TOOLS = [
                 "directory": {
                     "type": "string",
                     "description": (
-                        "Directory to search within, relative to the workspace or absolute "
-                        "inside the workspace. Defaults to the workspace."
+                        "Directory to search within. Relative paths resolve within the "
+                        "workspace; an external directory must be absolute. Defaults to "
+                        "the workspace."
                     ),
                 },
                 "include_dirs": {
@@ -314,7 +324,8 @@ TOOLS = [
         "type": "function",
         "name": "grep",
         "description": (
-            "Search workspace file contents with ripgrep. "
+            "Search file contents with ripgrep. Relative search paths resolve within the "
+            "workspace; a path outside it must be absolute. "
             "Put the search location in path, and use glob only to filter file names. "
             "The valid JSON arguments are pattern, path, glob, output_mode, ignore_case, "
             "line_number, and head_limit. Do not pass command-line flags such as -n, -A, "
@@ -331,8 +342,8 @@ TOOLS = [
                 "path": {
                     "type": "string",
                     "description": (
-                        "File or directory to search, relative to the workspace or absolute "
-                        "inside the workspace. Defaults to the workspace."
+                        "File or directory to search. Relative paths resolve within the "
+                        "workspace; an external path must be absolute. Defaults to the workspace."
                     ),
                 },
                 "glob": {
@@ -934,9 +945,11 @@ def run_read(
     `offset=` hint when more remains) so the model can page instead of re-reading.
     """
     try:
-        fp = workspace.resolve(path)
+        fp = workspace.resolve(path, allow_external_absolute=True)
     except Exception as e:
         return f"Error: {e}"
+    if is_sensitive_path(fp, workspace.root):
+        return f"Error: Access to sensitive path is blocked: {path}"
     if not fp.exists():
         return f"Error: File not found: {path}"
     if not fp.is_file():
@@ -1343,11 +1356,12 @@ def _glob_excluded(rel: Path) -> bool:
     return any(part in EXCLUDE_DIRS for part in rel.parts)
 
 
-def _glob_listing(pattern: str, base: Path) -> str:
+def _glob_listing(pattern: str, base: Path, workspace: Workspace) -> str:
     entries = [
         f"{child.name}/" if child.is_dir() else child.name
         for child in sorted(base.iterdir())
         if child.name not in EXCLUDE_DIRS
+        and not is_sensitive_path(child.resolve(), workspace.root)
     ]
     body = "\n".join(entries) if entries else "(empty)"
     return (
@@ -1359,7 +1373,12 @@ def _glob_listing(pattern: str, base: Path) -> str:
     )
 
 
-def _glob_walk(base: Path, tail: str, include_dirs: bool) -> list[Path]:
+def _glob_walk(
+    workspace: Workspace,
+    base: Path,
+    tail: str,
+    include_dirs: bool,
+) -> list[Path]:
     """Recursive `**/<tail>` search that prunes noisy dirs during traversal.
 
     Matches the basename against `tail` (not the relative path) so `fnmatch`'s
@@ -1367,7 +1386,11 @@ def _glob_walk(base: Path, tail: str, include_dirs: bool) -> list[Path]:
     """
     matches: list[Path] = []
     for root, dirs, files in os.walk(base):
-        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+        dirs[:] = [
+            d for d in dirs
+            if d not in EXCLUDE_DIRS
+            and not is_sensitive_path((Path(root) / d).resolve(), workspace.root)
+        ]
         names = files + dirs if include_dirs else files
         for name in names:
             if fnmatch.fnmatch(name, tail):
@@ -1404,7 +1427,7 @@ def run_glob(
     limit: int = 1000,
 ) -> str:
     try:
-        base = workspace.resolve(directory or ".")
+        base = workspace.resolve(directory or ".", allow_external_absolute=True)
         if not base.exists():
             return f"Error: Directory not found: {directory or '.'}"
         if not base.is_dir():
@@ -1413,11 +1436,11 @@ def run_glob(
             return f"Error: Access to sensitive directory is blocked: {directory or '.'}"
 
         if pattern in BROAD_GLOB_PATTERNS:
-            return _glob_listing(pattern, base)
+            return _glob_listing(pattern, base, workspace)
 
         if pattern.startswith("**/") and "/" not in pattern[3:]:
             # Precise recursive search: fast, pruned os.walk over the tree.
-            matches = _glob_walk(base, pattern[3:], include_dirs)
+            matches = _glob_walk(workspace, base, pattern[3:], include_dirs)
         else:
             # Non-recursive or exotic `**` shapes: pathlib handles the pattern;
             # noisy dirs are dropped from the results by the formatter.
@@ -1453,7 +1476,7 @@ def run_grep(
         return "Error: ripgrep (`rg`) is not installed. Install it with `brew install ripgrep`."
 
     try:
-        search_path = workspace.resolve(path)
+        search_path = workspace.resolve(path, allow_external_absolute=True)
         if not search_path.exists():
             return f"Error: Path not found: {path}"
         if is_sensitive_path(search_path, workspace.root):

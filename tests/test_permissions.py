@@ -64,6 +64,76 @@ def test_sensitive_reads_are_denied(load_module, path) -> None:
     assert "sensitive" in decision.reason.lower()
 
 
+def test_external_absolute_read_only_paths_are_allowed(load_module, tmp_path) -> None:
+    permissions = permission_module
+    workdir = tmp_path / "workspace"
+    external = tmp_path / "external"
+    workdir.mkdir()
+    external.mkdir()
+    manager = permissions.PermissionManager(workdir)
+
+    assert manager.check(
+        "read_file", {"path": str(external / "file.txt")}
+    ).behavior.value == "allow"
+    assert manager.check(
+        "glob", {"pattern": "*.py", "directory": str(external)}
+    ).behavior.value == "allow"
+    assert manager.check(
+        "grep", {"pattern": "needle", "path": str(external)}
+    ).behavior.value == "allow"
+
+
+@pytest.mark.parametrize(
+    "tool_name,path_key",
+    [
+        ("read_file", "path"),
+        ("glob", "directory"),
+        ("grep", "path"),
+    ],
+)
+def test_read_only_tools_reject_relative_workspace_escape(
+    load_module,
+    tool_name,
+    path_key,
+) -> None:
+    manager = permission_module.PermissionManager(Path.cwd())
+
+    decision = manager.check(tool_name, {path_key: "../outside"})
+
+    assert decision.behavior.value == "deny"
+    assert "escapes workspace" in decision.reason.lower()
+
+
+def test_external_sensitive_read_path_is_denied(load_module, tmp_path) -> None:
+    workdir = tmp_path / "workspace"
+    workdir.mkdir()
+    manager = permission_module.PermissionManager(workdir)
+
+    decision = manager.check(
+        "read_file",
+        {"path": str(tmp_path / ".ssh" / "custom-key-name")},
+    )
+
+    assert decision.behavior.value == "deny"
+    assert "sensitive" in decision.reason.lower()
+
+
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+def test_external_absolute_mutation_remains_denied(
+    load_module,
+    tmp_path,
+    tool_name,
+) -> None:
+    workdir = tmp_path / "workspace"
+    workdir.mkdir()
+    manager = permission_module.PermissionManager(workdir)
+
+    decision = manager.check(tool_name, {"path": str(tmp_path / "outside.txt")})
+
+    assert decision.behavior.value == "deny"
+    assert "escapes workspace" in decision.reason.lower()
+
+
 @pytest.mark.parametrize(
     "path",
     [
