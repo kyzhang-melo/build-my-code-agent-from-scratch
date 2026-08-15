@@ -32,6 +32,24 @@ SENSITIVE_BASENAMES = {
 }
 SENSITIVE_SUFFIXES = {".key", ".pem", ".p12", ".pfx"}
 
+SAFE_BASH_COMMANDS = {"ls", "rg", "grep", "head", "tail", "wc"}
+SAFE_GIT_SUBCOMMANDS = {"status", "diff", "log", "show"}
+UNSAFE_SHELL_SYNTAX = re.compile(r"(?:&&|\|\||[|;<>`$\n\r])")
+SHELL_GLOB_CHARS = frozenset("*?[]{}")
+UNSAFE_RG_OPTIONS = {
+    "--follow",
+    "--hidden",
+    "--no-ignore",
+    "--no-ignore-dot",
+    "--no-ignore-exclude",
+    "--no-ignore-files",
+    "--no-ignore-global",
+    "--no-ignore-messages",
+    "--no-ignore-parent",
+    "--no-ignore-vcs",
+    "--pre",
+}
+
 
 class PermissionMode(str, Enum):
     DEFAULT = "default"
@@ -115,11 +133,25 @@ class PermissionManager:
 
         if tool_name == "bash":
             command = str(tool_input.get("command", ""))
+            action = f"bash:{command}"
+            if action in self.auto_approve_actions:
+                return PermissionDecision(
+                    behavior=PermissionBehavior.ALLOW,
+                    reason="Session approval covers this exact shell command.",
+                    action=action,
+                    allow_for_session=True,
+                )
+            if is_safe_bash_command(command, self.workdir):
+                return PermissionDecision(
+                    behavior=PermissionBehavior.ALLOW,
+                    reason="Shell command is in the conservative read-only allowlist.",
+                    action=action,
+                )
             return PermissionDecision(
                 behavior=PermissionBehavior.ASK,
                 reason="Shell commands require approval.",
-                action=f"bash:{command}",
-                allow_for_session=False,
+                action=action,
+                allow_for_session=True,
             )
 
         if tool_name in READ_ONLY_TOOLS:
@@ -217,7 +249,8 @@ class TerminalApprovalHandler:
 
         options = "[y]es / [n]o"
         if request.allow_for_session:
-            options += " / [a]llow this path for the session"
+            scope = "command" if request.tool_name == "bash" else "path"
+            options += f" / [a]llow this {scope} for the session"
         prompt = f"\n[permission] {request.description}\n{options}: "
 
         async with self._lock:
@@ -377,6 +410,91 @@ def is_protected_write_path(path: Path, workdir: Path) -> bool:
     except ValueError:
         return True
     return ".git" in parts or ".ssh" in parts or ".sessions" in parts
+
+
+def is_safe_bash_command(command: str, workdir: Path) -> bool:
+    """Return whether a simple shell command is safe to run without approval.
+
+    This is deliberately a small allowlist, not a shell security parser. Any
+    compound shell syntax, dynamic expansion, suspicious path, or unfamiliar
+    argument shape falls back to interactive approval.
+    """
+    if not command or UNSAFE_SHELL_SYNTAX.search(command):
+        return False
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    if not argv:
+        return False
+
+    executable = Path(argv[0]).name
+    args = argv[1:]
+    if executable == "pwd":
+        return not args
+    if executable == "git":
+        return _is_safe_git_command(args)
+    if executable not in SAFE_BASH_COMMANDS:
+        return False
+    if executable in {"rg", "grep"} and _has_unsafe_search_options(executable, args):
+        return False
+    return all(_is_safe_bash_argument(arg, workdir) for arg in args)
+
+
+def _is_safe_git_command(args: list[str]) -> bool:
+    if not args:
+        return False
+    if args[:2] == ["branch", "--show-current"]:
+        return len(args) == 2
+    return args[0] in SAFE_GIT_SUBCOMMANDS and all(
+        arg not in {"--ext-diff", "--no-index"} for arg in args[1:]
+    )
+
+
+def _is_safe_bash_argument(arg: str, workdir: Path) -> bool:
+    if not arg:
+        return True
+    lowered = arg.lower()
+    if any(name in lowered for name in SENSITIVE_BASENAMES):
+        return False
+    if any(marker in lowered for marker in (".env", ".ssh", ".sessions", ".transcripts")):
+        return False
+    if any(lowered.endswith(suffix) for suffix in SENSITIVE_SUFFIXES):
+        return False
+    if arg.startswith("-"):
+        return True
+    if arg.startswith("~") or any(char in arg for char in SHELL_GLOB_CHARS):
+        return False
+
+    candidate = Path(os.path.expanduser(arg))
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(workdir):
+            return False
+    else:
+        resolved = (workdir / candidate).resolve()
+        if not resolved.is_relative_to(workdir):
+            return False
+    return not is_sensitive_path(resolved, workdir)
+
+
+def _has_unsafe_search_options(executable: str, args: list[str]) -> bool:
+    for arg in args:
+        if executable == "rg":
+            if arg in UNSAFE_RG_OPTIONS or any(
+                arg.startswith(f"{option}=") for option in UNSAFE_RG_OPTIONS
+            ):
+                return True
+            if re.fullmatch(r"-u+", arg):
+                return True
+        if executable == "grep":
+            if arg in {"--recursive", "--dereference-recursive"}:
+                return True
+            if arg.startswith("-") and not arg.startswith("--") and any(
+                flag in arg[1:] for flag in "rR"
+            ):
+                return True
+    return False
 
 
 def bash_hard_deny_reason(command: str, workdir: Path) -> str | None:

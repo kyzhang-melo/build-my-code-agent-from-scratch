@@ -911,10 +911,21 @@ async def cmd_permissions(arg: str, history: list, session: AgentSession) -> Non
     )
     if not paths:
         print("[permissions] session-approved paths: none")
+    else:
+        print("[permissions] session-approved paths:")
+        for path in paths:
+            print(f"  {path}")
+    commands = sorted(
+        action.removeprefix("bash:")
+        for action in manager.auto_approve_actions
+        if action.startswith("bash:")
+    )
+    if not commands:
+        print("[permissions] session-approved bash commands: none")
         return
-    print("[permissions] session-approved paths:")
-    for path in paths:
-        print(f"  {path}")
+    print("[permissions] session-approved bash commands:")
+    for command in commands:
+        print(f"  {command}")
 
 
 async def cmd_sessions(arg: str, history: list, session: AgentSession) -> None:

@@ -236,11 +236,68 @@ def test_dynamic_dev_redirects_are_hard_denied(load_module, command) -> None:
     assert "device" in decision.reason.lower()
 
 
-def test_devnull_bash_returns_ask_not_allow(load_module) -> None:
+def test_compound_bash_returns_ask_not_allow(load_module) -> None:
     permissions = permission_module
     manager = permissions.PermissionManager(Path.cwd())
 
     decision = manager.check("bash", {"command": "find . 2>/dev/null"})
+
+    assert decision.behavior.value == "ask"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pwd",
+        "ls -lh",
+        "rg PermissionManager permissions.py",
+        "grep PermissionManager permissions.py",
+        "head -20 permissions.py",
+        "tail -20 permissions.py",
+        "wc -l permissions.py",
+        "git status",
+        "git diff --stat",
+        "git log --oneline -5",
+        "git show HEAD",
+        "git branch --show-current",
+    ],
+)
+def test_conservative_read_only_bash_commands_are_allowed(load_module, command) -> None:
+    manager = permission_module.PermissionManager(Path.cwd())
+
+    decision = manager.check("bash", {"command": command})
+
+    assert decision.behavior.value == "allow"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo hi",
+        "pytest -q",
+        "npm install",
+        "git commit -m test",
+        "git status && echo done",
+        "git status | head",
+        "ls > files.txt",
+        "rg foo $(pwd)",
+        "ls ../",
+        "ls /tmp",
+        "ls .env",
+        "rg --pre 'cat' needle .",
+        "rg --hidden SECRET .",
+        "rg -u SECRET .",
+        "rg --glob=.env SECRET .",
+        "grep -r SECRET .",
+        "git diff --ext-diff",
+        "git diff --no-index a b",
+        "'unterminated",
+    ],
+)
+def test_untrusted_or_complex_bash_commands_still_ask(load_module, command) -> None:
+    manager = permission_module.PermissionManager(Path.cwd())
+
+    decision = manager.check("bash", {"command": command})
 
     assert decision.behavior.value == "ask"
 
@@ -510,7 +567,7 @@ def test_approve_for_session_executes_and_covers_edit(load_module, workspace) ->
     assert calls == 1
 
 
-def test_bash_approval_never_becomes_session_allow(load_module) -> None:
+def test_bash_exact_command_approval_is_reused_for_session(load_module) -> None:
     permissions = permission_module
     calls = 0
 
@@ -518,7 +575,7 @@ def test_bash_approval_never_becomes_session_allow(load_module) -> None:
         async def request(self, request):
             nonlocal calls
             calls += 1
-            assert request.allow_for_session is False
+            assert request.allow_for_session is True
             return permissions.ApprovalResponse("approve_for_session")
 
     service = permissions.PermissionService(
@@ -528,7 +585,42 @@ def test_bash_approval_never_becomes_session_allow(load_module) -> None:
 
     first = asyncio.run(service.authorize("bash", {"command": "echo hi"}))
     second = asyncio.run(service.authorize("bash", {"command": "echo hi"}))
+    changed = service.manager.check("bash", {"command": "echo  hi"})
 
-    assert first.behavior.value == "deny"
-    assert second.behavior.value == "deny"
-    assert calls == 2
+    assert first.behavior.value == "allow"
+    assert second.behavior.value == "allow"
+    assert changed.behavior.value == "ask"
+    assert calls == 1
+
+
+def test_bash_session_approval_cannot_override_hard_deny(load_module) -> None:
+    manager = permission_module.PermissionManager(Path.cwd())
+    command = "sudo echo hi"
+    manager.remember(f"bash:{command}")
+
+    decision = manager.check("bash", {"command": command})
+
+    assert decision.behavior.value == "deny"
+
+
+def test_bash_session_prompt_names_command_scope(load_module) -> None:
+    prompts = []
+
+    async def prompt(message: str) -> str:
+        prompts.append(message)
+        return "n"
+
+    handler = permission_module.TerminalApprovalHandler(
+        interactive=True,
+        prompt_fn=prompt,
+    )
+    request = permission_module.ApprovalRequest(
+        tool_name="bash",
+        action="bash:echo hi",
+        description="echo hi",
+        allow_for_session=True,
+    )
+
+    asyncio.run(handler.request(request))
+
+    assert "[a]llow this command for the session" in prompts[0]

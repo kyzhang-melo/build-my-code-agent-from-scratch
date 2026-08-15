@@ -48,3 +48,6 @@ evals/.cache/
 
 # Local cross-session notes; intentionally not versioned
 evals/.handover/
+
+# Local draft documents; intentionally not versioned
+.local-docs/
