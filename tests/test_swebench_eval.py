@@ -44,6 +44,18 @@ def make_repo(tmp_path: Path) -> tuple[Path, Path, str]:
     return source, mirror, commit
 
 
+def test_task_from_dict_preserves_optional_defaults() -> None:
+    task = Task.from_dict({
+        "instance_id": "id",
+        "repo": "owner/repo",
+        "base_commit": "abc",
+        "problem_statement": "Fix it",
+    })
+
+    assert task.platform == "linux/x86_64"
+    assert task.instance_image_key == ""
+
+
 def test_build_prompt_contains_issue_but_not_gold_fields() -> None:
     task = Task("id", "owner/repo", "abc", "Fix the actual issue", "1")
     prompt = core.build_prompt(task)
@@ -346,16 +358,32 @@ def test_manifest_migrates_legacy_resume_after_config_check(tmp_path) -> None:
             "max_output_tokens": 128000,
         },
     }
-    assert core.ensure_manifest(path, proposed)["schema_version"] == 2
+    assert core.ensure_manifest(path, proposed)["schema_version"] == 3
     migrated = json.loads(path.read_text(encoding="utf-8"))
     assert migrated["model_limits"] == proposed["model_limits"]
     assert migrated["harness_commit"] == "new-harness"
-    assert migrated["migrations"][-1]["previous_harness_commit"] == "old-harness"
+    harness_migration = next(
+        item for item in migrated["migrations"]
+        if item["kind"] == "model_limits_and_harness_upgrade"
+    )
+    assert harness_migration["previous_harness_commit"] == "old-harness"
 
     with pytest.raises(ValueError, match="model"):
         core.ensure_manifest(path, {**proposed, "model": "other"})
     with pytest.raises(ValueError, match="harness_commit"):
         core.ensure_manifest(path, {**proposed, "harness_commit": "another-harness"})
+
+
+def test_legacy_manifest_docker_conflict_has_actionable_message(tmp_path) -> None:
+    path = tmp_path / "manifest.json"
+    core.atomic_write_json(path, {"schema_version": 2})
+
+    with pytest.raises(ValueError, match="--generate-environment local"):
+        core.ensure_manifest(path, {
+            "schema_version": 3,
+            "generate_environment": "docker",
+            "solve_network_mode": "none",
+        })
 
 
 def test_report_merges_agent_and_official_statuses(tmp_path) -> None:
@@ -667,6 +695,7 @@ def test_run_parser_combines_generation_and_evaluation_options() -> None:
     assert args.max_output_tokens == 16000
     assert args.cache_level == "env"
     assert args.namespace == "swebench"
+    assert args.generate_environment == "local"
 
 
 def test_swebench_parser_accepts_none_reasoning_effort() -> None:
@@ -695,8 +724,20 @@ def test_swebench_defaults_to_five_workers() -> None:
     assert pipeline.reasoning_effort is None
     assert pipeline.max_output_tokens is None
     assert pipeline.instance_timeout is None
+    assert pipeline.generate_environment == "local"
     assert evaluate.cache_level == "instance"
     assert pipeline.cache_level == "instance"
+
+
+def test_swebench_generate_can_use_local_environment() -> None:
+    from evals.swebench import cli
+
+    args = cli.build_parser().parse_args([
+        "generate", "--run-id", "local", "--subset", "small.json",
+        "--generate-environment", "local",
+    ])
+
+    assert args.generate_environment == "local"
 
 
 def test_swebench_parser_can_disable_staged_steering() -> None:

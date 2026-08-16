@@ -26,7 +26,7 @@ TERMINAL_AGENT_STATUSES = {"completed", "max_api_calls", "timeout", "error"}
 FAILED_AGENT_STATUSES = {"max_api_calls", "timeout", "error"}
 SWEBENCH_SYSTEM_ADDENDUM = (
     "SWE-bench evaluation mode: solve the issue by producing the smallest correct "
-    "source patch. The host workspace is provided only for source inspection and "
+    "source patch. The solve workspace is provided only for source inspection and "
     "editing. Do not install dependencies, create virtual environments, download "
     "packages, run the project's tests, or execute or import project code to "
     "validate the change. Do not attempt to repair the host environment. Use source "
@@ -150,6 +150,7 @@ def load_tasks_via_bridge(
     split: str,
     instance_ids: list[str],
     output_path: Path,
+    namespace: str = "swebench",
 ) -> list[Task]:
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join(
@@ -167,6 +168,8 @@ def load_tasks_via_bridge(
             *instance_ids,
             "--output",
             str(output_path),
+            "--namespace",
+            namespace,
         ],
         cwd=swebench_repo,
         env=env,
@@ -401,11 +404,13 @@ def create_manifest(
     swebench_repo: Path,
     model_limits: dict[str, int | None],
     provider: str | None = None,
+    generate_environment: str = "local",
+    image_namespace: str = "swebench",
 ) -> dict:
     harness_commit, harness_dirty = repository_state(PROJECT_ROOT)
     swebench_commit, swebench_dirty = repository_state(swebench_repo)
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "run_id": run_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "dataset": dataset,
@@ -431,14 +436,26 @@ def create_manifest(
         "swebench_worktree_dirty": swebench_dirty,
         "platform": platform.platform(),
         "auto_compact": os.getenv("AUTO_COMPACT", "1") != "0",
+        "generate_environment": generate_environment,
+        "solve_network_mode": "none" if generate_environment == "docker" else "host",
+        "image_namespace": image_namespace,
     }
 
 
 def ensure_manifest(path: Path, proposed: dict) -> dict:
+    proposed = dict(proposed)
+    proposed.setdefault("generate_environment", "local")
+    proposed.setdefault("solve_network_mode", "host")
+    proposed.setdefault("image_namespace", "swebench")
     if not path.exists():
         atomic_write_json(path, proposed)
         return proposed
     existing = json.loads(path.read_text(encoding="utf-8"))
+    needs_environment_migration = "generate_environment" not in existing
+    if needs_environment_migration:
+        existing["generate_environment"] = "local"
+        existing["solve_network_mode"] = "host"
+        existing["image_namespace"] = proposed.get("image_namespace", "swebench")
     needs_model_limits_migration = "model_limits" not in existing
     keys = (
         "dataset",
@@ -455,6 +472,9 @@ def ensure_manifest(path: Path, proposed: dict) -> dict:
         "instance_timeout_seconds",
         "harness_commit",
         "swebench_commit",
+        "generate_environment",
+        "solve_network_mode",
+        "image_namespace",
     )
     conflicts = [
         key
@@ -470,7 +490,15 @@ def ensure_manifest(path: Path, proposed: dict) -> dict:
         )
     ]
     if conflicts:
-        raise ValueError(f"run manifest conflicts in: {', '.join(conflicts)}")
+        detail = f"run manifest conflicts in: {', '.join(conflicts)}"
+        if needs_environment_migration and any(
+            key in conflicts for key in ("generate_environment", "solve_network_mode")
+        ):
+            detail += (
+                "; legacy runs used the local generate environment, so resume with "
+                "--generate-environment local or choose a new run id for Docker"
+            )
+        raise ValueError(detail)
     if needs_model_limits_migration:
         previous_harness_commit = existing.get("harness_commit")
         existing["schema_version"] = 2
@@ -486,6 +514,17 @@ def ensure_manifest(path: Path, proposed: dict) -> dict:
             "previous_harness_commit": previous_harness_commit,
             "new_harness_commit": proposed["harness_commit"],
         })
+    if needs_environment_migration:
+        existing["schema_version"] = 3
+        migrations = existing.setdefault("migrations", [])
+        if not isinstance(migrations, list):
+            raise ValueError("run manifest has invalid migrations metadata")
+        migrations.append({
+            "kind": "generate_environment_upgrade",
+            "migrated_at": datetime.now(timezone.utc).isoformat(),
+            "generate_environment": "local",
+        })
+    if needs_model_limits_migration or needs_environment_migration:
         atomic_write_json(path, existing)
     return existing
 
@@ -511,9 +550,12 @@ async def run_agent_attempt(
     reasoning_effort: str | None,
     max_output_tokens: int | None,
     timeout: int | None,
+    generate_environment: str = "local",
 ) -> AgentResult:
     import main
     from trace import JsonlTraceSink, TraceContext
+    from sandbox import DockerSandbox
+    from workspace import Workspace
 
     workspace = create_isolated_workspace(
         mirror,
@@ -530,25 +572,33 @@ async def run_agent_attempt(
         run_id=f"{run_id}:{task.instance_id}:attempt-{attempt}",
         agent_id="parent",
     )
-    session = main.create_parent_session(
-        workspace,
-        approval_handler=AutoApproveHandler(),
-        trace_context=trace,
-        on_text=None,
-        max_api_calls=max_api_calls,
-        steering_policy=(
-            SwebenchSteeringPolicy(workspace, task.base_commit)
-            if steering_policy == "staged"
-            else None
-        ),
-        reasoning_effort=reasoning_effort,
-        max_output_tokens=max_output_tokens,
-        system_addendum=SWEBENCH_SYSTEM_ADDENDUM,
-        tool_names=SWEBENCH_TOOL_NAMES,
-    )
     state = main.LoopState(messages=[{"role": "user", "content": build_prompt(task)}])
     log_path = attempt_dir / "agent.log"
+    sandbox = None
     try:
+        if generate_environment == "docker":
+            if not task.instance_image_key:
+                raise RuntimeError("task is missing its SWE-bench instance image key")
+            sandbox = DockerSandbox(
+                Workspace(workspace), task.instance_image_key, platform=task.platform,
+            ).start()
+        session = main.create_parent_session(
+            workspace,
+            approval_handler=AutoApproveHandler(),
+            trace_context=trace,
+            on_text=None,
+            max_api_calls=max_api_calls,
+            steering_policy=(
+                SwebenchSteeringPolicy(workspace, task.base_commit)
+                if steering_policy == "staged"
+                else None
+            ),
+            reasoning_effort=reasoning_effort,
+            max_output_tokens=max_output_tokens,
+            system_addendum=SWEBENCH_SYSTEM_ADDENDUM,
+            tool_names=SWEBENCH_TOOL_NAMES,
+            sandbox=sandbox,
+        )
         with log_path.open("w", encoding="utf-8") as log, contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
             if timeout is None:
                 outcome = await main.agent_loop(state, session)
@@ -572,6 +622,9 @@ async def run_agent_attempt(
         # every request that was attempted before the failure.
         result.api_calls = state.api_call_count
         result.error = f"{type(exc).__name__}: {exc}"
+    finally:
+        if sandbox is not None:
+            sandbox.close()
 
     (attempt_dir / "final_text.txt").write_text(final_text, encoding="utf-8")
     try:
@@ -604,6 +657,7 @@ def run_agent_attempt_worker(
     reasoning_effort: str | None,
     max_output_tokens: int | None,
     timeout: int | None,
+    generate_environment: str = "local",
 ) -> AgentResult:
     """Run one attempt in a dedicated worker process.
 
@@ -622,6 +676,7 @@ def run_agent_attempt_worker(
             reasoning_effort=reasoning_effort,
             max_output_tokens=max_output_tokens,
             timeout=timeout,
+            generate_environment=generate_environment,
         )
     )
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -37,6 +38,9 @@ class FileBackend(Protocol):
 
 
 class Sandbox(Protocol):
+    @property
+    def command_runner(self) -> CommandRunner: ...
+
     @property
     def file_backend(self) -> FileBackend: ...
 
@@ -93,14 +97,17 @@ class DockerCommandRunner:
         if cwd:
             command.extend(["--workdir", cwd])
         command.extend([self.container_id, *argv])
-        completed = subprocess.run(
-            command,
-            input=stdin,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                command,
+                input=stdin,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return CommandResult(124, "", f"container command timed out after {timeout}s")
         return CommandResult(completed.returncode, completed.stdout, completed.stderr)
 
 
@@ -148,11 +155,16 @@ class DockerSandbox:
 
     def start(self) -> "DockerSandbox":
         name = f"mycodeagent-swe-{uuid.uuid4().hex[:12]}"
+        workspace_label = hashlib.sha256(
+            str(self.workspace.root).encode("utf-8")
+        ).hexdigest()[:16]
+        self._remove_orphans(workspace_label)
         completed = subprocess.run(
             [
                 "docker", "run", "--detach", "--network", "none",
                 "--platform", self.platform, "--name", name,
                 "--label", "mycodeagent.role=swebench-solve",
+                "--label", f"mycodeagent.workspace={workspace_label}",
                 "--user", f"{os.getuid()}:{os.getgid()}",
                 "--mount", f"type=bind,src={self.workspace.root},dst=/testbed",
                 "--workdir", "/testbed", self.image, "tail", "-f", "/dev/null",
@@ -174,7 +186,32 @@ class DockerSandbox:
         if copied.returncode != 0:
             self.close()
             raise RuntimeError(copied.stderr.strip() or "failed to install grep bridge")
+        check = self.file_backend.grep(
+            GrepRequest(pattern="__mycodeagent_bridge_self_check_7f4d2b9a__", path=".")
+        )
+        if check.startswith("Error:"):
+            self.close()
+            raise RuntimeError(f"grep bridge self-check failed: {check}")
         return self
+
+    @staticmethod
+    def _remove_orphans(workspace_label: str) -> None:
+        listed = subprocess.run(
+            [
+                "docker", "ps", "--all", "--quiet", "--filter",
+                f"label=mycodeagent.workspace={workspace_label}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        for container_id in listed.stdout.split():
+            subprocess.run(
+                ["docker", "rm", "-f", container_id],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
 
     def close(self) -> None:
         container_id = self.container_id

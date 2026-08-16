@@ -93,17 +93,37 @@ def test_docker_sandbox_uses_network_none_and_always_removes(monkeypatch, tmp_pa
         calls.append(argv)
         if argv[:2] == ["docker", "run"]:
             return subprocess.CompletedProcess(argv, 0, stdout="container-id\n", stderr="")
+        if argv[:2] == ["docker", "exec"]:
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=json.dumps({"output": "No matches found."}), stderr="",
+            )
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
     monkeypatch.setattr(sandbox.subprocess, "run", fake_run)
     runtime = DockerSandbox(Workspace(tmp_path), "example/image:latest").start()
     runtime.close()
 
-    run = calls[0]
+    run = next(call for call in calls if call[:2] == ["docker", "run"])
+    assert calls[0][:2] == ["docker", "ps"]
     assert ["--network", "none"] == run[run.index("--network"):run.index("--network") + 2]
     assert ["--user", f"{os.getuid()}:{os.getgid()}"] == run[
         run.index("--user"):run.index("--user") + 2
     ]
     assert f"type=bind,src={tmp_path},dst=/testbed" in run
-    assert calls[1][:2] == ["docker", "cp"]
-    assert calls[2] == ["docker", "rm", "-f", "container-id"]
+    assert any(item.startswith("mycodeagent.workspace=") for item in run)
+    assert any(call[:2] == ["docker", "cp"] for call in calls)
+    assert calls[-1] == ["docker", "rm", "-f", "container-id"]
+
+
+def test_docker_command_timeout_is_normalized(monkeypatch) -> None:
+    import sandbox
+
+    def timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(["docker", "exec"], 3)
+
+    monkeypatch.setattr(sandbox.subprocess, "run", timeout)
+
+    result = sandbox.DockerCommandRunner("container-id").run(["true"], timeout=3)
+
+    assert result.exit_code == 124
+    assert result.stderr == "container command timed out after 3s"

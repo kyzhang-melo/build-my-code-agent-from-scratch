@@ -10,10 +10,16 @@ class Task:
     base_commit: str
     problem_statement: str
     version: str = ""
+    instance_image_key: str = ""
+    platform: str = "linux/x86_64"
 
     @classmethod
     def from_dict(cls, raw: dict) -> "Task":
-        return cls(**{field: raw.get(field, "") for field in cls.__dataclass_fields__})
+        return cls(**{
+            field: raw[field]
+            for field in cls.__dataclass_fields__
+            if field in raw
+        })
 
     def to_dict(self) -> dict:
         return asdict(self)

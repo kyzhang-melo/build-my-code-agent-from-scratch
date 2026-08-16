@@ -1,15 +1,18 @@
 # SWE-bench eval
 
-This adapter runs the real `myCodeAgent-v0` parent agent in host-side Git
+This adapter runs the real `myCodeAgent-v0` parent agent against Git
 repositories whose history ends at each task's base commit, exports the
-resulting repository changes, and delegates grading to
-the unmodified official SWE-bench Docker harness.
+resulting repository changes, and delegates grading to the unmodified official
+SWE-bench Docker harness. Generation remains host-local by default. Pass
+`--generate-environment docker` to opt into the experimental per-attempt solve
+container backend.
 
-The host-side eval agent uses a restricted tool profile: workspace-bound file
-tools, `todo`, the read-only exploration subagent, and a parameter-free
-`git_diff`. It does not receive the general-purpose `bash` tool, so model tool
-calls cannot inspect other runs or host files. This is tool-capability
-isolation, not an operating-system sandbox.
+The eval agent uses a restricted tool profile: workspace-bound file tools,
+`todo`, the read-only exploration subagent, and a parameter-free `git_diff`.
+It does not receive the general-purpose `bash` tool. In Docker generation mode,
+the workspace is mounted at `/testbed`, networking is disabled, and `grep`
+executes inside the solve container. The remaining file tools still operate on
+the same bind-mounted workspace from the host and will migrate incrementally.
 
 Live runs call a model, clone GitHub repositories, and may consume substantial
 time, tokens, disk, and Docker resources. They are separate from pytest.
@@ -78,8 +81,8 @@ windows.
 
 Agent instances have no overall timeout by default. Use
 `--instance-timeout <seconds>` only when a run needs an explicit safety limit.
-This setting applies to the host-side agent loop, not the official Docker test
-timeout.
+This setting applies to the agent loop and solve container, not the official
+Docker test timeout.
 
 Generation uses staged steering by default. After model calls 45 and 60, the
 eval injects a session-local instruction to converge and deliver a patch; the

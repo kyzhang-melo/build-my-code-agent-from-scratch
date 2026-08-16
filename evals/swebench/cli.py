@@ -71,6 +71,8 @@ async def cmd_generate(args: argparse.Namespace) -> int:
     if not model:
         raise SystemExit("MODEL_ID is not set; pass --model or configure .env")
     import main
+    generate_environment = getattr(args, "generate_environment", "local")
+    namespace = getattr(args, "namespace", "swebench")
 
     manifest = create_manifest(
         run_id=args.run_id,
@@ -87,6 +89,8 @@ async def cmd_generate(args: argparse.Namespace) -> int:
         swebench_repo=swebench_repo,
         model_limits=main.model_limits(model).as_dict(),
         provider=os.getenv("OPENROUTER_PROVIDER"),
+        generate_environment=generate_environment,
+        image_namespace=namespace,
     )
     ensure_manifest(target / "manifest.json", manifest)
     tasks = load_tasks_via_bridge(
@@ -96,6 +100,7 @@ async def cmd_generate(args: argparse.Namespace) -> int:
         split,
         instance_ids,
         target / "tasks.json",
+        namespace,
     )
 
     cache_dir = Path(args.repo_cache).expanduser().resolve()
@@ -160,6 +165,7 @@ async def cmd_generate(args: argparse.Namespace) -> int:
             reasoning_effort=args.reasoning_effort,
             max_output_tokens=args.max_output_tokens,
             timeout=args.instance_timeout,
+            generate_environment=generate_environment,
         )
         future = loop.run_in_executor(executor, call)
         futures[future] = (task, attempt_dir)
@@ -332,10 +338,15 @@ def _generate_args(parser: argparse.ArgumentParser) -> None:
         default=5,
         help="parallel agent processes used to generate patches (default: 5)",
     )
+    parser.add_argument(
+        "--generate-environment",
+        choices=("docker", "local"),
+        default="local",
+        help="tool execution environment used during patch generation (default: local)",
+    )
 
 
 def _evaluate_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--namespace", default="swebench")
     parser.add_argument(
         "--max-workers",
         type=_positive_int,
@@ -357,6 +368,10 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _docker_image_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--namespace", default="swebench")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run myCodeAgent against SWE-bench.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -364,12 +379,14 @@ def build_parser() -> argparse.ArgumentParser:
     generate = sub.add_parser("generate", help="run the agent and produce predictions")
     _shared_run_args(generate)
     _swebench_args(generate)
+    _docker_image_args(generate)
     _generate_args(generate)
     generate.set_defaults(func=cmd_generate)
 
     evaluate = sub.add_parser("evaluate", help="run the official Docker evaluator")
     _shared_run_args(evaluate)
     _swebench_args(evaluate)
+    _docker_image_args(evaluate)
     _evaluate_args(evaluate)
     evaluate.set_defaults(func=cmd_evaluate)
 
@@ -383,6 +400,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _shared_run_args(pipeline)
     _swebench_args(pipeline)
+    _docker_image_args(pipeline)
     _generate_args(pipeline)
     _evaluate_args(pipeline)
     pipeline.set_defaults(func=cmd_run)

@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 from swebench.harness.utils import load_swebench_dataset
+from swebench.harness.test_spec.test_spec import make_test_spec
 
 
 SAFE_FIELDS = ("instance_id", "repo", "base_commit", "problem_statement", "version")
@@ -19,10 +20,20 @@ def main() -> int:
     parser.add_argument("--split", default="test")
     parser.add_argument("--instance-ids", nargs="+", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--namespace", default="swebench")
     args = parser.parse_args()
 
     rows = load_swebench_dataset(args.dataset, args.split, args.instance_ids)
-    tasks = [{key: row.get(key, "") for key in SAFE_FIELDS} for row in rows]
+    namespace = None if args.namespace.lower() == "none" else args.namespace
+    tasks = []
+    for row in rows:
+        spec = make_test_spec(row, namespace=namespace)
+        task = {key: row.get(key, "") for key in SAFE_FIELDS}
+        task.update({
+            "instance_image_key": spec.instance_image_key,
+            "platform": spec.platform,
+        })
+        tasks.append(task)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(tasks, indent=2), encoding="utf-8")
     return 0
