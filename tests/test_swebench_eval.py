@@ -66,8 +66,8 @@ def test_build_prompt_contains_issue_but_not_gold_fields() -> None:
     assert "Do not install dependencies" in prompt
     assert "run the project's tests" in prompt
     assert "execute or import project code" in prompt
-    assert "shell tool is unavailable" in prompt
-    assert "Use git_diff to review the final patch" in prompt
+    assert "Use bash to inspect the workspace" in prompt
+    assert "git diff" in prompt
     assert "tests run" not in prompt
 
 
@@ -666,8 +666,8 @@ def test_parent_session_system_addendum_is_per_session(load_module, tmp_path) ->
     assert "git_diff" not in regular_names
     assert swebench_names == set(core.SWEBENCH_TOOL_NAMES)
     assert set(swebench.registry) == set(core.SWEBENCH_TOOL_NAMES)
-    assert "bash" not in swebench_names
-    assert {"git_diff", "task", "todo"} <= swebench_names
+    assert "bash" in swebench_names
+    assert {"bash", "task", "todo"} <= swebench_names
 
 
 def test_run_command_executes_all_pipeline_phases(monkeypatch, tmp_path) -> None:

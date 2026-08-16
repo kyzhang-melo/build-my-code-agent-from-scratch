@@ -8,10 +8,10 @@ SWE-bench Docker harness. Generation uses each instance image's prepared
 `--generate-environment local` to use the compatibility host workspace.
 
 The eval agent uses a restricted tool profile: workspace-bound file tools,
-`todo`, the read-only exploration subagent, and a parameter-free `git_diff`.
-It does not receive the general-purpose `bash` tool. In Docker generation mode,
-networking is disabled and every repository file operation executes against
-the image-owned `/testbed`.
+`todo`, the read-only exploration subagent, and `bash`. The standalone
+`git_diff` tool is not provided; review changes with `bash` by running
+`git diff`. In Docker generation mode, networking is disabled and every
+repository file operation executes against the image-owned `/testbed`.
 
 Docker file operations are strictly confined to `/testbed`; unlike the local
 interactive backend, absolute paths outside the workspace are rejected.

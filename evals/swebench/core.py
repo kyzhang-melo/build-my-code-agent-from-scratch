@@ -41,7 +41,7 @@ SWEBENCH_TOOL_NAMES = frozenset({
     "edit_file",
     "glob",
     "grep",
-    "git_diff",
+    "bash",
     "todo",
     "task",
 })
@@ -283,9 +283,8 @@ def build_prompt(task: Task) -> str:
         "environment will test the resulting patch separately. Do not commit "
         "changes. Do not modify tests merely to make them pass. Work only inside "
         "the current workspace.\n\n"
-        "The shell tool is unavailable in this evaluation. Use git_diff to review "
-        "the final patch for correctness and unintended changes. Then summarize "
-        "what you changed and why.\n\n"
+        "Use bash to inspect the workspace and to review the final patch with "
+        "`git diff` before finishing. Then summarize what you changed and why.\n\n"
         f"Issue:\n{task.problem_statement}"
     )
 
