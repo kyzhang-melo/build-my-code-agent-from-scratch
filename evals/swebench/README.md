@@ -3,10 +3,10 @@
 This adapter runs the real `myCodeAgent-v0` parent agent against Git
 repositories whose working tree matches each task's base commit, exports the
 resulting repository changes, and delegates grading to the unmodified official
-SWE-bench Docker harness. Generation uses each instance image's prepared
-`/testbed` without a host bind mount. Local generation is temporarily disabled
-because the eval profile includes general-purpose `bash`; use
-`--generate-environment docker`.
+SWE-bench Docker harness. Generation is Docker-only: each agent works inside
+its instance image's prepared `/testbed` without a host bind mount. There is no
+local generation mode because the eval profile includes general-purpose
+`bash`.
 
 The eval agent uses a restricted tool profile: workspace-bound file tools,
 `todo`, the read-only exploration subagent, and `bash`. The standalone
@@ -198,15 +198,15 @@ representative benchmark score.
 
 ## Artifacts and recovery
 
-Runs are stored under `evals/.runs/swebench/<run-id>/`. Repository mirrors are
-cached under `evals/.cache/swebench/repos/`; both locations are ignored by Git.
+Runs are stored under `evals/.runs/swebench/<run-id>/`, which is ignored by
+Git. Cold runs no longer clone Git repository mirrors on the host; mirror
+caching belongs to the warm-context sequence evals.
 
 Each task attempt retains its trace, final text, patch, log, and structured
-result. Local generation additionally retains `attempt-*/workspace`. Docker
-generation works directly in the image's temporary `/testbed`; that container
-is removed after the attempt, so the exported patch and diagnostic artifacts
-are the durable record rather than a copied workspace. Existing results are
-skipped. To retry only failed,
+result. Generation works directly in the image's temporary `/testbed`; that
+container is removed after the attempt, so the exported patch and diagnostic
+artifacts are the durable record rather than a copied workspace. Existing
+results are skipped. To retry only failed,
 timed-out, budget-exhausted, or empty-patch tasks while preserving the previous
 attempt:
 

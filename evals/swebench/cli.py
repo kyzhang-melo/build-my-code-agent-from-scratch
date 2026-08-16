@@ -13,13 +13,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from .core import (
-    DEFAULT_CACHE_DIR,
     DEFAULT_RUNS_DIR,
-    DOCKER_GENERATION_REQUIRED,
     atomic_write_json,
     create_manifest,
     ensure_manifest,
-    ensure_mirror,
     generate_report,
     latest_result,
     load_subset,
@@ -61,10 +58,6 @@ def run_dir(args: argparse.Namespace) -> Path:
 
 
 async def cmd_generate(args: argparse.Namespace) -> int:
-    generate_environment = getattr(args, "generate_environment", "docker")
-    if generate_environment != "docker":
-        raise SystemExit(DOCKER_GENERATION_REQUIRED)
-
     load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=True)
     swebench_repo = resolve_swebench_repo(args.swebench_repo)
     swebench_python = resolve_swebench_python(args.swebench_python, swebench_repo)
@@ -93,14 +86,12 @@ async def cmd_generate(args: argparse.Namespace) -> int:
         swebench_repo=swebench_repo,
         model_limits=main.model_limits(model).as_dict(),
         provider=os.getenv("OPENROUTER_PROVIDER"),
-        generate_environment=generate_environment,
         image_namespace=namespace,
     )
     ensure_manifest(target / "manifest.json", manifest)
-    if generate_environment == "docker":
-        from sandbox import DockerSandbox
+    from sandbox import DockerSandbox
 
-        DockerSandbox.remove_run_orphans(args.run_id)
+    DockerSandbox.remove_run_orphans(args.run_id)
     tasks = load_tasks_via_bridge(
         swebench_python,
         swebench_repo,
@@ -111,9 +102,7 @@ async def cmd_generate(args: argparse.Namespace) -> int:
         namespace,
     )
 
-    cache_dir = Path(args.repo_cache).expanduser().resolve()
     predictions_path = target / "predictions.jsonl"
-    mirrors = {}
     pending = []
     for task in tasks:
         instance_dir = target / "instances" / task.instance_id
@@ -123,27 +112,7 @@ async def cmd_generate(args: argparse.Namespace) -> int:
         attempt = next_attempt(instance_dir)
         attempt_dir = instance_dir / f"attempt-{attempt}"
         print(f"[run] {task.instance_id} attempt={attempt}")
-        try:
-            mirror = mirrors.get(task.repo)
-            if mirror is None:
-                mirror = ensure_mirror(task, cache_dir)
-                mirrors[task.repo] = mirror
-        except Exception as exc:  # noqa: BLE001 - isolate batch failures
-            attempt_dir.mkdir(parents=True, exist_ok=True)
-            result = AgentResult(
-                task.instance_id,
-                attempt,
-                "error",
-                "not_exported",
-                stop_reason="error",
-                error=f"{type(exc).__name__}: {exc}",
-            )
-            atomic_write_json(attempt_dir / "result.json", result.to_dict())
-            _record_generation_result(
-                result, task.instance_id, attempt_dir, predictions_path, model
-            )
-            continue
-        pending.append((task, mirror, attempt_dir))
+        pending.append((task, attempt_dir))
 
     if not pending:
         return 0
@@ -158,13 +127,12 @@ async def cmd_generate(args: argparse.Namespace) -> int:
 
     def submit_next() -> bool:
         try:
-            task, mirror, attempt_dir = next(jobs)
+            task, attempt_dir = next(jobs)
         except StopIteration:
             return False
         call = partial(
             run_agent_attempt_worker,
             task,
-            mirror,
             attempt_dir,
             run_id=args.run_id,
             model=model,
@@ -173,7 +141,6 @@ async def cmd_generate(args: argparse.Namespace) -> int:
             reasoning_effort=args.reasoning_effort,
             max_output_tokens=args.max_output_tokens,
             timeout=args.instance_timeout,
-            generate_environment=generate_environment,
         )
         future = loop.run_in_executor(executor, call)
         futures[future] = (task, attempt_dir)
@@ -321,7 +288,6 @@ def _swebench_args(parser: argparse.ArgumentParser) -> None:
 def _generate_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--subset", required=True)
     parser.add_argument("--model")
-    parser.add_argument("--repo-cache", default=str(DEFAULT_CACHE_DIR))
     parser.add_argument("--max-api-calls", type=int, default=90)
     parser.add_argument(
         "--steering-policy",
@@ -345,15 +311,6 @@ def _generate_args(parser: argparse.ArgumentParser) -> None:
         type=_positive_int,
         default=5,
         help="parallel agent processes used to generate patches (default: 5)",
-    )
-    parser.add_argument(
-        "--generate-environment",
-        choices=("docker", "local"),
-        default="docker",
-        help=(
-            "tool execution environment used during patch generation; "
-            "local is temporarily disabled (default: docker)"
-        ),
     )
 
 

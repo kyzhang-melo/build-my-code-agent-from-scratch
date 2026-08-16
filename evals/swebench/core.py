@@ -46,7 +46,8 @@ SWEBENCH_TOOL_NAMES = frozenset({
     "task",
 })
 DOCKER_GENERATION_REQUIRED = (
-    "SWE-bench bash generation requires --generate-environment docker"
+    "Legacy local SWE-bench runs cannot be resumed by the Docker-only runner; "
+    "choose a new run ID."
 )
 STAGED_STEERING_THRESHOLDS = (45, 60)
 
@@ -404,11 +405,8 @@ def create_manifest(
     swebench_repo: Path,
     model_limits: dict[str, int | None],
     provider: str | None = None,
-    generate_environment: str = "docker",
     image_namespace: str = "swebench",
 ) -> dict:
-    if generate_environment != "docker":
-        raise ValueError(DOCKER_GENERATION_REQUIRED)
     harness_commit, harness_dirty = repository_state(PROJECT_ROOT)
     swebench_commit, swebench_dirty = repository_state(swebench_repo)
     return {
@@ -543,7 +541,6 @@ class AutoApproveHandler:
 
 async def run_agent_attempt(
     task: Task,
-    mirror: Path,
     attempt_dir: Path,
     *,
     run_id: str,
@@ -553,15 +550,10 @@ async def run_agent_attempt(
     reasoning_effort: str | None,
     max_output_tokens: int | None,
     timeout: int | None,
-    generate_environment: str = "docker",
 ) -> AgentResult:
-    if generate_environment != "docker":
-        raise ValueError(DOCKER_GENERATION_REQUIRED)
-
     import main
     from trace import JsonlTraceSink, TraceContext
     from sandbox import DockerSandbox
-    from workspace import Workspace
 
     attempt_dir.mkdir(parents=True, exist_ok=True)
     workspace = None
@@ -590,8 +582,6 @@ async def run_agent_attempt(
         )
         sandbox.start()
         workspace = Path(sandbox.workspace_root)
-        if workspace is None:
-            raise RuntimeError("solve workspace was not initialized")
         session = main.create_parent_session(
             workspace,
             approval_handler=AutoApproveHandler(),
@@ -599,11 +589,7 @@ async def run_agent_attempt(
             on_text=None,
             max_api_calls=max_api_calls,
             steering_policy=(
-                SwebenchSteeringPolicy(
-                    sandbox.export_patch
-                    if sandbox is not None
-                    else lambda: export_patch(workspace, task.base_commit)
-                )
+                SwebenchSteeringPolicy(sandbox.export_patch)
                 if steering_policy == "staged"
                 else None
             ),
@@ -644,20 +630,14 @@ async def run_agent_attempt(
                 result.error = f"{type(exc).__name__}: {exc}"
 
         # A Docker startup failure never created a solve workspace, so there is
-        # no patch to classify. Preserve `not_exported` rather than reporting an
-        # invalid agent patch and attempting a host export with cwd=None.
+        # no patch to classify. Preserve `not_exported` rather than reporting
+        # an invalid agent patch.
         if workspace is not None:
             try:
-                patch = (
-                    sandbox.export_patch()
-                    if sandbox is not None
-                    else export_patch(workspace, task.base_commit)
-                )
+                patch = sandbox.export_patch()
                 if not patch.strip():
                     result.patch_status = "empty"
                 else:
-                    if sandbox is None:
-                        validate_patch(mirror, task.base_commit, patch)
                     (attempt_dir / "patch.diff").write_text(patch, encoding="utf-8")
                     result.patch_status = "produced"
                     result.patch_bytes = len(patch.encode("utf-8"))
@@ -675,7 +655,6 @@ async def run_agent_attempt(
 
 def run_agent_attempt_worker(
     task: Task,
-    mirror: Path,
     attempt_dir: Path,
     *,
     run_id: str,
@@ -685,7 +664,6 @@ def run_agent_attempt_worker(
     reasoning_effort: str | None,
     max_output_tokens: int | None,
     timeout: int | None,
-    generate_environment: str = "docker",
 ) -> AgentResult:
     """Run one attempt in a dedicated worker process.
 
@@ -695,7 +673,6 @@ def run_agent_attempt_worker(
     return asyncio.run(
         run_agent_attempt(
             task,
-            mirror,
             attempt_dir,
             run_id=run_id,
             model=model,
@@ -704,7 +681,6 @@ def run_agent_attempt_worker(
             reasoning_effort=reasoning_effort,
             max_output_tokens=max_output_tokens,
             timeout=timeout,
-            generate_environment=generate_environment,
         )
     )
 

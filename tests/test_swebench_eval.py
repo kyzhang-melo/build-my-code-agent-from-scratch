@@ -232,8 +232,10 @@ def test_failed_attempt_requires_explicit_rerun(tmp_path) -> None:
 def test_agent_attempt_records_api_calls_when_the_agent_errors(
     monkeypatch, tmp_path,
 ) -> None:
-    _, mirror, commit = make_repo(tmp_path)
-    task = Task("owner__repo-1", "owner/repo", commit, "Fix it")
+    task = Task(
+        "owner__repo-1", "owner/repo", "base", "Fix it",
+        instance_image_key="example/image:latest",
+    )
     attempt_dir = tmp_path / "attempt-1"
 
     import main
@@ -273,14 +275,9 @@ def test_agent_attempt_records_api_calls_when_the_agent_errors(
     monkeypatch.setattr(main, "create_parent_session", fake_create_parent_session)
     monkeypatch.setattr(main, "agent_loop", fail_agent_loop)
     monkeypatch.setattr(sandbox, "DockerSandbox", FakeDockerSandbox)
-    task = Task(
-        task.instance_id, task.repo, task.base_commit, task.problem_statement,
-        task.version, instance_image_key="example/image:latest",
-    )
 
     result = asyncio.run(core.run_agent_attempt(
         task,
-        mirror,
         attempt_dir,
         run_id="test",
         model="test-model",
@@ -289,7 +286,6 @@ def test_agent_attempt_records_api_calls_when_the_agent_errors(
         reasoning_effort=None,
         max_output_tokens=None,
         timeout=None,
-        generate_environment="docker",
     ))
 
     assert result.agent_status == "error"
@@ -323,41 +319,16 @@ def test_docker_start_failure_is_not_misclassified_as_invalid_patch(
     )
 
     result = asyncio.run(core.run_agent_attempt(
-        task, tmp_path / "mirror", tmp_path / "attempt-1",
+        task, tmp_path / "attempt-1",
         run_id="run", model="model", max_api_calls=1,
         steering_policy="none", reasoning_effort=None,
-        max_output_tokens=None, timeout=None, generate_environment="docker",
+        max_output_tokens=None, timeout=None,
     ))
 
     assert result.agent_status == "error"
     assert result.patch_status == "not_exported"
     assert "docker failed to start" in result.error
     assert closed == [True]
-
-
-def test_local_agent_attempt_fails_before_workspace_or_agent_start(
-    monkeypatch, tmp_path,
-) -> None:
-    import main
-
-    def unexpected_call(*_args, **_kwargs):
-        raise AssertionError("local generation reached agent or workspace setup")
-
-    monkeypatch.setattr(core, "create_isolated_workspace", unexpected_call)
-    monkeypatch.setattr(main, "create_parent_session", unexpected_call)
-    task = Task("owner__repo-1", "owner/repo", "base", "Fix it")
-
-    with pytest.raises(ValueError) as exc_info:
-        asyncio.run(core.run_agent_attempt(
-            task, tmp_path / "mirror", tmp_path / "attempt-1",
-            run_id="run", model="model", max_api_calls=1,
-            steering_policy="none", reasoning_effort=None,
-            max_output_tokens=None, timeout=None,
-            generate_environment="local",
-        ))
-
-    assert str(exc_info.value) == core.DOCKER_GENERATION_REQUIRED
-    assert not (tmp_path / "attempt-1").exists()
 
 
 def test_final_text_write_failure_still_closes_docker_sandbox(
@@ -405,10 +376,10 @@ def test_final_text_write_failure_still_closes_docker_sandbox(
     )
 
     result = asyncio.run(core.run_agent_attempt(
-        task, tmp_path / "mirror", tmp_path / "attempt-1",
+        task, tmp_path / "attempt-1",
         run_id="run", model="model", max_api_calls=1,
         steering_policy="none", reasoning_effort=None,
-        max_output_tokens=None, timeout=None, generate_environment="docker",
+        max_output_tokens=None, timeout=None,
     ))
 
     assert result.agent_status == "error"
@@ -533,6 +504,8 @@ def test_legacy_local_manifest_requires_docker(tmp_path) -> None:
         })
 
     assert str(exc_info.value) == core.DOCKER_GENERATION_REQUIRED
+    assert "choose a new run ID" in str(exc_info.value)
+    assert "--generate-environment" not in str(exc_info.value)
 
 
 def test_manifest_with_explicit_local_generation_is_rejected(tmp_path) -> None:
@@ -546,6 +519,8 @@ def test_manifest_with_explicit_local_generation_is_rejected(tmp_path) -> None:
         core.ensure_manifest(path, {"schema_version": 4})
 
     assert str(exc_info.value) == core.DOCKER_GENERATION_REQUIRED
+    assert "choose a new run ID" in str(exc_info.value)
+    assert "--generate-environment" not in str(exc_info.value)
 
 
 def test_bind_mount_manifest_requires_new_run_for_image_testbed(tmp_path) -> None:
@@ -877,7 +852,6 @@ def test_run_parser_combines_generation_and_evaluation_options() -> None:
     assert args.max_output_tokens == 16000
     assert args.cache_level == "env"
     assert args.namespace == "swebench"
-    assert args.generate_environment == "docker"
 
 
 def test_swebench_parser_accepts_none_reasoning_effort() -> None:
@@ -906,31 +880,49 @@ def test_swebench_defaults_to_five_workers() -> None:
     assert pipeline.reasoning_effort is None
     assert pipeline.max_output_tokens is None
     assert pipeline.instance_timeout is None
-    assert pipeline.generate_environment == "docker"
     assert evaluate.cache_level == "instance"
     assert pipeline.cache_level == "instance"
 
 
-def test_swebench_parser_accepts_local_for_actionable_runtime_error() -> None:
+@pytest.mark.parametrize("flag", ["--generate-environment", "--repo-cache"])
+def test_swebench_parser_rejects_removed_generation_flags(flag: str) -> None:
     from evals.swebench import cli
 
-    args = cli.build_parser().parse_args([
-        "generate", "--run-id", "local", "--subset", "small.json",
-        "--generate-environment", "local",
-    ])
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args([
+            "generate", "--run-id", "removed", "--subset", "small.json",
+            flag, "value",
+        ])
 
-    assert args.generate_environment == "local"
 
-
-def test_generate_rejects_local_environment_before_setup() -> None:
+def test_swebench_cli_never_clones_repository_mirrors() -> None:
+    """Cold generation runs inside instance images, never host Git mirrors."""
+    import inspect
     from evals.swebench import cli
 
-    args = argparse.Namespace(generate_environment="local")
+    source = inspect.getsource(cli)
+    assert "ensure_mirror" not in source
+    assert "DEFAULT_CACHE_DIR" not in source
+    assert "repo_cache" not in source
 
-    with pytest.raises(SystemExit) as exc_info:
-        asyncio.run(cli.cmd_generate(args))
 
-    assert str(exc_info.value) == core.DOCKER_GENERATION_REQUIRED
+def test_swebench_attempt_chain_is_docker_only() -> None:
+    import inspect
+
+    for func in (
+        core.create_manifest,
+        core.run_agent_attempt_worker,
+        core.run_agent_attempt,
+    ):
+        parameters = inspect.signature(func).parameters
+        assert "mirror" not in parameters
+        assert "generate_environment" not in parameters
+
+    attempt_source = inspect.getsource(core.run_agent_attempt)
+    assert "create_isolated_workspace" not in attempt_source
+    assert "validate_patch" not in attempt_source
+    assert "DockerSandbox" in attempt_source
+    assert "sandbox.export_patch()" in attempt_source
 
 
 def test_swebench_parser_can_disable_staged_steering() -> None:
@@ -989,7 +981,7 @@ def test_generate_runs_five_workers_and_continues_after_error(
     calls = []
     lock = threading.Lock()
 
-    def fake_worker(task, _mirror, attempt_dir, **_kwargs):
+    def fake_worker(task, attempt_dir, **_kwargs):
         nonlocal active, maximum
         with lock:
             active += 1
@@ -1021,7 +1013,10 @@ def test_generate_runs_five_workers_and_continues_after_error(
     monkeypatch.setattr(cli, "create_manifest", lambda **_kwargs: {})
     monkeypatch.setattr(cli, "ensure_manifest", lambda *_args: {})
     monkeypatch.setattr(cli, "load_tasks_via_bridge", lambda *_args: tasks)
-    monkeypatch.setattr(cli, "ensure_mirror", lambda _task, _cache: tmp_path / "mirror")
+    # Cold generation must reach worker scheduling even when repository
+    # mirroring is unavailable: instance images, not host clones, carry /testbed.
+    monkeypatch.delattr(core, "ensure_mirror", raising=False)
+    monkeypatch.delattr(cli, "ensure_mirror", raising=False)
     monkeypatch.setattr(cli, "run_agent_attempt_worker", fake_worker)
     monkeypatch.setattr(
         cli,
@@ -1035,7 +1030,6 @@ def test_generate_runs_five_workers_and_continues_after_error(
         swebench_python=None,
         subset="subset.json",
         model="test-model",
-        repo_cache=str(tmp_path / "cache"),
         max_api_calls=3,
         steering_policy="staged",
         reasoning_effort=None,
