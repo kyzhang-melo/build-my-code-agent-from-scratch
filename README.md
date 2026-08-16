@@ -7,6 +7,8 @@ A learning project that refactors a monolithic code-agent loop into a multi-file
 - `main.py`: agent loop, OpenAI client initialization, CLI entrypoint.
 - `tools.py`: tool schema and shell tool execution logic.
 - `grep_engine.py`: portable ripgrep/Python search engine for local and container backends.
+- `file_engine.py`: shared stdlib-only read/write/edit/glob semantics for all backends.
+- `file_bridge.py`: stdlib-only JSON bridge for solve-container file operations.
 - `sandbox.py`: session-scoped local/Docker execution backends and solve-container lifecycle.
 - `permissions.py`: workspace safety policy and approval handling.
 - `trace.py`: lightweight runtime trace events and in-memory/JSONL sinks.

@@ -5,6 +5,8 @@ import os
 import re
 import time
 
+import pytest
+
 
 def _run(tools, workspace, command: str) -> str:
     return asyncio.run(tools.run_bash(workspace, command))
@@ -30,6 +32,107 @@ def test_bash_returns_structured_success_with_output(load_module, workspace) -> 
     assert metadata["truncated"] == "false"
     assert int(metadata["duration_ms"]) >= 0
     assert body == "hello"
+
+
+def test_registry_bash_uses_local_workspace(load_module, workspace) -> None:
+    tools = load_module("tools", "tools.py")
+    from sandbox import LocalSandbox
+
+    runtime = LocalSandbox(workspace)
+    registry = tools.build_tool_registry(
+        workspace,
+        tools.TodoManager(),
+        {"bash"},
+        file_backend=runtime.file_backend,
+        command_runner=runtime.command_runner,
+    )
+
+    output = asyncio.run(registry["bash"].execute(
+        tools.BashParams(command="printf hello; pwd"),
+    ))
+    metadata, body = _metadata(output)
+
+    assert metadata["status"] == "completed"
+    assert body.splitlines() == ["hello" + str(workspace.root)]
+
+
+@pytest.mark.parametrize(
+    "result, expected_status, expected_exit_code, expected_timed_out, expected_body",
+    [
+        ((7, "", "failure", False), "failed", "7", "false", "failure"),
+        ((124, "", "timeout", True), "timed_out", "null", "true", "timeout"),
+    ],
+)
+def test_remote_bash_uses_structured_result(
+    load_module,
+    workspace,
+    result,
+    expected_status,
+    expected_exit_code,
+    expected_timed_out,
+    expected_body,
+) -> None:
+    tools = load_module("tools", "tools.py")
+    from sandbox import CommandResult
+
+    del workspace
+    rendered = tools.render_remote_bash_result(
+        CommandResult(*result[:3], timed_out=result[3]), duration_ms=12,
+    )
+    metadata, body = _metadata(rendered)
+
+    assert metadata["status"] == expected_status
+    assert metadata["exit_code"] == expected_exit_code
+    assert metadata["timed_out"] == expected_timed_out
+    assert body == expected_body
+
+
+def test_registry_uses_explicit_local_backend_location(load_module, workspace) -> None:
+    tools = load_module("tools", "tools.py")
+    from sandbox import LocalSandbox
+
+    runtime = LocalSandbox(workspace)
+
+    class WrappedLocalBackend:
+        execution_location = "local"
+
+        def grep(self, request):
+            return runtime.file_backend.grep(request)
+
+    registry = tools.build_tool_registry(
+        workspace,
+        tools.TodoManager(),
+        {"bash"},
+        file_backend=WrappedLocalBackend(),
+        command_runner=runtime.command_runner,
+    )
+
+    output = asyncio.run(registry["bash"].execute(
+        tools.BashParams(command="printf wrapped-local"),
+    ))
+
+    assert "wrapped-local" in output
+    assert not hasattr(runtime.file_backend, "call")
+
+
+def test_registry_rejects_remote_backend_without_remote_capability(
+    load_module, workspace,
+) -> None:
+    tools = load_module("tools", "tools.py")
+
+    class InvalidRemoteBackend:
+        execution_location = "remote"
+
+        def grep(self, _request):
+            return ""
+
+    with pytest.raises(TypeError, match="must implement call"):
+        tools.build_tool_registry(
+            workspace,
+            tools.TodoManager(),
+            {"grep"},
+            file_backend=InvalidRemoteBackend(),
+        )
 
 
 def test_bash_uses_bash_syntax(load_module, workspace) -> None:

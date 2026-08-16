@@ -71,7 +71,7 @@ async def cmd_generate(args: argparse.Namespace) -> int:
     if not model:
         raise SystemExit("MODEL_ID is not set; pass --model or configure .env")
     import main
-    generate_environment = getattr(args, "generate_environment", "local")
+    generate_environment = getattr(args, "generate_environment", "docker")
     namespace = getattr(args, "namespace", "swebench")
 
     manifest = create_manifest(
@@ -93,6 +93,10 @@ async def cmd_generate(args: argparse.Namespace) -> int:
         image_namespace=namespace,
     )
     ensure_manifest(target / "manifest.json", manifest)
+    if generate_environment == "docker":
+        from sandbox import DockerSandbox
+
+        DockerSandbox.remove_run_orphans(args.run_id)
     tasks = load_tasks_via_bridge(
         swebench_python,
         swebench_repo,
@@ -341,8 +345,8 @@ def _generate_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--generate-environment",
         choices=("docker", "local"),
-        default="local",
-        help="tool execution environment used during patch generation (default: local)",
+        default="docker",
+        help="tool execution environment used during patch generation (default: docker)",
     )
 
 

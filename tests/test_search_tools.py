@@ -256,6 +256,51 @@ def test_run_grep_handles_no_matches_and_limits_output(load_module, monkeypatch,
     ]
 
 
+@pytest.mark.parametrize("use_rg", [False, True])
+def test_grep_content_truncates_long_lines_in_both_implementations(
+    load_module, monkeypatch, workspace, use_rg,
+) -> None:
+    tools = load_module("tools", "tools.py")
+    import grep_engine
+    import json
+
+    long_line = "needle" + "x" * 60_000
+    (workspace.root / "large.js").write_text(long_line + "\n", encoding="utf-8")
+    if use_rg:
+        event = {
+            "type": "match",
+            "data": {
+                "path": {"text": str(workspace.root / "large.js")},
+                "line_number": 1,
+                "lines": {"text": long_line + "\n"},
+                "submatches": [{"start": 0, "end": 6}],
+            },
+        }
+        monkeypatch.setattr(grep_engine.shutil, "which", lambda _name: "/usr/bin/rg")
+        monkeypatch.setattr(
+            grep_engine.subprocess,
+            "run",
+            lambda args, **_kwargs: subprocess.CompletedProcess(
+                args, 0, stdout=json.dumps(event) + "\n", stderr="",
+            ),
+        )
+    else:
+        monkeypatch.setattr(grep_engine.shutil, "which", lambda _name: None)
+
+    output = tools.run_grep(
+        workspace, "needle", output_mode="content", head_limit=10,
+    )
+
+    prefix = "large.js:1:"
+    assert output.startswith(prefix + long_line[:grep_engine.MAX_CONTENT_LINE_CHARS])
+    assert output.endswith(grep_engine.CONTENT_LINE_TRUNCATION_MARKER)
+    assert len(output) == (
+        len(prefix)
+        + grep_engine.MAX_CONTENT_LINE_CHARS
+        + len(grep_engine.CONTENT_LINE_TRUNCATION_MARKER)
+    )
+
+
 def test_run_grep_rejects_workspace_escape(load_module, monkeypatch, workspace) -> None:
     tools = load_module("tools", "tools.py")
     import grep_engine

@@ -436,6 +436,7 @@ def create_explore_session(
         tools=EXPLORE_TOOLS,
         registry=build_tool_registry(
             workspace, todo, READ_ONLY_TOOL_NAMES, file_backend=runtime.file_backend,
+            command_runner=runtime.command_runner,
         ),
         permission_service=permission_service,
         permission_source="subagent:explore",
@@ -521,6 +522,7 @@ def create_parent_session(
             selected_names,
             task_runner=task_runner,
             file_backend=runtime.file_backend,
+            command_runner=runtime.command_runner,
         ),
         permission_service=permission_service,
         permission_source="parent",

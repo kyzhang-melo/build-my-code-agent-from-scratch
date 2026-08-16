@@ -1,18 +1,20 @@
 # SWE-bench eval
 
 This adapter runs the real `myCodeAgent-v0` parent agent against Git
-repositories whose history ends at each task's base commit, exports the
+repositories whose working tree matches each task's base commit, exports the
 resulting repository changes, and delegates grading to the unmodified official
-SWE-bench Docker harness. Generation remains host-local by default. Pass
-`--generate-environment docker` to opt into the experimental per-attempt solve
-container backend.
+SWE-bench Docker harness. Generation uses each instance image's prepared
+`/testbed` by default, without a host bind mount. Pass
+`--generate-environment local` to use the compatibility host workspace.
 
 The eval agent uses a restricted tool profile: workspace-bound file tools,
 `todo`, the read-only exploration subagent, and a parameter-free `git_diff`.
 It does not receive the general-purpose `bash` tool. In Docker generation mode,
-the workspace is mounted at `/testbed`, networking is disabled, and `grep`
-executes inside the solve container. The remaining file tools still operate on
-the same bind-mounted workspace from the host and will migrate incrementally.
+networking is disabled and every repository file operation executes against
+the image-owned `/testbed`.
+
+Docker file operations are strictly confined to `/testbed`; unlike the local
+interactive backend, absolute paths outside the workspace are rejected.
 
 Live runs call a model, clone GitHub repositories, and may consume substantial
 time, tokens, disk, and Docker resources. They are separate from pytest.
@@ -198,8 +200,12 @@ representative benchmark score.
 Runs are stored under `evals/.runs/swebench/<run-id>/`. Repository mirrors are
 cached under `evals/.cache/swebench/repos/`; both locations are ignored by Git.
 
-Each task attempt retains its workspace, trace, final text, patch, log, and
-structured result. Existing results are skipped. To retry only failed,
+Each task attempt retains its trace, final text, patch, log, and structured
+result. Local generation additionally retains `attempt-*/workspace`. Docker
+generation works directly in the image's temporary `/testbed`; that container
+is removed after the attempt, so the exported patch and diagnostic artifacts
+are the durable record rather than a copied workspace. Existing results are
+skipped. To retry only failed,
 timed-out, budget-exhausted, or empty-patch tasks while preserving the previous
 attempt:
 

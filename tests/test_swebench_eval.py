@@ -277,6 +277,98 @@ def test_agent_attempt_records_api_calls_when_the_agent_errors(
     )
 
 
+def test_docker_start_failure_is_not_misclassified_as_invalid_patch(
+    monkeypatch, tmp_path,
+) -> None:
+    import sandbox
+
+    closed = []
+
+    class FailingDockerSandbox:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("docker failed to start")
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(sandbox, "DockerSandbox", FailingDockerSandbox)
+    task = Task(
+        "owner__repo-1", "owner/repo", "base", "Fix it",
+        instance_image_key="example/image:latest",
+    )
+
+    result = asyncio.run(core.run_agent_attempt(
+        task, tmp_path / "mirror", tmp_path / "attempt-1",
+        run_id="run", model="model", max_api_calls=1,
+        steering_policy="none", reasoning_effort=None,
+        max_output_tokens=None, timeout=None, generate_environment="docker",
+    ))
+
+    assert result.agent_status == "error"
+    assert result.patch_status == "not_exported"
+    assert "docker failed to start" in result.error
+    assert closed == [True]
+
+
+def test_final_text_write_failure_still_closes_docker_sandbox(
+    monkeypatch, tmp_path,
+) -> None:
+    import main
+    import sandbox
+
+    closed = []
+
+    class FakeDockerSandbox:
+        workspace_root = "/testbed"
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            return self
+
+        def close(self):
+            closed.append(True)
+
+        def export_patch(self):
+            return ""
+
+    def fail_session(*_args, **_kwargs):
+        raise RuntimeError("agent setup failed")
+
+    original_write_text = Path.write_text
+    failed = False
+
+    def fail_final_text_once(path, data, *args, **kwargs):
+        nonlocal failed
+        if path.name == "final_text.txt" and not failed:
+            failed = True
+            raise OSError("disk full")
+        return original_write_text(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(sandbox, "DockerSandbox", FakeDockerSandbox)
+    monkeypatch.setattr(main, "create_parent_session", fail_session)
+    monkeypatch.setattr(Path, "write_text", fail_final_text_once)
+    task = Task(
+        "owner__repo-1", "owner/repo", "base", "Fix it",
+        instance_image_key="example/image:latest",
+    )
+
+    result = asyncio.run(core.run_agent_attempt(
+        task, tmp_path / "mirror", tmp_path / "attempt-1",
+        run_id="run", model="model", max_api_calls=1,
+        steering_policy="none", reasoning_effort=None,
+        max_output_tokens=None, timeout=None, generate_environment="docker",
+    ))
+
+    assert result.agent_status == "error"
+    assert result.patch_status == "empty"
+    assert closed == [True]
+
+
 def test_successful_attempt_is_never_rerun(tmp_path) -> None:
     result = tmp_path / "instance" / "attempt-1" / "result.json"
     core.atomic_write_json(
@@ -358,7 +450,7 @@ def test_manifest_migrates_legacy_resume_after_config_check(tmp_path) -> None:
             "max_output_tokens": 128000,
         },
     }
-    assert core.ensure_manifest(path, proposed)["schema_version"] == 3
+    assert core.ensure_manifest(path, proposed)["schema_version"] == 4
     migrated = json.loads(path.read_text(encoding="utf-8"))
     assert migrated["model_limits"] == proposed["model_limits"]
     assert migrated["harness_commit"] == "new-harness"
@@ -383,6 +475,25 @@ def test_legacy_manifest_docker_conflict_has_actionable_message(tmp_path) -> Non
             "schema_version": 3,
             "generate_environment": "docker",
             "solve_network_mode": "none",
+        })
+
+
+def test_bind_mount_manifest_requires_new_run_for_image_testbed(tmp_path) -> None:
+    path = tmp_path / "manifest.json"
+    core.atomic_write_json(path, {
+        "schema_version": 3,
+        "generate_environment": "docker",
+        "solve_network_mode": "none",
+        "image_namespace": "swebench",
+    })
+
+    with pytest.raises(ValueError, match="legacy Docker runs used bind mounts"):
+        core.ensure_manifest(path, {
+            "schema_version": 4,
+            "generate_environment": "docker",
+            "solve_network_mode": "none",
+            "solve_workspace_mode": "image_testbed",
+            "image_namespace": "swebench",
         })
 
 
@@ -695,7 +806,7 @@ def test_run_parser_combines_generation_and_evaluation_options() -> None:
     assert args.max_output_tokens == 16000
     assert args.cache_level == "env"
     assert args.namespace == "swebench"
-    assert args.generate_environment == "local"
+    assert args.generate_environment == "docker"
 
 
 def test_swebench_parser_accepts_none_reasoning_effort() -> None:
@@ -724,7 +835,7 @@ def test_swebench_defaults_to_five_workers() -> None:
     assert pipeline.reasoning_effort is None
     assert pipeline.max_output_tokens is None
     assert pipeline.instance_timeout is None
-    assert pipeline.generate_environment == "local"
+    assert pipeline.generate_environment == "docker"
     assert evaluate.cache_level == "instance"
     assert pipeline.cache_level == "instance"
 
@@ -756,11 +867,8 @@ def test_swebench_parser_can_disable_staged_steering() -> None:
     assert args.steering_policy == "none"
 
 
-def test_staged_steering_uses_patch_aware_second_message(
-    monkeypatch, tmp_path,
-) -> None:
-    monkeypatch.setattr(core, "export_patch", lambda *_args: "")
-    policy = core.SwebenchSteeringPolicy(tmp_path, "base")
+def test_staged_steering_uses_patch_aware_second_message() -> None:
+    policy = core.SwebenchSteeringPolicy(lambda: "")
 
     first = policy.after_turn(45)
     no_patch = policy.after_turn(60)
@@ -771,8 +879,7 @@ def test_staged_steering_uses_patch_aware_second_message(
     assert no_patch.reason == "implement_patch_and_finish"
     assert policy.after_turn(60) is None
 
-    monkeypatch.setattr(core, "export_patch", lambda *_args: "diff --git a/x b/x")
-    patch_policy = core.SwebenchSteeringPolicy(tmp_path, "base")
+    patch_policy = core.SwebenchSteeringPolicy(lambda: "diff --git a/x b/x")
     has_patch = patch_policy.after_turn(60)
     assert has_patch is not None
     assert has_patch.reason == "review_patch_and_finish"

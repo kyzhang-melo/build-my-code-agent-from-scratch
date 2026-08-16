@@ -12,6 +12,7 @@ import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from session import SteeringDirective
 
@@ -52,9 +53,8 @@ class SwebenchSteeringPolicy:
 
     name = "staged"
 
-    def __init__(self, workspace: Path, base_commit: str):
-        self.workspace = workspace
-        self.base_commit = base_commit
+    def __init__(self, patch_provider: Callable[[], str]):
+        self.patch_provider = patch_provider
         self._emitted: set[int] = set()
 
     def after_turn(self, api_call_count: int) -> SteeringDirective | None:
@@ -71,9 +71,7 @@ class SwebenchSteeringPolicy:
                 reason="converge_on_root_cause",
             )
         elif api_call_count == STAGED_STEERING_THRESHOLDS[1]:
-            has_patch = bool(
-                export_patch(self.workspace, self.base_commit).strip()
-            )
+            has_patch = bool(self.patch_provider().strip())
             if has_patch:
                 directive = SteeringDirective(
                     content=(
@@ -404,13 +402,13 @@ def create_manifest(
     swebench_repo: Path,
     model_limits: dict[str, int | None],
     provider: str | None = None,
-    generate_environment: str = "local",
+    generate_environment: str = "docker",
     image_namespace: str = "swebench",
 ) -> dict:
     harness_commit, harness_dirty = repository_state(PROJECT_ROOT)
     swebench_commit, swebench_dirty = repository_state(swebench_repo)
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "run_id": run_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "dataset": dataset,
@@ -438,6 +436,9 @@ def create_manifest(
         "auto_compact": os.getenv("AUTO_COMPACT", "1") != "0",
         "generate_environment": generate_environment,
         "solve_network_mode": "none" if generate_environment == "docker" else "host",
+        "solve_workspace_mode": (
+            "image_testbed" if generate_environment == "docker" else "host_workspace"
+        ),
         "image_namespace": image_namespace,
     }
 
@@ -446,6 +447,10 @@ def ensure_manifest(path: Path, proposed: dict) -> dict:
     proposed = dict(proposed)
     proposed.setdefault("generate_environment", "local")
     proposed.setdefault("solve_network_mode", "host")
+    proposed.setdefault(
+        "solve_workspace_mode",
+        "image_testbed" if proposed["generate_environment"] == "docker" else "host_workspace",
+    )
     proposed.setdefault("image_namespace", "swebench")
     if not path.exists():
         atomic_write_json(path, proposed)
@@ -456,6 +461,13 @@ def ensure_manifest(path: Path, proposed: dict) -> dict:
         existing["generate_environment"] = "local"
         existing["solve_network_mode"] = "host"
         existing["image_namespace"] = proposed.get("image_namespace", "swebench")
+    needs_workspace_migration = "solve_workspace_mode" not in existing
+    if needs_workspace_migration:
+        existing["solve_workspace_mode"] = (
+            "bind_mount"
+            if existing.get("generate_environment") == "docker"
+            else "host_workspace"
+        )
     needs_model_limits_migration = "model_limits" not in existing
     keys = (
         "dataset",
@@ -474,6 +486,7 @@ def ensure_manifest(path: Path, proposed: dict) -> dict:
         "swebench_commit",
         "generate_environment",
         "solve_network_mode",
+        "solve_workspace_mode",
         "image_namespace",
     )
     conflicts = [
@@ -491,6 +504,8 @@ def ensure_manifest(path: Path, proposed: dict) -> dict:
     ]
     if conflicts:
         detail = f"run manifest conflicts in: {', '.join(conflicts)}"
+        if "solve_workspace_mode" in conflicts and existing.get("solve_workspace_mode") == "bind_mount":
+            detail += "; legacy Docker runs used bind mounts; choose a new run id for image /testbed"
         if needs_environment_migration and any(
             key in conflicts for key in ("generate_environment", "solve_network_mode")
         ):
@@ -514,17 +529,18 @@ def ensure_manifest(path: Path, proposed: dict) -> dict:
             "previous_harness_commit": previous_harness_commit,
             "new_harness_commit": proposed["harness_commit"],
         })
-    if needs_environment_migration:
-        existing["schema_version"] = 3
+    if needs_environment_migration or needs_workspace_migration:
+        existing["schema_version"] = 4
         migrations = existing.setdefault("migrations", [])
         if not isinstance(migrations, list):
             raise ValueError("run manifest has invalid migrations metadata")
         migrations.append({
-            "kind": "generate_environment_upgrade",
+            "kind": "solve_workspace_upgrade",
             "migrated_at": datetime.now(timezone.utc).isoformat(),
-            "generate_environment": "local",
+            "generate_environment": existing["generate_environment"],
+            "solve_workspace_mode": existing["solve_workspace_mode"],
         })
-    if needs_model_limits_migration or needs_environment_migration:
+    if needs_model_limits_migration or needs_environment_migration or needs_workspace_migration:
         atomic_write_json(path, existing)
     return existing
 
@@ -557,10 +573,12 @@ async def run_agent_attempt(
     from sandbox import DockerSandbox
     from workspace import Workspace
 
-    workspace = create_isolated_workspace(
-        mirror,
-        attempt_dir / "workspace",
-        task.base_commit,
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+    docker_mode = generate_environment == "docker"
+    workspace = (
+        None
+        if docker_mode
+        else create_isolated_workspace(mirror, attempt_dir / "workspace", task.base_commit)
     )
     attempt = int(attempt_dir.name.split("-", 1)[1])
     result = AgentResult(task.instance_id, attempt, "error", "not_exported")
@@ -576,12 +594,20 @@ async def run_agent_attempt(
     log_path = attempt_dir / "agent.log"
     sandbox = None
     try:
-        if generate_environment == "docker":
+        if docker_mode:
             if not task.instance_image_key:
                 raise RuntimeError("task is missing its SWE-bench instance image key")
             sandbox = DockerSandbox(
-                Workspace(workspace), task.instance_image_key, platform=task.platform,
-            ).start()
+                task.instance_image_key,
+                f"{run_id}:{task.instance_id}:attempt-{attempt}",
+                task.base_commit,
+                platform=task.platform,
+                run_id=run_id,
+            )
+            sandbox.start()
+            workspace = Path(sandbox.workspace_root)
+        if workspace is None:
+            raise RuntimeError("solve workspace was not initialized")
         session = main.create_parent_session(
             workspace,
             approval_handler=AutoApproveHandler(),
@@ -589,7 +615,11 @@ async def run_agent_attempt(
             on_text=None,
             max_api_calls=max_api_calls,
             steering_policy=(
-                SwebenchSteeringPolicy(workspace, task.base_commit)
+                SwebenchSteeringPolicy(
+                    sandbox.export_patch
+                    if sandbox is not None
+                    else lambda: export_patch(workspace, task.base_commit)
+                )
                 if steering_policy == "staged"
                 else None
             ),
@@ -622,24 +652,38 @@ async def run_agent_attempt(
         # every request that was attempted before the failure.
         result.api_calls = state.api_call_count
         result.error = f"{type(exc).__name__}: {exc}"
+    try:
+        try:
+            (attempt_dir / "final_text.txt").write_text(final_text, encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001 - retain cleanup and result recording
+            if not result.error:
+                result.error = f"{type(exc).__name__}: {exc}"
+
+        # A Docker startup failure never created a solve workspace, so there is
+        # no patch to classify. Preserve `not_exported` rather than reporting an
+        # invalid agent patch and attempting a host export with cwd=None.
+        if workspace is not None:
+            try:
+                patch = (
+                    sandbox.export_patch()
+                    if sandbox is not None
+                    else export_patch(workspace, task.base_commit)
+                )
+                if not patch.strip():
+                    result.patch_status = "empty"
+                else:
+                    if sandbox is None:
+                        validate_patch(mirror, task.base_commit, patch)
+                    (attempt_dir / "patch.diff").write_text(patch, encoding="utf-8")
+                    result.patch_status = "produced"
+                    result.patch_bytes = len(patch.encode("utf-8"))
+            except Exception as exc:  # noqa: BLE001
+                result.patch_status = "invalid"
+                if not result.error:
+                    result.error = f"{type(exc).__name__}: {exc}"
     finally:
         if sandbox is not None:
             sandbox.close()
-
-    (attempt_dir / "final_text.txt").write_text(final_text, encoding="utf-8")
-    try:
-        patch = export_patch(workspace, task.base_commit)
-        if not patch.strip():
-            result.patch_status = "empty"
-        else:
-            validate_patch(mirror, task.base_commit, patch)
-            (attempt_dir / "patch.diff").write_text(patch, encoding="utf-8")
-            result.patch_status = "produced"
-            result.patch_bytes = len(patch.encode("utf-8"))
-    except Exception as exc:  # noqa: BLE001
-        result.patch_status = "invalid"
-        if not result.error:
-            result.error = f"{type(exc).__name__}: {exc}"
     result.duration_seconds = round(time.monotonic() - started, 3)
     atomic_write_json(attempt_dir / "result.json", result.to_dict())
     return result

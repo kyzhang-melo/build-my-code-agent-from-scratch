@@ -22,6 +22,8 @@ SENSITIVE_NAMES = {
     "id_dsa", "id_ecdsa", "id_ed25519", "id_rsa",
 }
 SENSITIVE_SUFFIXES = {".key", ".pem", ".p12", ".pfx"}
+MAX_CONTENT_LINE_CHARS = 500
+CONTENT_LINE_TRUNCATION_MARKER = " [...line truncated]"
 
 
 @dataclass(frozen=True)
@@ -157,6 +159,12 @@ def _limit(lines: list[str], limit: int) -> str:
     return "\n".join(lines)
 
 
+def _truncate_content_line(line: str) -> str:
+    if len(line) <= MAX_CONTENT_LINE_CHARS:
+        return line
+    return line[:MAX_CONTENT_LINE_CHARS] + CONTENT_LINE_TRUNCATION_MARKER
+
+
 def _python_search(root: Path, search_path: Path, request: GrepRequest) -> str:
     flags = re.IGNORECASE if request.ignore_case else 0
     try:
@@ -187,7 +195,7 @@ def _python_search(root: Path, search_path: Path, request: GrepRequest) -> str:
         else:
             for number, line, _count in matched_lines:
                 prefix = f"{relative}:{number}:" if request.line_number else f"{relative}:"
-                output.append(f"{prefix}{line}")
+                output.append(f"{prefix}{_truncate_content_line(line)}")
 
     return _limit(output, request.head_limit) if output else "No matches found."
 
@@ -242,7 +250,7 @@ def _rg_search(root: Path, search_path: Path, request: GrepRequest, rg_path: str
             line = str(data.get("lines", {}).get("text", "")).rstrip("\r\n")
             number = data.get("line_number")
             prefix = f"{relative}:{number}:" if request.line_number else f"{relative}:"
-            content.append(f"{prefix}{line}")
+            content.append(f"{prefix}{_truncate_content_line(line)}")
 
     if request.output_mode == "content":
         lines = content

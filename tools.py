@@ -1,15 +1,12 @@
 import asyncio
 import codecs
-import fnmatch
 import hashlib
 import json
 import os
-import re
 import signal
 import subprocess
 import tempfile
 import time
-import unicodedata
 from collections import deque
 from collections.abc import Awaitable
 from dataclasses import dataclass
@@ -18,6 +15,12 @@ from typing import Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
+from file_engine import (
+    MAX_LINE_CHARS,
+    MAX_READ_BYTES,
+    MAX_READ_FILE_BYTES,
+    FileEngine,
+)
 from permissions import (
     PermissionBehavior,
     PermissionDecision,
@@ -29,29 +32,15 @@ from permissions import (
 from trace import TraceContext, emit_trace
 from workspace import Workspace
 from grep_engine import GrepRequest
-from sandbox import FileBackend, LocalFileBackend
+from sandbox import CommandResult, CommandRunner, FileBackend, LocalFileBackend
 
 
 TOOL_OUTPUT_PREVIEW_CHARS = 500
 READ_ONLY_TOOL_NAMES = {"read_file", "glob", "grep"}
-# Noisy/sensitive directories pruned from glob traversal and results, keeping
-# `glob` consistent with `run_grep`'s excludes (`.git/.svn/.hg`).
-EXCLUDE_DIRS = {
-    ".git",
-    ".svn",
-    ".hg",
-    ".venv",
-    "node_modules",
-    "__pycache__",
-    ".pytest_cache",
-    ".claude",
-    ".sessions",
-    ".transcripts",
-}
 # Budget for a single tool output handed back to the model. Char-based (chars
 # ~= 4x tokens); a token-aware policy can replace it later without touching callers.
 TOOL_OUTPUT_MAX_CHARS = 48000
-TOOL_OUTPUT_MAX_LINE_CHARS = 2000
+TOOL_OUTPUT_MAX_LINE_CHARS = MAX_LINE_CHARS
 DEFAULT_MAX_PARALLEL_TOOL_CALLS = 4
 
 # `run_bash` bounds its own output before returning a structured result.  Leave
@@ -74,9 +63,6 @@ BASH_CANDIDATE_PATHS = (
 # read_file bounds. The reader self-bounds and is exempt from truncate_middle
 # (see run_tool_call), so these are the sole authority over read output size.
 MAX_READ_LINES = 1000              # max lines returned; also the `limit` default and hard max
-MAX_LINE_CHARS = TOOL_OUTPUT_MAX_LINE_CHARS  # per-line cap (reuse the existing constant)
-MAX_READ_BYTES = 40_000            # cap on returned content bytes; stays under TOOL_OUTPUT_MAX_CHARS
-MAX_READ_FILE_BYTES = 5 * 1024 * 1024  # st_size pre-check: stream to EOF for an exact total
                                         # only below this; larger files skip the full scan
 
 
@@ -644,6 +630,24 @@ class BashResult:
         )
 
 
+def render_remote_bash_result(result: CommandResult, duration_ms: int) -> str:
+    """Render a remote command with the same status contract as local Bash."""
+    raw_output = (result.stdout + result.stderr).strip()
+    output = truncate_middle(raw_output, max_chars=BASH_OUTPUT_MAX_CHARS)
+    return BashResult(
+        status=(
+            "timed_out" if result.timed_out
+            else "completed" if result.exit_code == 0
+            else "failed"
+        ),
+        exit_code=None if result.timed_out else result.exit_code,
+        output=output,
+        truncated=output != raw_output,
+        duration_ms=duration_ms,
+        timed_out=result.timed_out,
+    ).render()
+
+
 class _BashOutputBuffer:
     """Keep the useful tail of a command's combined output within a char budget."""
 
@@ -882,407 +886,17 @@ async def run_bash(workspace: Workspace, command: str) -> str:
             await asyncio.gather(collector_task, return_exceptions=True)
 
 
-# Common non-text extensions, rejected early with a clear message. The null-byte
-# sniff below catches the rest; this list just avoids opening obvious binaries.
-BINARY_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico", ".tiff", ".pdf",
-    ".zip", ".gz", ".bz2", ".xz", ".tar", ".7z", ".rar",
-    ".exe", ".dll", ".so", ".dylib", ".bin", ".o", ".a", ".class", ".jar",
-    ".pyc", ".pyo", ".wasm", ".node",
-    ".mp3", ".wav", ".flac", ".ogg", ".mp4", ".mov", ".avi", ".mkv", ".webm",
-    ".sqlite", ".sqlite3", ".db", ".woff", ".woff2", ".ttf", ".otf",
-}
+def run_read(workspace: Workspace, path: str, offset: int = 1, limit: int = MAX_READ_LINES) -> str:
+    return FileEngine(
+        workspace.root,
+        max_line_chars=MAX_LINE_CHARS,
+        max_read_bytes=MAX_READ_BYTES,
+        max_read_file_bytes=MAX_READ_FILE_BYTES,
+    ).read(path, offset, limit)
 
 
-def _looks_binary(fp: Path) -> bool:
-    """True for obvious non-text files: known binary extension or a NUL byte in the head."""
-    if fp.suffix.lower() in BINARY_EXTENSIONS:
-        return True
-    try:
-        with open(fp, "rb") as handle:
-            return b"\x00" in handle.read(4096)
-    except OSError:
-        return False
-
-
-def run_read(
-    workspace: Workspace,
-    path: str,
-    offset: int = 1,
-    limit: int = MAX_READ_LINES,
-) -> str:
-    """Read a slice of a text file, streaming and bounded.
-
-    Returns `cat -n`-style numbered lines for the window [offset, offset+limit)
-    plus a trailing summary (total lines, end-of-file/cap notes, and a forward
-    `offset=` hint when more remains) so the model can page instead of re-reading.
-    """
-    try:
-        fp = workspace.resolve(path, allow_external_absolute=True)
-    except Exception as e:
-        return f"Error: {e}"
-    if is_sensitive_path(fp, workspace.root):
-        return f"Error: Access to sensitive path is blocked: {path}"
-    if not fp.exists():
-        return f"Error: File not found: {path}"
-    if not fp.is_file():
-        return f"Error: Not a file: {path}"
-    if _looks_binary(fp):
-        return (
-            f"Error: '{path}' appears to be a binary or non-text file. "
-            "Use appropriate tools to inspect it."
-        )
-
-    try:
-        # st_size pre-check: only stream all the way to EOF (for an exact total
-        # line count) when the file is small enough that the scan is cheap.
-        count_to_eof = fp.stat().st_size <= MAX_READ_FILE_BYTES
-
-        rendered: list[str] = []
-        rendered_bytes = 0
-        truncated_lines: list[int] = []
-        total_lines = 0
-        last_line = offset - 1
-        max_lines_reached = False
-        max_bytes_reached = False
-        reached_eof = True
-
-        with open(fp, encoding="utf-8", errors="replace") as handle:
-            for i, raw in enumerate(handle, start=1):
-                total_lines = i
-                if i < offset:
-                    continue
-                line_limit_reached = len(rendered) >= limit
-                byte_limit_reached = rendered_bytes >= MAX_READ_BYTES
-                if line_limit_reached or byte_limit_reached:
-                    max_lines_reached = max_lines_reached or line_limit_reached
-                    max_bytes_reached = max_bytes_reached or byte_limit_reached
-                    if count_to_eof:
-                        continue  # window full; keep counting only
-                    reached_eof = False
-                    break
-                content = raw.rstrip("\n")
-                if len(content) > MAX_LINE_CHARS:
-                    content = content[:MAX_LINE_CHARS] + " [...line truncated]"
-                    truncated_lines.append(i)
-                line = f"{i}\t{content}"
-                rendered.append(line)
-                rendered_bytes += len(line)
-                last_line = i
-    except Exception as e:
-        return f"Error: {e}"
-
-    if not rendered:
-        if total_lines == 0:
-            return "<system-reminder>File exists but is empty.</system-reminder>"
-        return (
-            f"<system-reminder>File has {total_lines} lines; offset {offset} "
-            "is past the end of the file.</system-reminder>"
-        )
-
-    body = "\n".join(rendered)
-    footer = _read_footer(
-        offset=offset,
-        last_line=last_line,
-        n=len(rendered),
-        limit=limit,
-        total_lines=total_lines,
-        reached_eof=reached_eof,
-        is_large=not count_to_eof,
-        max_lines_reached=max_lines_reached,
-        max_bytes_reached=max_bytes_reached,
-        truncated_lines=truncated_lines,
-    )
-    return f"{body}\n\n{footer}"
-
-
-def _read_footer(
-    *,
-    offset: int,
-    last_line: int,
-    n: int,
-    limit: int,
-    total_lines: int,
-    reached_eof: bool,
-    is_large: bool,
-    max_lines_reached: bool,
-    max_bytes_reached: bool,
-    truncated_lines: list[int],
-) -> str:
-    head = f"Read {n} lines (lines {offset}-{last_line})."
-
-    if reached_eof:
-        total_part = f" Total lines: {total_lines}."
-    else:
-        total_part = f" Total lines: {total_lines}+ (not fully counted)."
-
-    notes: list[str] = []
-    if max_lines_reached:
-        notes.append(f"Stopped at the {limit}-line limit")
-    elif max_bytes_reached:
-        notes.append(f"Stopped at the {MAX_READ_BYTES}-byte limit")
-    elif reached_eof and 0 < n < limit:
-        notes.append("End of file")
-    if truncated_lines:
-        notes.append(f"lines {truncated_lines} truncated to {MAX_LINE_CHARS} chars")
-    if is_large:
-        notes.append("large file -- use grep or a targeted offset/limit to narrow the read")
-    note_part = (" " + "; ".join(notes) + ".") if notes else ""
-
-    more_remains = max_lines_reached or max_bytes_reached or not reached_eof
-    hint = f" Use offset={last_line + 1} to continue." if more_remains else ""
-
-    return f"[{head}{total_part}{note_part}{hint}]"
-
-
-def run_write(
-    workspace: Workspace,
-    path: str,
-    content: str,
-    mode: str = "overwrite",
-) -> str:
-    """Create, overwrite, or append to a UTF-8 workspace file."""
-    try:
-        if mode not in {"overwrite", "append"}:
-            return "Error: mode must be 'overwrite' or 'append'"
-        fp = workspace.resolve(path)
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        file_mode = "w" if mode == "overwrite" else "a"
-        with fp.open(file_mode, encoding="utf-8", newline="") as handle:
-            handle.write(content)
-        written_bytes = len(content.encode("utf-8"))
-        current_size = fp.stat().st_size
-        if mode == "append":
-            return (
-                f"Appended {written_bytes} bytes to {path} "
-                f"(current size: {current_size} bytes)"
-            )
-        return f"Wrote {written_bytes} bytes to {path} (current size: {current_size} bytes)"
-    except Exception as e:
-        return f"Error: {e}"
-
-
-@dataclass(frozen=True)
-class _MatchedEdit:
-    edit_index: int
-    match_index: int
-    match_length: int
-    new_text: str
-
-
-_FUZZY_CHAR_TRANSLATION = str.maketrans({
-    "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'",
-    "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"',
-    "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-",
-    "\u2014": "-", "\u2015": "-", "\u2212": "-",
-    "\u00a0": " ", "\u2002": " ", "\u2003": " ", "\u2004": " ",
-    "\u2005": " ", "\u2006": " ", "\u2007": " ", "\u2008": " ",
-    "\u2009": " ", "\u200a": " ", "\u202f": " ", "\u205f": " ",
-    "\u3000": " ",
-})
-
-
-def _normalize_to_lf(text: str) -> str:
-    return text.replace("\r\n", "\n").replace("\r", "\n")
-
-
-def _detect_line_ending(text: str) -> str:
-    first_lf = text.find("\n")
-    if first_lf != -1 and first_lf > 0 and text[first_lf - 1] == "\r":
-        return "\r\n"
-    return "\n"
-
-
-def _restore_line_endings(text: str, line_ending: str) -> str:
-    return text.replace("\n", "\r\n") if line_ending == "\r\n" else text
-
-
-def _normalize_for_fuzzy_match(text: str) -> str:
-    normalized = unicodedata.normalize("NFKC", text)
-    normalized = "\n".join(line.rstrip() for line in normalized.split("\n"))
-    return normalized.translate(_FUZZY_CHAR_TRANSLATION)
-
-
-def _find_occurrences(content: str, needle: str) -> list[int]:
-    positions: list[int] = []
-    start = 0
-    while True:
-        index = content.find(needle, start)
-        if index == -1:
-            return positions
-        positions.append(index)
-        start = index + len(needle)
-
-
-def _split_lines_with_endings(content: str) -> list[str]:
-    return re.findall(r"[^\n]*\n|[^\n]+", content)
-
-
-def _line_spans(content: str) -> list[tuple[int, int]]:
-    offset = 0
-    spans = []
-    for line in _split_lines_with_endings(content):
-        spans.append((offset, offset + len(line)))
-        offset += len(line)
-    return spans
-
-
-def _replacement_line_range(
-    spans: list[tuple[int, int]],
-    replacement: _MatchedEdit,
-) -> tuple[int, int]:
-    replacement_start = replacement.match_index
-    replacement_end = replacement.match_index + replacement.match_length
-    start_line = next(
-        (i for i, (start, end) in enumerate(spans) if start <= replacement_start < end),
-        -1,
-    )
-    if start_line == -1:
-        raise ValueError("Replacement range is outside the file content")
-    end_line = start_line
-    while end_line < len(spans) and spans[end_line][1] < replacement_end:
-        end_line += 1
-    if end_line >= len(spans):
-        raise ValueError("Replacement range is outside the file content")
-    return start_line, end_line + 1
-
-
-def _apply_replacements(
-    content: str,
-    replacements: list[_MatchedEdit],
-    *,
-    offset: int = 0,
-) -> str:
-    result = content
-    for replacement in reversed(replacements):
-        index = replacement.match_index - offset
-        result = (
-            result[:index]
-            + replacement.new_text
-            + result[index + replacement.match_length:]
-        )
-    return result
-
-
-def _apply_fuzzy_replacements_preserving_lines(
-    original_content: str,
-    fuzzy_content: str,
-    replacements: list[_MatchedEdit],
-) -> str:
-    """Rewrite touched lines in fuzzy space while copying untouched lines verbatim."""
-    original_lines = _split_lines_with_endings(original_content)
-    spans = _line_spans(fuzzy_content)
-    if len(original_lines) != len(spans):
-        raise ValueError("Fuzzy normalization changed the file's line structure")
-
-    groups: list[dict] = []
-    for replacement in sorted(replacements, key=lambda item: item.match_index):
-        start_line, end_line = _replacement_line_range(spans, replacement)
-        current = groups[-1] if groups else None
-        if current is not None and start_line < current["end_line"]:
-            current["end_line"] = max(current["end_line"], end_line)
-            current["replacements"].append(replacement)
-        else:
-            groups.append({
-                "start_line": start_line,
-                "end_line": end_line,
-                "replacements": [replacement],
-            })
-
-    result: list[str] = []
-    original_line_index = 0
-    for group in groups:
-        start_line = group["start_line"]
-        end_line = group["end_line"]
-        result.extend(original_lines[original_line_index:start_line])
-        group_start = spans[start_line][0]
-        group_end = spans[end_line - 1][1]
-        result.append(_apply_replacements(
-            fuzzy_content[group_start:group_end],
-            group["replacements"],
-            offset=group_start,
-        ))
-        original_line_index = end_line
-    result.extend(original_lines[original_line_index:])
-    return "".join(result)
-
-
-def _coerce_edits(
-    edits_or_old_text: list[EditParams] | list[dict] | str,
-    new_text: str | None,
-) -> list[EditParams]:
-    if isinstance(edits_or_old_text, str):
-        if new_text is None:
-            raise ValueError("new_text is required with a legacy old_text argument")
-        return [EditParams(old_text=edits_or_old_text, new_text=new_text)]
-    if new_text is not None:
-        raise ValueError("new_text cannot be combined with an edits list")
-    return [
-        edit if isinstance(edit, EditParams) else EditParams.model_validate(edit)
-        for edit in edits_or_old_text
-    ]
-
-
-def _prepare_edits(
-    content: str,
-    edits: list[EditParams],
-    path: str,
-) -> tuple[str, str]:
-    normalized_edits = [
-        EditParams(
-            old_text=_normalize_to_lf(edit.old_text),
-            new_text=_normalize_to_lf(edit.new_text),
-        )
-        for edit in edits
-    ]
-
-    needs_fuzzy = False
-    for i, edit in enumerate(normalized_edits):
-        if edit.old_text in content:
-            continue
-        if _normalize_for_fuzzy_match(edit.old_text) in _normalize_for_fuzzy_match(content):
-            needs_fuzzy = True
-            continue
-        raise ValueError(
-            f"Could not find edits[{i}].old_text in {path}. Re-read the file and copy "
-            "the target text, including its whitespace and newlines."
-        )
-
-    match_content = _normalize_for_fuzzy_match(content) if needs_fuzzy else content
-    matched: list[_MatchedEdit] = []
-    for i, edit in enumerate(normalized_edits):
-        old_text = _normalize_for_fuzzy_match(edit.old_text) if needs_fuzzy else edit.old_text
-        positions = _find_occurrences(match_content, old_text)
-        if not positions:
-            raise ValueError(
-                f"Could not find edits[{i}].old_text in {path}. Re-read the file and copy "
-                "the target text, including its whitespace and newlines."
-            )
-        if len(positions) > 1:
-            raise ValueError(
-                f"Found {len(positions)} occurrences of edits[{i}].old_text in {path}. "
-                "Add surrounding context so the target is unique."
-            )
-        matched.append(_MatchedEdit(i, positions[0], len(old_text), edit.new_text))
-
-    matched.sort(key=lambda item: item.match_index)
-    for previous, current in zip(matched, matched[1:]):
-        if previous.match_index + previous.match_length > current.match_index:
-            raise ValueError(
-                f"edits[{previous.edit_index}] and edits[{current.edit_index}] overlap in "
-                f"{path}. Merge them into one edit or target disjoint regions."
-            )
-
-    new_content = (
-        _apply_fuzzy_replacements_preserving_lines(content, match_content, matched)
-        if needs_fuzzy
-        else _apply_replacements(match_content, matched)
-    )
-    if new_content == content:
-        raise ValueError(
-            f"No changes made to {path}. The replacements produced identical content."
-        )
-    return content, new_content
+def run_write(workspace: Workspace, path: str, content: str, mode: str = "overwrite") -> str:
+    return FileEngine(workspace.root).write(path, content, mode)
 
 
 def run_edit(
@@ -1291,105 +905,23 @@ def run_edit(
     edits_or_old_text: list[EditParams] | list[dict] | str,
     new_text: str | None = None,
 ) -> str:
-    """Apply validated, unique, non-overlapping edits to one UTF-8 file."""
     try:
-        edits = _coerce_edits(edits_or_old_text, new_text)
-        if not edits:
-            return "Error: edits must contain at least one replacement"
-        fp = workspace.resolve(path)
-        if not fp.exists():
-            return f"Error: File not found: {path}. Use write_file to create it first."
-        if not fp.is_file():
-            return f"Error: Not a file: {path}"
-
-        raw_content = fp.read_bytes().decode("utf-8", errors="replace")
-        bom = "\ufeff" if raw_content.startswith("\ufeff") else ""
-        content_without_bom = raw_content[len(bom):]
-        line_ending = _detect_line_ending(content_without_bom)
-        normalized_content = _normalize_to_lf(content_without_bom)
-        _, edited_content = _prepare_edits(normalized_content, edits, path)
-        final_content = bom + _restore_line_endings(edited_content, line_ending)
-        fp.write_text(final_content, encoding="utf-8", newline="")
-        return f"Edited {path}: applied {len(edits)} replacement(s)"
-    except Exception as e:
-        return f"Error: {e}"
-
-
-def _limit_lines(lines: list[str], limit: int) -> tuple[list[str], str]:
-    if limit and len(lines) > limit:
-        return lines[:limit], f"\n... ({len(lines) - limit} more lines)"
-    return lines, ""
-
-
-# Match-everything patterns: too broad to be useful, answered with a listing.
-BROAD_GLOB_PATTERNS = {"**", "**/", "**/*", "**/**"}
-
-
-def _glob_excluded(rel: Path) -> bool:
-    return any(part in EXCLUDE_DIRS for part in rel.parts)
-
-
-def _glob_listing(pattern: str, base: Path, workspace: Workspace) -> str:
-    entries = [
-        f"{child.name}/" if child.is_dir() else child.name
-        for child in sorted(base.iterdir())
-        if child.name not in EXCLUDE_DIRS
-        and not is_sensitive_path(child.resolve(), workspace.root)
-    ]
-    body = "\n".join(entries) if entries else "(empty)"
-    return (
-        f"Error: pattern `{pattern}` matches everything and is too broad. "
-        "Use a more specific recursive pattern such as `**/*.py`, `**/*.md`, "
-        "`src/**/*.ts`, or `tests/**/*_test.py`. If you need a shallow "
-        "directory overview, use pattern `*` with a specific directory. "
-        f"Top-level entries of `{base}` (directories marked with `/`):\n{body}"
+        if isinstance(edits_or_old_text, str):
+            if new_text is None:
+                raise ValueError("new_text is required with a legacy old_text argument")
+            edits = [EditParams(old_text=edits_or_old_text, new_text=new_text)]
+        else:
+            if new_text is not None:
+                raise ValueError("new_text cannot be combined with an edits list")
+            edits = [
+                edit if isinstance(edit, EditParams) else EditParams.model_validate(edit)
+                for edit in edits_or_old_text
+            ]
+    except Exception as exc:
+        return f"Error: {exc}"
+    return FileEngine(workspace.root).edit(
+        path, [edit.model_dump() for edit in edits],
     )
-
-
-def _glob_walk(
-    workspace: Workspace,
-    base: Path,
-    tail: str,
-    include_dirs: bool,
-) -> list[Path]:
-    """Recursive `**/<tail>` search that prunes noisy dirs during traversal.
-
-    Matches the basename against `tail` (not the relative path) so `fnmatch`'s
-    `*`-spans-`/` behavior cannot leak, and depth-0 entries under `base` match.
-    """
-    matches: list[Path] = []
-    for root, dirs, files in os.walk(base):
-        dirs[:] = [
-            d for d in dirs
-            if d not in EXCLUDE_DIRS
-            and not is_sensitive_path((Path(root) / d).resolve(), workspace.root)
-        ]
-        names = files + dirs if include_dirs else files
-        for name in names:
-            if fnmatch.fnmatch(name, tail):
-                matches.append(Path(root) / name)
-    return matches
-
-
-def _format_glob_matches(
-    workspace: Workspace,
-    pattern: str,
-    base: Path,
-    matches: list[Path],
-    limit: int,
-) -> str:
-    matches = [path for path in matches if not _glob_excluded(path.relative_to(base))]
-    matches = [path for path in matches if not is_sensitive_path(path.resolve(), workspace.root)]
-    matches.sort()
-    total = len(matches)
-    if total == 0:
-        return f"No matches found for pattern `{pattern}`."
-
-    lines = [str(path.relative_to(base)) for path in matches[:limit]]
-    message = f"Found {total} matches for pattern `{pattern}`."
-    if total > limit:
-        message += f" Showing first {limit}."
-    return "\n".join([message, *lines])
 
 
 def run_glob(
@@ -1399,31 +931,7 @@ def run_glob(
     include_dirs: bool = True,
     limit: int = 1000,
 ) -> str:
-    try:
-        base = workspace.resolve(directory or ".", allow_external_absolute=True)
-        if not base.exists():
-            return f"Error: Directory not found: {directory or '.'}"
-        if not base.is_dir():
-            return f"Error: Not a directory: {directory or '.'}"
-        if is_sensitive_path(base, workspace.root):
-            return f"Error: Access to sensitive directory is blocked: {directory or '.'}"
-
-        if pattern in BROAD_GLOB_PATTERNS:
-            return _glob_listing(pattern, base, workspace)
-
-        if pattern.startswith("**/") and "/" not in pattern[3:]:
-            # Precise recursive search: fast, pruned os.walk over the tree.
-            matches = _glob_walk(workspace, base, pattern[3:], include_dirs)
-        else:
-            # Non-recursive or exotic `**` shapes: pathlib handles the pattern;
-            # noisy dirs are dropped from the results by the formatter.
-            matches = list(base.glob(pattern))
-            if not include_dirs:
-                matches = [path for path in matches if path.is_file()]
-
-        return _format_glob_matches(workspace, pattern, base, matches, limit)
-    except Exception as e:
-        return f"Error: {e}"
+    return FileEngine(workspace.root).glob(pattern, directory, include_dirs, limit)
 
 
 def run_grep(
@@ -1602,6 +1110,7 @@ def build_tool_registry(
     *,
     task_runner: Callable[[str, str], Awaitable[str]] | None = None,
     file_backend: FileBackend | None = None,
+    command_runner: CommandRunner | None = None,
 ) -> dict[str, ToolRuntimeSpec]:
     """Build a tool registry bound to one workspace.
 
@@ -1610,49 +1119,93 @@ def build_tool_registry(
     """
     runner = task_runner or unavailable_task_runner
     files = file_backend or LocalFileBackend(workspace)
+    location = files.execution_location
+    if location not in {"local", "remote"}:
+        raise ValueError(f"Unsupported file backend location: {location!r}")
+    if location == "local" and not workspace.root.is_dir():
+        raise ValueError(f"Local workspace directory does not exist: {workspace.root}")
+    remote_call = getattr(files, "call", None)
+    if location == "remote" and not callable(remote_call):
+        raise TypeError("Remote file backend must implement call(operation, args)")
+    if command_runner is not None and command_runner.execution_location != location:
+        raise ValueError(
+            "File backend and command runner execution locations do not match: "
+            f"{location!r} != {command_runner.execution_location!r}"
+        )
+
+    def file_call(operation: str, args: dict, local: Callable[[], str]) -> str:
+        if location == "local":
+            return local()
+        assert callable(remote_call)
+        return remote_call(operation, args)
+
+    def remote_bash_call(command: str) -> str:
+        if command_runner is None:
+            return "Error: remote bash runner is not configured."
+        deny_reason = bash_hard_deny_reason(command, workspace.root)
+        if deny_reason:
+            return f"Error: Command blocked by safety policy: {deny_reason}"
+        started_at = time.monotonic()
+        result = command_runner.run(
+            ["bash", "-lc", command], cwd=command_runner.default_cwd, timeout=120,
+        )
+        return render_remote_bash_result(
+            result, round((time.monotonic() - started_at) * 1000),
+        )
+
+    async def execute_bash(params: BashParams) -> str:
+        if location == "local":
+            return await run_bash(workspace, params.command)
+        return await asyncio.to_thread(remote_bash_call, params.command)
+
+    def git_diff_call() -> str:
+        output = file_call(
+            "git_patch", {"base_commit": "BASELINE"}, lambda: run_git_diff(workspace),
+        )
+        if output.startswith("Error:"):
+            return output
+        return truncate_middle(output) if output else "No changes found."
     registry = {
         "bash": ToolRuntimeSpec(
             name="bash",
             params_model=BashParams,
             sanitize_args=sanitize_bash_args,
-            execute=lambda params: run_bash(workspace, params.command),
+            execute=execute_bash,
         ),
         "read_file": ToolRuntimeSpec(
             name="read_file",
             params_model=ReadFileParams,
             sanitize_args=sanitize_file_args,
-            execute=async_tool(lambda params: run_read(
-                workspace, params.path, params.offset, params.limit,
-            )),
+            execute=async_tool(lambda params: file_call("read", {
+                "path": params.path, "offset": params.offset, "limit": params.limit,
+            }, lambda: run_read(workspace, params.path, params.offset, params.limit))),
             concurrency_safe=True,
         ),
         "write_file": ToolRuntimeSpec(
             name="write_file",
             params_model=WriteFileParams,
             sanitize_args=sanitize_file_args,
-            execute=async_tool(lambda params: run_write(
-                workspace, params.path, params.content, params.mode,
-            )),
+            execute=async_tool(lambda params: file_call("write", {
+                "path": params.path, "content": params.content, "mode": params.mode,
+            }, lambda: run_write(workspace, params.path, params.content, params.mode))),
         ),
         "edit_file": ToolRuntimeSpec(
             name="edit_file",
             params_model=EditFileParams,
             sanitize_args=sanitize_edit_args,
-            execute=async_tool(lambda params: run_edit(
-                workspace, params.path, params.edits,
-            )),
+            execute=async_tool(lambda params: file_call("edit", {
+                "path": params.path,
+                "edits": [edit.model_dump() for edit in params.edits],
+            }, lambda: run_edit(workspace, params.path, params.edits))),
         ),
         "glob": ToolRuntimeSpec(
             name="glob",
             params_model=GlobParams,
             sanitize_args=sanitize_search_args,
-            execute=async_tool(lambda params: run_glob(
-                workspace,
-                params.pattern,
-                params.directory,
-                params.include_dirs,
-                params.limit,
-            )),
+            execute=async_tool(lambda params: file_call("glob", {
+                "pattern": params.pattern, "directory": params.directory,
+                "include_dirs": params.include_dirs, "limit": params.limit,
+            }, lambda: run_glob(workspace, params.pattern, params.directory, params.include_dirs, params.limit))),
             concurrency_safe=True,
         ),
         "grep": ToolRuntimeSpec(
@@ -1670,7 +1223,7 @@ def build_tool_registry(
             name="git_diff",
             params_model=GitDiffParams,
             sanitize_args=sanitize_passthrough,
-            execute=async_tool(lambda params: run_git_diff(workspace)),
+            execute=async_tool(lambda params: git_diff_call()),
             concurrency_safe=True,
         ),
         "todo": ToolRuntimeSpec(

@@ -214,15 +214,12 @@ class TestEditFuzzy:
 
     def test_fuzzy_untouched_lines_preserved(self, tools, workspace):
         rel = "preserve.txt"
-        original = "keep\u00a0this\nchange me\nkeep\u00a0that"
+        original = "keep\u00a0this   \nchange “me”  \nkeep—that\t  \n"
         _seed(workspace, rel, original)
-        result = tools.run_edit(workspace, rel, [tools.EditParams(old_text="change me", new_text="CHANGED")])
+        result = tools.run_edit(workspace, rel, [tools.EditParams(old_text='change "me"', new_text="CHANGED")])
         assert "1 replacement" in result
         content = (workspace.root / "preserve.txt").read_text(encoding="utf-8")
-        # Untouched lines keep their original NBSP.
-        assert "keep\u00a0this" in content
-        assert "keep\u00a0that" in content
-        assert "CHANGED" in content
+        assert content == "keep\u00a0this   \nCHANGED\nkeep—that\t  \n"
 
 
 # ---------------------------------------------------------------------------
