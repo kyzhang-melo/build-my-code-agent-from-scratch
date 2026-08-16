@@ -174,21 +174,21 @@ def test_run_glob_limits_results(load_module, workspace) -> None:
     assert len(output.splitlines()) == 3
 
 
-def test_run_grep_reports_missing_ripgrep(load_module, monkeypatch, workspace) -> None:
+def test_run_grep_falls_back_when_ripgrep_is_missing(load_module, monkeypatch, workspace) -> None:
     tools = load_module("tools", "tools.py")
-    monkeypatch.setattr(tools.shutil, "which", lambda name: None)
+    import grep_engine
+    (workspace.root / "target.txt").write_text("a needle here\n", encoding="utf-8")
+    monkeypatch.setattr(grep_engine.shutil, "which", lambda _name: None)
 
-    output = tools.run_grep(workspace, "needle")
-
-    assert output.startswith("Error: ripgrep (`rg`) is not installed")
+    assert tools.run_grep(workspace, "needle") == "target.txt"
 
 
 @pytest.mark.parametrize(
-    "output_mode, expected_flag",
+    "output_mode, expected_output",
     [
-        ("files_with_matches", "--files-with-matches"),
-        ("count_matches", "--count-matches"),
-        ("content", "--line-number"),
+        ("files_with_matches", "tools.py"),
+        ("count_matches", "tools.py:1"),
+        ("content", "tools.py:2:needle"),
     ],
 )
 def test_run_grep_builds_safe_rg_command(
@@ -196,18 +196,29 @@ def test_run_grep_builds_safe_rg_command(
     monkeypatch,
     workspace,
     output_mode,
-    expected_flag,
+    expected_output,
 ) -> None:
     tools = load_module("tools", "tools.py")
+    import grep_engine
     captured = {}
 
     def fake_run(args, **kwargs):
         captured["args"] = args
         captured["kwargs"] = kwargs
-        return subprocess.CompletedProcess(args, 0, stdout=f"{workspace.root}/tools.py\n", stderr="")
+        event = {
+            "type": "match",
+            "data": {
+                "path": {"text": str(workspace.root / "tools.py")},
+                "line_number": 2,
+                "lines": {"text": "needle\n"},
+                "submatches": [{"start": 0, "end": 6}],
+            },
+        }
+        import json
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps(event) + "\n", stderr="")
 
-    monkeypatch.setattr(tools.shutil, "which", lambda name: "/usr/bin/rg")
-    monkeypatch.setattr(tools.subprocess, "run", fake_run)
+    monkeypatch.setattr(grep_engine.shutil, "which", lambda _name: "/usr/bin/rg")
+    monkeypatch.setattr(grep_engine.subprocess, "run", fake_run)
 
     output = tools.run_grep(
         workspace, "needle",
@@ -217,11 +228,10 @@ def test_run_grep_builds_safe_rg_command(
         ignore_case=True,
     )
 
-    assert output == "tools.py"
-    assert captured["kwargs"]["shell"] is False
-    assert captured["kwargs"]["cwd"] == str(workspace.root)
+    assert output == expected_output
+    assert captured["kwargs"]["cwd"] == workspace.root
     assert captured["kwargs"]["timeout"] == 20
-    assert expected_flag in captured["args"]
+    assert "--json" in captured["args"]
     assert "--ignore-case" in captured["args"]
     assert "--glob" in captured["args"]
     assert "*.py" in captured["args"]
@@ -231,19 +241,12 @@ def test_run_grep_builds_safe_rg_command(
 
 def test_run_grep_handles_no_matches_and_limits_output(load_module, monkeypatch, workspace) -> None:
     tools = load_module("tools", "tools.py")
-
-    def no_match(args, **kwargs):
-        return subprocess.CompletedProcess(args, 1, stdout="", stderr="")
-
-    monkeypatch.setattr(tools.shutil, "which", lambda name: "/usr/bin/rg")
-    monkeypatch.setattr(tools.subprocess, "run", no_match)
+    import grep_engine
+    monkeypatch.setattr(grep_engine.shutil, "which", lambda _name: None)
     assert tools.run_grep(workspace, "missing") == "No matches found."
 
-    def many_matches(args, **kwargs):
-        stdout = "\n".join(f"{workspace.root}/file_{index}.py" for index in range(3))
-        return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
-
-    monkeypatch.setattr(tools.subprocess, "run", many_matches)
+    for index in range(3):
+        (workspace.root / f"file_{index}.py").write_text("needle\n", encoding="utf-8")
     output = tools.run_grep(workspace, "needle", head_limit=2)
 
     assert output.splitlines() == [
@@ -255,7 +258,8 @@ def test_run_grep_handles_no_matches_and_limits_output(load_module, monkeypatch,
 
 def test_run_grep_rejects_workspace_escape(load_module, monkeypatch, workspace) -> None:
     tools = load_module("tools", "tools.py")
-    monkeypatch.setattr(tools.shutil, "which", lambda name: "/usr/bin/rg")
+    import grep_engine
+    monkeypatch.setattr(grep_engine.shutil, "which", lambda _name: None)
 
     output = tools.run_grep(workspace, "needle", path="../")
 
@@ -269,21 +273,15 @@ def test_run_grep_allows_external_absolute_path(
     tmp_path,
 ) -> None:
     tools = load_module("tools", "tools.py")
+    import grep_engine
     external = tmp_path.parent / f"{tmp_path.name}-external-grep"
     external.mkdir()
-    captured = {}
-
-    def fake_run(args, **kwargs):
-        captured["args"] = args
-        return subprocess.CompletedProcess(args, 1, stdout="", stderr="")
-
-    monkeypatch.setattr(tools.shutil, "which", lambda _name: "/usr/bin/rg")
-    monkeypatch.setattr(tools.subprocess, "run", fake_run)
+    (external / "target.txt").write_text("needle\n", encoding="utf-8")
+    monkeypatch.setattr(grep_engine.shutil, "which", lambda _name: None)
 
     output = tools.run_grep(workspace, "needle", path=str(external))
 
-    assert output == "No matches found."
-    assert str(external.resolve()) in captured["args"]
+    assert output == "target.txt"
 
 
 @pytest.mark.parametrize(

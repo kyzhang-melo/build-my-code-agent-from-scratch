@@ -522,14 +522,16 @@ def test_glob_hides_sensitive_paths(load_module, workspace) -> None:
 
 def test_grep_sensitive_excludes_override_caller_glob(load_module, workspace, monkeypatch) -> None:
     tools = load_module("tools", "tools.py")
+    import grep_engine
+
     captured = {}
 
     def fake_run(args, **kwargs):
         captured["args"] = args
         return subprocess.CompletedProcess(args, 1, stdout="", stderr="")
 
-    monkeypatch.setattr(tools.shutil, "which", lambda _name: "/usr/bin/rg")
-    monkeypatch.setattr(tools.subprocess, "run", fake_run)
+    monkeypatch.setattr(grep_engine.shutil, "which", lambda _name: "/usr/bin/rg")
+    monkeypatch.setattr(grep_engine.subprocess, "run", fake_run)
 
     tools.run_grep(workspace, "SECRET", glob=".env")
 

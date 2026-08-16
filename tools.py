@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import signal
 import subprocess
 import tempfile
@@ -29,6 +28,8 @@ from permissions import (
 )
 from trace import TraceContext, emit_trace
 from workspace import Workspace
+from grep_engine import GrepRequest
+from sandbox import FileBackend, LocalFileBackend
 
 
 TOOL_OUTPUT_PREVIEW_CHARS = 500
@@ -47,34 +48,6 @@ EXCLUDE_DIRS = {
     ".sessions",
     ".transcripts",
 }
-SENSITIVE_GLOB_PATTERNS = (
-    ".env",
-    ".env.*",
-    "*.key",
-    "*.pem",
-    "*.p12",
-    "*.pfx",
-    ".netrc",
-    ".npmrc",
-    ".pypirc",
-    "credentials",
-    "id_dsa",
-    "id_ecdsa",
-    "id_ed25519",
-    "id_rsa",
-    ".sessions",
-    ".sessions/**",
-    "**/.sessions/**",
-    ".transcripts",
-    ".transcripts/**",
-    "**/.transcripts/**",
-    ".ssh",
-    ".ssh/**",
-    "**/.ssh/**",
-    ".git/config",
-    "**/.git/config",
-)
-
 # Budget for a single tool output handed back to the model. Char-based (chars
 # ~= 4x tokens); a token-aware policy can replace it later without touching callers.
 TOOL_OUTPUT_MAX_CHARS = 48000
@@ -324,7 +297,7 @@ TOOLS = [
         "type": "function",
         "name": "grep",
         "description": (
-            "Search file contents with ripgrep. Relative search paths resolve within the "
+            "Search file contents. Relative search paths resolve within the "
             "workspace; a path outside it must be absolute. "
             "Put the search location in path, and use glob only to filter file names. "
             "The valid JSON arguments are pattern, path, glob, output_mode, ignore_case, "
@@ -1453,14 +1426,6 @@ def run_glob(
         return f"Error: {e}"
 
 
-def _strip_workdir_prefix(workspace: Workspace, output: str) -> str:
-    prefix = str(workspace.root) + "/"
-    return "\n".join(
-        line[len(prefix) :] if line.startswith(prefix) else line
-        for line in output.splitlines()
-    )
-
-
 def run_grep(
     workspace: Workspace,
     pattern: str,
@@ -1471,74 +1436,15 @@ def run_grep(
     line_number: bool = True,
     head_limit: int = 250,
 ) -> str:
-    rg_path = shutil.which("rg")
-    if not rg_path:
-        return "Error: ripgrep (`rg`) is not installed. Install it with `brew install ripgrep`."
-
-    try:
-        search_path = workspace.resolve(path, allow_external_absolute=True)
-        if not search_path.exists():
-            return f"Error: Path not found: {path}"
-        if is_sensitive_path(search_path, workspace.root):
-            return f"Error: Access to sensitive path is blocked: {path}"
-
-        args = [
-            rg_path,
-            "--hidden",
-            "--max-columns",
-            "500",
-            "--glob",
-            "!.git",
-            "--glob",
-            "!.svn",
-            "--glob",
-            "!.hg",
-            "--glob",
-            "!.env",
-            "--glob",
-            "!.env.*",
-        ]
-        if ignore_case:
-            args.append("--ignore-case")
-        if glob:
-            args.extend(["--glob", glob])
-        # Apply sensitive excludes last so a caller-supplied include glob cannot
-        # re-include files that must stay out of model context.
-        for sensitive_pattern in SENSITIVE_GLOB_PATTERNS:
-            args.extend(["--glob", f"!{sensitive_pattern}"])
-        if output_mode == "files_with_matches":
-            args.append("--files-with-matches")
-        elif output_mode == "count_matches":
-            args.append("--count-matches")
-        elif output_mode == "content" and line_number:
-            args.append("--line-number")
-
-        args.extend(["--", pattern, str(search_path)])
-
-        result = subprocess.run(
-            args,
-            shell=False,
-            cwd=str(workspace.root),
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-    except subprocess.TimeoutExpired:
-        return "Error: grep timed out after 20s. Try a more specific path or pattern."
-    except Exception as e:
-        return f"Error: {e}"
-
-    output = _strip_workdir_prefix(workspace, result.stdout.strip())
-    stderr = result.stderr.strip()
-    if result.returncode == 1:
-        return "No matches found."
-    if result.returncode not in (0, 1):
-        return f"Error: grep failed. {stderr}".strip()
-
-    lines = output.splitlines()
-    lines, suffix = _limit_lines(lines, head_limit)
-    output = "\n".join(lines) + suffix
-    return output if output else "No matches found."
+    return LocalFileBackend(workspace).grep(GrepRequest(
+        pattern=pattern,
+        path=path,
+        glob=glob,
+        output_mode=output_mode,
+        ignore_case=ignore_case,
+        line_number=line_number,
+        head_limit=head_limit,
+    ))
 
 
 def run_git_diff(workspace: Workspace) -> str:
@@ -1695,6 +1601,7 @@ def build_tool_registry(
     tool_names: set[str] | None = None,
     *,
     task_runner: Callable[[str, str], Awaitable[str]] | None = None,
+    file_backend: FileBackend | None = None,
 ) -> dict[str, ToolRuntimeSpec]:
     """Build a tool registry bound to one workspace.
 
@@ -1702,6 +1609,7 @@ def build_tool_registry(
     never operate on a directory other than the one its registry was built for.
     """
     runner = task_runner or unavailable_task_runner
+    files = file_backend or LocalFileBackend(workspace)
     registry = {
         "bash": ToolRuntimeSpec(
             name="bash",
@@ -1751,16 +1659,11 @@ def build_tool_registry(
             name="grep",
             params_model=GrepParams,
             sanitize_args=sanitize_search_args,
-            execute=async_tool(lambda params: run_grep(
-                workspace,
-                params.pattern,
-                params.path,
-                params.glob,
-                params.output_mode,
-                params.ignore_case,
-                params.line_number,
-                params.head_limit,
-            )),
+            execute=async_tool(lambda params: files.grep(GrepRequest(
+                pattern=params.pattern, path=params.path, glob=params.glob,
+                output_mode=params.output_mode, ignore_case=params.ignore_case,
+                line_number=params.line_number, head_limit=params.head_limit,
+            ))),
             concurrency_safe=True,
         ),
         "git_diff": ToolRuntimeSpec(

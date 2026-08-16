@@ -44,6 +44,8 @@ def test_two_parent_sessions_have_distinct_workspaces(load_module) -> None:
 
     assert sa.workspace.root != sb.workspace.root
     assert sa.workspace is not sb.workspace
+    assert sa.sandbox is not sb.sandbox
+    assert sa.sandbox.file_backend is not sb.sandbox.file_backend
 
 
 def test_two_parent_sessions_have_distinct_todos(load_module) -> None:

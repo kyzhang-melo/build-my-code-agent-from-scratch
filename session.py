@@ -13,6 +13,7 @@ from permissions import PermissionService
 from session_store import NullSessionStore, SessionStoreProtocol
 from tools import TodoManager, ToolRuntimeSpec
 from trace import TraceContext
+from sandbox import Sandbox
 from workspace import Workspace
 
 
@@ -107,6 +108,7 @@ class AgentSession:
     name: str
     session_id: str
     workspace: Workspace
+    sandbox: Sandbox
     todo: TodoManager
     system: str
     tools: list[dict]

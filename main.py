@@ -25,6 +25,7 @@ from prompt_toolkit.styles import Style
 from message_utils import extract_usage, normalize_messages, response_item_to_dict
 from permissions import PermissionManager, PermissionMode, PermissionService, TerminalApprovalHandler
 from prompts import GLOB_DISCOVERY_RULES, build_explore_system, build_parent_system
+from sandbox import LocalSandbox, Sandbox
 from session import (
     AgentSession,
     ReportStopGate,
@@ -416,21 +417,26 @@ def create_explore_session(
     trace_context: TraceContext,
     session_id: str,
     *,
+    sandbox: Sandbox | None = None,
     reasoning_effort: str | None = None,
     max_output_tokens: int | None = DEFAULT_MAX_OUTPUT_TOKENS,
 ) -> AgentSession:
     """Create an isolated read-only exploration session."""
     validate_generation_config(reasoning_effort, max_output_tokens)
     todo = TodoManager()
+    runtime = sandbox or LocalSandbox(workspace)
     child_trace = replace(trace_context, agent_id="subagent:explore")
     return AgentSession(
         name="subagent:explore",
         session_id=session_id,
         workspace=workspace,
+        sandbox=runtime,
         todo=todo,
         system=build_explore_system(workspace.root),
         tools=EXPLORE_TOOLS,
-        registry=build_tool_registry(workspace, todo, READ_ONLY_TOOL_NAMES),
+        registry=build_tool_registry(
+            workspace, todo, READ_ONLY_TOOL_NAMES, file_backend=runtime.file_backend,
+        ),
         permission_service=permission_service,
         permission_source="subagent:explore",
         trace_context=child_trace,
@@ -460,10 +466,12 @@ def create_parent_session(
     steering_policy: TurnSteeringPolicy | None = None,
     system_addendum: str | None = None,
     tool_names: set[str] | frozenset[str] | None = None,
+    sandbox: Sandbox | None = None,
 ) -> AgentSession:
     """Build one fully isolated parent-agent session."""
     validate_generation_config(reasoning_effort, max_output_tokens)
     workspace = Workspace(Path(workdir))
+    runtime = sandbox or LocalSandbox(workspace)
     todo = TodoManager()
     permission_service = PermissionService(
         manager=PermissionManager(workspace.root),
@@ -484,6 +492,7 @@ def create_parent_session(
             permission_service,
             trace,
             sid,
+            sandbox=runtime,
             reasoning_effort=reasoning_effort,
             max_output_tokens=max_output_tokens,
         )
@@ -502,6 +511,7 @@ def create_parent_session(
         name="parent",
         session_id=sid,
         workspace=workspace,
+        sandbox=runtime,
         todo=todo,
         system=system,
         tools=select_tool_schemas(selected_names),
@@ -510,6 +520,7 @@ def create_parent_session(
             todo,
             selected_names,
             task_runner=task_runner,
+            file_backend=runtime.file_backend,
         ),
         permission_service=permission_service,
         permission_source="parent",
