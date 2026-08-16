@@ -265,9 +265,11 @@ The repository has several deliberately separate evaluation layers:
 - Mini-fixture evals exercise end-to-end agent behavior in small local
   workspaces.
 - Micro evals isolate deterministic or paired harness decisions.
-- Cold SWE-bench runs measure behavior with a fresh session per instance.
+- Cold SWE-bench runs use Docker-based generation with a fresh session and
+  disposable instance-image `/testbed` workspace per instance.
 - Warm-context SWE-bench sequences preserve conversation context across an
-  ordered set of instances while resetting the code workspace each time.
+  ordered set of instances while resetting a host-side Git workspace each
+  time. This runner has not been migrated to Docker-based generation.
 - Official SWE-bench grading remains the correctness signal. The optional LLM
   judge compares the recorded processes after eval completion; it does not
   replace outcome grading.
@@ -279,20 +281,46 @@ Start with [`evals/README.md`](evals/README.md), then see the focused guides for
 
 ### SWE-bench
 
-The SWE-bench adapter runs the real parent agent in isolated host-side Git
-repositories, exports its changes as official prediction patches, and delegates
-grading to an unmodified SWE-bench Docker harness:
+The cold SWE-bench adapter now uses Docker for both generation and official
+grading. During generation, the real parent agent runs inside each official
+instance image's prepared `/testbed`; the solve container has networking
+disabled, is removed after the attempt, and exports only the prediction patch
+and diagnostic artifacts. Cold runs no longer clone host-side Git mirrors or
+retain a repository workspace per attempt.
+
+The cold eval tool profile includes workspace-bound file/search tools and
+`bash`, so the agent can inspect `/testbed` and review changes with `git diff`.
+The standalone `git_diff` tool is not included in this profile.
+
+Run the complete generate, official-evaluate, and report pipeline with:
 
 ```bash
 ./.venv/bin/python evals/swebench/run_swebench.py run \
-  --run-id verified-smoke-001 \
-  --subset evals/swebench/subsets/smoke.json
+  --run-id verified-small-11-001 \
+  --subset evals/swebench/subsets/small_11.json \
+  --runs-dir /mnt/docker-data/swebench/runs \
+  --reasoning-effort high \
+  --agent-workers 2 \
+  --max-workers 2
 ```
 
-This workflow calls a live model and may clone large repositories or run
-resource-intensive Docker evaluations. It is never included in pytest. See
+The former cold-runner options `--generate-environment` and `--repo-cache`
+have been removed. Docker generation is no longer optional, and cold runs no
+longer download or use host repository mirrors. Existing command lines must
+drop both options; Docker may still pull missing instance images, and an
+uncached SWE-bench dataset may still require a download.
+
+`evals/swebench_sequence` is deliberately unchanged. Its warm-context runner
+still uses a host repository mirror and recreates/archives a local workspace
+for each episode, so its own `--repo-cache` option remains valid. Migration of
+that workflow to Docker-based generation is deferred.
+
+These workflows call a live model and can run resource-intensive Docker
+evaluations. They are never included in pytest. See
 [`evals/swebench/README.md`](evals/swebench/README.md) for prerequisites,
-artifacts, budgets, and recovery behavior.
+artifacts, budgets, and recovery behavior, and
+[`evals/swebench_sequence/README.md`](evals/swebench_sequence/README.md) for
+the separate warm-context workflow.
 
 ### Testing Conventions
 
