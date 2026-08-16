@@ -1,7 +1,7 @@
 {
   "dataset": "SWE-bench/SWE-bench_Verified",
   "split": "test",
-  "selection": "Ten-repository batch that extends small.json with five additional SWE-bench Verified instances; selected without gold fields and is not a representative benchmark sample.",
+  "selection": "Eleven-instance batch that extends small.json with six additional SWE-bench Verified instances; ten distinct repositories; selected without gold fields and is not a representative benchmark sample.",
   "instance_ids": [
     "astropy__astropy-12907",
     "django__django-10097",
@@ -12,6 +12,7 @@
     "mwaskom__seaborn-3069",
     "pallets__flask-5014",
     "psf__requests-1142",
-    "pydata__xarray-2905"
+    "pydata__xarray-2905",
+    "django__django-13513"
   ]
 }

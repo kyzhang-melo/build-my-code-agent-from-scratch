@@ -216,4 +216,4 @@ Baseline/candidate order alternates between trials. Reports are written under
 calls, `-n` validation failures, tool-error signatures, and a verdict against
 the criteria declared before the run. If the hypothesis is accepted, the next
 gate is to implement the candidate in the production harness and run SWE-bench
-`small_10.json` once to check for side effects.
+`small_11.json` once to check for side effects.

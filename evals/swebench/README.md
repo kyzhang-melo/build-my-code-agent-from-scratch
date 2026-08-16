@@ -4,8 +4,9 @@ This adapter runs the real `myCodeAgent-v0` parent agent against Git
 repositories whose working tree matches each task's base commit, exports the
 resulting repository changes, and delegates grading to the unmodified official
 SWE-bench Docker harness. Generation uses each instance image's prepared
-`/testbed` by default, without a host bind mount. Pass
-`--generate-environment local` to use the compatibility host workspace.
+`/testbed` without a host bind mount. Local generation is temporarily disabled
+because the eval profile includes general-purpose `bash`; use
+`--generate-environment docker`.
 
 The eval agent uses a restricted tool profile: workspace-bound file tools,
 `todo`, the read-only exploration subagent, and `bash`. The standalone

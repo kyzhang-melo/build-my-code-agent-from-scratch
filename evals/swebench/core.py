@@ -45,6 +45,9 @@ SWEBENCH_TOOL_NAMES = frozenset({
     "todo",
     "task",
 })
+DOCKER_GENERATION_REQUIRED = (
+    "SWE-bench bash generation requires --generate-environment docker"
+)
 STAGED_STEERING_THRESHOLDS = (45, 60)
 
 
@@ -404,6 +407,8 @@ def create_manifest(
     generate_environment: str = "docker",
     image_namespace: str = "swebench",
 ) -> dict:
+    if generate_environment != "docker":
+        raise ValueError(DOCKER_GENERATION_REQUIRED)
     harness_commit, harness_dirty = repository_state(PROJECT_ROOT)
     swebench_commit, swebench_dirty = repository_state(swebench_repo)
     return {
@@ -433,40 +438,30 @@ def create_manifest(
         "swebench_worktree_dirty": swebench_dirty,
         "platform": platform.platform(),
         "auto_compact": os.getenv("AUTO_COMPACT", "1") != "0",
-        "generate_environment": generate_environment,
-        "solve_network_mode": "none" if generate_environment == "docker" else "host",
-        "solve_workspace_mode": (
-            "image_testbed" if generate_environment == "docker" else "host_workspace"
-        ),
+        "generate_environment": "docker",
+        "solve_network_mode": "none",
+        "solve_workspace_mode": "image_testbed",
         "image_namespace": image_namespace,
     }
 
 
 def ensure_manifest(path: Path, proposed: dict) -> dict:
     proposed = dict(proposed)
-    proposed.setdefault("generate_environment", "local")
-    proposed.setdefault("solve_network_mode", "host")
-    proposed.setdefault(
-        "solve_workspace_mode",
-        "image_testbed" if proposed["generate_environment"] == "docker" else "host_workspace",
-    )
+    if proposed.get("generate_environment", "docker") != "docker":
+        raise ValueError(DOCKER_GENERATION_REQUIRED)
+    proposed.setdefault("generate_environment", "docker")
+    proposed.setdefault("solve_network_mode", "none")
+    proposed.setdefault("solve_workspace_mode", "image_testbed")
     proposed.setdefault("image_namespace", "swebench")
     if not path.exists():
         atomic_write_json(path, proposed)
         return proposed
     existing = json.loads(path.read_text(encoding="utf-8"))
-    needs_environment_migration = "generate_environment" not in existing
-    if needs_environment_migration:
-        existing["generate_environment"] = "local"
-        existing["solve_network_mode"] = "host"
-        existing["image_namespace"] = proposed.get("image_namespace", "swebench")
+    if existing.get("generate_environment") != "docker":
+        raise ValueError(DOCKER_GENERATION_REQUIRED)
     needs_workspace_migration = "solve_workspace_mode" not in existing
     if needs_workspace_migration:
-        existing["solve_workspace_mode"] = (
-            "bind_mount"
-            if existing.get("generate_environment") == "docker"
-            else "host_workspace"
-        )
+        existing["solve_workspace_mode"] = "bind_mount"
     needs_model_limits_migration = "model_limits" not in existing
     keys = (
         "dataset",
@@ -505,13 +500,6 @@ def ensure_manifest(path: Path, proposed: dict) -> dict:
         detail = f"run manifest conflicts in: {', '.join(conflicts)}"
         if "solve_workspace_mode" in conflicts and existing.get("solve_workspace_mode") == "bind_mount":
             detail += "; legacy Docker runs used bind mounts; choose a new run id for image /testbed"
-        if needs_environment_migration and any(
-            key in conflicts for key in ("generate_environment", "solve_network_mode")
-        ):
-            detail += (
-                "; legacy runs used the local generate environment, so resume with "
-                "--generate-environment local or choose a new run id for Docker"
-            )
         raise ValueError(detail)
     if needs_model_limits_migration:
         previous_harness_commit = existing.get("harness_commit")
@@ -528,7 +516,7 @@ def ensure_manifest(path: Path, proposed: dict) -> dict:
             "previous_harness_commit": previous_harness_commit,
             "new_harness_commit": proposed["harness_commit"],
         })
-    if needs_environment_migration or needs_workspace_migration:
+    if needs_workspace_migration:
         existing["schema_version"] = 4
         migrations = existing.setdefault("migrations", [])
         if not isinstance(migrations, list):
@@ -539,7 +527,7 @@ def ensure_manifest(path: Path, proposed: dict) -> dict:
             "generate_environment": existing["generate_environment"],
             "solve_workspace_mode": existing["solve_workspace_mode"],
         })
-    if needs_model_limits_migration or needs_environment_migration or needs_workspace_migration:
+    if needs_model_limits_migration or needs_workspace_migration:
         atomic_write_json(path, existing)
     return existing
 
@@ -565,20 +553,18 @@ async def run_agent_attempt(
     reasoning_effort: str | None,
     max_output_tokens: int | None,
     timeout: int | None,
-    generate_environment: str = "local",
+    generate_environment: str = "docker",
 ) -> AgentResult:
+    if generate_environment != "docker":
+        raise ValueError(DOCKER_GENERATION_REQUIRED)
+
     import main
     from trace import JsonlTraceSink, TraceContext
     from sandbox import DockerSandbox
     from workspace import Workspace
 
     attempt_dir.mkdir(parents=True, exist_ok=True)
-    docker_mode = generate_environment == "docker"
-    workspace = (
-        None
-        if docker_mode
-        else create_isolated_workspace(mirror, attempt_dir / "workspace", task.base_commit)
-    )
+    workspace = None
     attempt = int(attempt_dir.name.split("-", 1)[1])
     result = AgentResult(task.instance_id, attempt, "error", "not_exported")
     started = time.monotonic()
@@ -593,18 +579,17 @@ async def run_agent_attempt(
     log_path = attempt_dir / "agent.log"
     sandbox = None
     try:
-        if docker_mode:
-            if not task.instance_image_key:
-                raise RuntimeError("task is missing its SWE-bench instance image key")
-            sandbox = DockerSandbox(
-                task.instance_image_key,
-                f"{run_id}:{task.instance_id}:attempt-{attempt}",
-                task.base_commit,
-                platform=task.platform,
-                run_id=run_id,
-            )
-            sandbox.start()
-            workspace = Path(sandbox.workspace_root)
+        if not task.instance_image_key:
+            raise RuntimeError("task is missing its SWE-bench instance image key")
+        sandbox = DockerSandbox(
+            task.instance_image_key,
+            f"{run_id}:{task.instance_id}:attempt-{attempt}",
+            task.base_commit,
+            platform=task.platform,
+            run_id=run_id,
+        )
+        sandbox.start()
+        workspace = Path(sandbox.workspace_root)
         if workspace is None:
             raise RuntimeError("solve workspace was not initialized")
         session = main.create_parent_session(
@@ -700,7 +685,7 @@ def run_agent_attempt_worker(
     reasoning_effort: str | None,
     max_output_tokens: int | None,
     timeout: int | None,
-    generate_environment: str = "local",
+    generate_environment: str = "docker",
 ) -> AgentResult:
     """Run one attempt in a dedicated worker process.
 

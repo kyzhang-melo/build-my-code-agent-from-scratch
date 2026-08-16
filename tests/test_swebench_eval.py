@@ -237,6 +237,22 @@ def test_agent_attempt_records_api_calls_when_the_agent_errors(
     attempt_dir = tmp_path / "attempt-1"
 
     import main
+    import sandbox
+
+    class FakeDockerSandbox:
+        workspace_root = "/testbed"
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            return self
+
+        def close(self):
+            pass
+
+        def export_patch(self):
+            return ""
 
     class FakeState:
         def __init__(self, messages):
@@ -256,6 +272,11 @@ def test_agent_attempt_records_api_calls_when_the_agent_errors(
     monkeypatch.setattr(main, "LoopState", FakeState)
     monkeypatch.setattr(main, "create_parent_session", fake_create_parent_session)
     monkeypatch.setattr(main, "agent_loop", fail_agent_loop)
+    monkeypatch.setattr(sandbox, "DockerSandbox", FakeDockerSandbox)
+    task = Task(
+        task.instance_id, task.repo, task.base_commit, task.problem_statement,
+        task.version, instance_image_key="example/image:latest",
+    )
 
     result = asyncio.run(core.run_agent_attempt(
         task,
@@ -268,6 +289,7 @@ def test_agent_attempt_records_api_calls_when_the_agent_errors(
         reasoning_effort=None,
         max_output_tokens=None,
         timeout=None,
+        generate_environment="docker",
     ))
 
     assert result.agent_status == "error"
@@ -311,6 +333,31 @@ def test_docker_start_failure_is_not_misclassified_as_invalid_patch(
     assert result.patch_status == "not_exported"
     assert "docker failed to start" in result.error
     assert closed == [True]
+
+
+def test_local_agent_attempt_fails_before_workspace_or_agent_start(
+    monkeypatch, tmp_path,
+) -> None:
+    import main
+
+    def unexpected_call(*_args, **_kwargs):
+        raise AssertionError("local generation reached agent or workspace setup")
+
+    monkeypatch.setattr(core, "create_isolated_workspace", unexpected_call)
+    monkeypatch.setattr(main, "create_parent_session", unexpected_call)
+    task = Task("owner__repo-1", "owner/repo", "base", "Fix it")
+
+    with pytest.raises(ValueError) as exc_info:
+        asyncio.run(core.run_agent_attempt(
+            task, tmp_path / "mirror", tmp_path / "attempt-1",
+            run_id="run", model="model", max_api_calls=1,
+            steering_policy="none", reasoning_effort=None,
+            max_output_tokens=None, timeout=None,
+            generate_environment="local",
+        ))
+
+    assert str(exc_info.value) == core.DOCKER_GENERATION_REQUIRED
+    assert not (tmp_path / "attempt-1").exists()
 
 
 def test_final_text_write_failure_still_closes_docker_sandbox(
@@ -437,6 +484,10 @@ def test_manifest_migrates_legacy_resume_after_config_check(tmp_path) -> None:
         "dataset": "verified",
         "model": "hy3",
         "harness_commit": "old-harness",
+        "generate_environment": "docker",
+        "solve_network_mode": "none",
+        "solve_workspace_mode": "image_testbed",
+        "image_namespace": "swebench",
     })
     proposed = {
         "schema_version": 2,
@@ -444,13 +495,17 @@ def test_manifest_migrates_legacy_resume_after_config_check(tmp_path) -> None:
         "model": "hy3",
         "harness_commit": "new-harness",
         "harness_worktree_dirty": True,
+        "generate_environment": "docker",
+        "solve_network_mode": "none",
+        "solve_workspace_mode": "image_testbed",
+        "image_namespace": "swebench",
         "model_limits": {
             "context_window_tokens": 262144,
             "max_input_tokens": 192000,
             "max_output_tokens": 128000,
         },
     }
-    assert core.ensure_manifest(path, proposed)["schema_version"] == 4
+    assert core.ensure_manifest(path, proposed)["schema_version"] == 2
     migrated = json.loads(path.read_text(encoding="utf-8"))
     assert migrated["model_limits"] == proposed["model_limits"]
     assert migrated["harness_commit"] == "new-harness"
@@ -466,16 +521,31 @@ def test_manifest_migrates_legacy_resume_after_config_check(tmp_path) -> None:
         core.ensure_manifest(path, {**proposed, "harness_commit": "another-harness"})
 
 
-def test_legacy_manifest_docker_conflict_has_actionable_message(tmp_path) -> None:
+def test_legacy_local_manifest_requires_docker(tmp_path) -> None:
     path = tmp_path / "manifest.json"
     core.atomic_write_json(path, {"schema_version": 2})
 
-    with pytest.raises(ValueError, match="--generate-environment local"):
+    with pytest.raises(ValueError) as exc_info:
         core.ensure_manifest(path, {
             "schema_version": 3,
             "generate_environment": "docker",
             "solve_network_mode": "none",
         })
+
+    assert str(exc_info.value) == core.DOCKER_GENERATION_REQUIRED
+
+
+def test_manifest_with_explicit_local_generation_is_rejected(tmp_path) -> None:
+    path = tmp_path / "manifest.json"
+    core.atomic_write_json(path, {
+        "schema_version": 4,
+        "generate_environment": "local",
+    })
+
+    with pytest.raises(ValueError) as exc_info:
+        core.ensure_manifest(path, {"schema_version": 4})
+
+    assert str(exc_info.value) == core.DOCKER_GENERATION_REQUIRED
 
 
 def test_bind_mount_manifest_requires_new_run_for_image_testbed(tmp_path) -> None:
@@ -614,16 +684,16 @@ def test_small_subset_has_five_distinct_repositories_and_smoke_control() -> None
     assert "not a representative benchmark sample" in selection
 
 
-def test_small_10_subset_extends_small_with_five_distinct_repositories() -> None:
+def test_small_11_subset_extends_small_with_ten_distinct_repositories() -> None:
     subsets = core.PROJECT_ROOT / "evals" / "swebench" / "subsets"
     dataset, split, small_ids, _ = core.load_subset(subsets / "small.json")
-    _, _, instance_ids, selection = core.load_subset(subsets / "small_10.json")
+    _, _, instance_ids, selection = core.load_subset(subsets / "small_11.json")
 
     repositories = {instance_id.split("__", 1)[0] for instance_id in instance_ids}
     assert dataset == "SWE-bench/SWE-bench_Verified"
     assert split == "test"
     assert instance_ids[: len(small_ids)] == small_ids
-    assert len(instance_ids) == 10
+    assert len(instance_ids) == 11
     assert len(repositories) == 10
     assert "not a representative benchmark sample" in selection
 
@@ -667,6 +737,7 @@ def test_parent_session_system_addendum_is_per_session(load_module, tmp_path) ->
     assert swebench_names == set(core.SWEBENCH_TOOL_NAMES)
     assert set(swebench.registry) == set(core.SWEBENCH_TOOL_NAMES)
     assert "bash" in swebench_names
+    assert "git_diff" not in swebench_names
     assert {"bash", "task", "todo"} <= swebench_names
 
 
@@ -840,7 +911,7 @@ def test_swebench_defaults_to_five_workers() -> None:
     assert pipeline.cache_level == "instance"
 
 
-def test_swebench_generate_can_use_local_environment() -> None:
+def test_swebench_parser_accepts_local_for_actionable_runtime_error() -> None:
     from evals.swebench import cli
 
     args = cli.build_parser().parse_args([
@@ -849,6 +920,17 @@ def test_swebench_generate_can_use_local_environment() -> None:
     ])
 
     assert args.generate_environment == "local"
+
+
+def test_generate_rejects_local_environment_before_setup() -> None:
+    from evals.swebench import cli
+
+    args = argparse.Namespace(generate_environment="local")
+
+    with pytest.raises(SystemExit) as exc_info:
+        asyncio.run(cli.cmd_generate(args))
+
+    assert str(exc_info.value) == core.DOCKER_GENERATION_REQUIRED
 
 
 def test_swebench_parser_can_disable_staged_steering() -> None:

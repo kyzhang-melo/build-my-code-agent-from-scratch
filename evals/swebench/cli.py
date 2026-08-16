@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from .core import (
     DEFAULT_CACHE_DIR,
     DEFAULT_RUNS_DIR,
+    DOCKER_GENERATION_REQUIRED,
     atomic_write_json,
     create_manifest,
     ensure_manifest,
@@ -60,6 +61,10 @@ def run_dir(args: argparse.Namespace) -> Path:
 
 
 async def cmd_generate(args: argparse.Namespace) -> int:
+    generate_environment = getattr(args, "generate_environment", "docker")
+    if generate_environment != "docker":
+        raise SystemExit(DOCKER_GENERATION_REQUIRED)
+
     load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=True)
     swebench_repo = resolve_swebench_repo(args.swebench_repo)
     swebench_python = resolve_swebench_python(args.swebench_python, swebench_repo)
@@ -71,7 +76,6 @@ async def cmd_generate(args: argparse.Namespace) -> int:
     if not model:
         raise SystemExit("MODEL_ID is not set; pass --model or configure .env")
     import main
-    generate_environment = getattr(args, "generate_environment", "docker")
     namespace = getattr(args, "namespace", "swebench")
 
     manifest = create_manifest(
@@ -346,7 +350,10 @@ def _generate_args(parser: argparse.ArgumentParser) -> None:
         "--generate-environment",
         choices=("docker", "local"),
         default="docker",
-        help="tool execution environment used during patch generation (default: docker)",
+        help=(
+            "tool execution environment used during patch generation; "
+            "local is temporarily disabled (default: docker)"
+        ),
     )
 
 

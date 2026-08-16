@@ -517,7 +517,7 @@ def write_report(
         "",
         (
             "If every preregistered criterion passes, implement the candidate in the production "
-            "harness and run SWE-bench `small_10.json` once to check for side effects."
+            "harness and run SWE-bench `small_11.json` once to check for side effects."
         ),
     ]
     (run_root / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
