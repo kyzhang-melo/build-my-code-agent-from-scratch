@@ -40,6 +40,7 @@ dist/
 
 # Session persistence files
 .sessions/
+.resume/
 
 # Eval run artifacts (workspaces kept on failure, reports)
 evals/.runs/
