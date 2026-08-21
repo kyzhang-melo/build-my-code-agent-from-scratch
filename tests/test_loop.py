@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import sys
 import types
@@ -726,6 +727,7 @@ def test_run_one_turn_subagent_evaluates_only_current_text(load_module, monkeypa
 def test_run_one_turn_budget_exhausted_returns_max_api_calls_outcome(load_module, tmp_path) -> None:
     main_module = load_module("main", "main.py")
     session = _parent(main_module, tmp_path)
+    session = dataclasses.replace(session, max_api_calls=3)
     state = main_module.LoopState(
         messages=[{"role": "user", "content": "task"}],
         api_call_count=session.max_api_calls,
@@ -1105,6 +1107,7 @@ def test_agent_loop_repeated_malformed_stops_at_max_api_calls(load_module, monke
     """
     main_module = load_module("main", "main.py")
     session = _parent(main_module, tmp_path)
+    session = dataclasses.replace(session, max_api_calls=3)
 
     def malformed_call(call_id: str):
         return types.SimpleNamespace(

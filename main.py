@@ -113,8 +113,8 @@ SUMMARY_CONTINUATION_PROMPT = (
     "summary that includes specific technical details, findings, and all "
     "important information that the parent agent should know."
 )
-MAX_API_CALLS_PER_USER_TURN = 60
-MAX_SUBAGENT_API_CALLS = 60
+MAX_API_CALLS_PER_USER_TURN = 0  # 0 means unlimited
+MAX_SUBAGENT_API_CALLS = 0  # 0 means unlimited
 INPUT_PROMPT = FormattedText([("class:input-prompt", "s01 >> ")])
 INPUT_STYLE = Style.from_dict({"input-prompt": "ansicyan"})
 
@@ -564,7 +564,7 @@ async def execute_configured_tool_calls(
 
 async def run_one_turn(state: LoopState, session: AgentSession) -> StepOutcome | None:
     # Returns None to keep looping, or a StepOutcome when the turn ends.
-    if state.api_call_count >= session.max_api_calls:
+    if session.max_api_calls and state.api_call_count >= session.max_api_calls:
         warning = f"Warning: stopped after max_api_calls={session.max_api_calls}."
         state.messages.append({
             "role": "assistant",
