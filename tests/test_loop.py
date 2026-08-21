@@ -60,6 +60,30 @@ def test_approval_toggle_command(load_module, capsys, tmp_path) -> None:
     assert "auto-approval disabled" in output
 
 
+def test_copy_command(load_module, capsys, tmp_path, monkeypatch) -> None:
+    main_module = load_module("main", "main.py")
+    session = _parent(main_module, tmp_path)
+
+    assert _run(main_module.handle_command("/copy", [], session)) is True
+    assert "no assistant response" in capsys.readouterr().out
+
+    copied = {}
+
+    def fake_copy(text: str) -> None:
+        copied["text"] = text
+
+    monkeypatch.setattr(main_module, "_copy_to_clipboard", fake_copy)
+    history = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+        {"role": "user", "content": "again"},
+        {"role": "assistant", "content": "latest answer"},
+    ]
+    assert _run(main_module.handle_command("/copy", history, session)) is True
+    assert copied["text"] == "latest answer"
+    assert "copied last response" in capsys.readouterr().out
+
+
 def test_permission_mode_commands(load_module, capsys, tmp_path) -> None:
     main_module = load_module("main", "main.py")
     session = _parent(main_module, tmp_path)

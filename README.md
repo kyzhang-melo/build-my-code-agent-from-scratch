@@ -140,6 +140,7 @@ python main.py --session-dir /tmp/my-sessions
 
 In-session commands:
 
+- `/copy` — copy the most recent model response to the system clipboard.
 - `/sessions` — list saved sessions in the current workspace.
 - `/approval` — toggle human approval on/off. Enter it once to disable approval
   prompts (the agent runs autonomously); enter it again to restore interactive

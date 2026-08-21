@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -903,11 +904,75 @@ async def cmd_approval(arg: str, history: list, session: AgentSession) -> None:
     print(f"[permissions] auto-approval {state}")
 
 
+def _copy_to_clipboard(text: str) -> str | None:
+    """Copy text to the system clipboard. Returns an error message on failure,
+    or None on success. Tries platform-specific clipboard tools in order."""
+    candidates: list[tuple[str, list[str]]] = []
+    if sys.platform == "darwin":
+        candidates.append(("pbcopy", ["pbcopy"]))
+    else:
+        if os.environ.get("WAYLAND_DISPLAY"):
+            candidates.append(("wl-copy", ["wl-copy"]))
+        if os.environ.get("DISPLAY"):
+            candidates.extend([
+                ("xclip", ["xclip", "-selection", "clipboard"]),
+                ("xsel", ["xsel", "--clipboard", "--input"]),
+            ])
+    candidates.append(("wl-copy", ["wl-copy"]))
+    candidates.append(("xclip", ["xclip", "-selection", "clipboard"]))
+
+    seen: set[str] = set()
+    for name, argv in candidates:
+        if name in seen:
+            continue
+        seen.add(name)
+        try:
+            result = subprocess.run(
+                argv, input=text.encode("utf-8"),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            continue
+        if result.returncode == 0:
+            return None
+    return (
+        "no clipboard tool found; install one of: pbcopy (macOS), "
+        "wl-copy (Wayland), xclip or xsel (X11)"
+    )
+
+
+def _last_assistant_text(history: list) -> str | None:
+    """Return the most recent assistant text message in the history."""
+    for message in reversed(history):
+        if message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+    return None
+
+
+async def cmd_copy(arg: str, history: list, session: AgentSession) -> None:
+    del arg, session
+    text = _last_assistant_text(history)
+    if text is None:
+        print("[copy] no assistant response to copy yet.")
+        return
+    error = _copy_to_clipboard(text)
+    if error is None:
+        preview = text.replace("\n", " ")[:80]
+        suffix = "..." if len(text) > 80 else ""
+        print(f"[copy] copied last response ({len(text)} chars): {preview}{suffix}")
+    else:
+        print(f"[copy] failed: {error}")
+
+
 async def cmd_help(arg: str, history: list, session: AgentSession) -> None:
     del arg, history, session
     print(
         "commands: /compact [focus]  |  /mode <default|plan>  |  "
-        "/permissions  |  /approval  |  /sessions  |  /help   (q or exit to quit)"
+        "/permissions  |  /approval  |  /copy  |  /sessions  |  /help   "
+        "(q or exit to quit)"
     )
 
 
@@ -971,6 +1036,7 @@ async def cmd_sessions(arg: str, history: list, session: AgentSession) -> None:
 COMMANDS = {
     "approval": cmd_approval,
     "compact": cmd_compact,
+    "copy": cmd_copy,
     "help": cmd_help,
     "mode": cmd_mode,
     "permissions": cmd_permissions,
