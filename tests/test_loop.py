@@ -40,6 +40,26 @@ def test_prompt_toolkit_session_accepts_mixed_unicode_input(load_module) -> None
     assert _run(scenario()) == "hello中文world"
 
 
+def test_approval_toggle_command(load_module, capsys, tmp_path) -> None:
+    main_module = load_module("main", "main.py")
+    session = _parent(main_module, tmp_path)
+    manager = session.permission_service.manager
+    decision = manager.check("bash", {"command": "pip install requests"})
+    assert decision.behavior.value == "ask"
+
+    assert _run(main_module.handle_command("/approval", [], session)) is True
+    assert manager.auto_approve_all is True
+    assert manager.check("bash", {"command": "pip install requests"}).behavior.value == "allow"
+
+    assert _run(main_module.handle_command("/approval", [], session)) is True
+    assert manager.auto_approve_all is False
+    assert manager.check("bash", {"command": "pip install requests"}).behavior.value == "ask"
+
+    output = capsys.readouterr().out
+    assert "auto-approval enabled" in output
+    assert "auto-approval disabled" in output
+
+
 def test_permission_mode_commands(load_module, capsys, tmp_path) -> None:
     main_module = load_module("main", "main.py")
     session = _parent(main_module, tmp_path)

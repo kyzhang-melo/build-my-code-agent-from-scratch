@@ -93,6 +93,7 @@ class PermissionManager:
     workdir: Path
     mode: PermissionMode = PermissionMode.DEFAULT
     auto_approve_actions: set[str] = field(default_factory=set)
+    auto_approve_all: bool = False
 
     def __post_init__(self) -> None:
         self.workdir = self.workdir.resolve()
@@ -103,10 +104,22 @@ class PermissionManager:
     def remember(self, action: str) -> None:
         self.auto_approve_actions.add(action)
 
+    def toggle_auto_approve_all(self) -> bool:
+        """Toggle the global auto-approval switch. Returns the new state."""
+        self.auto_approve_all = not self.auto_approve_all
+        return self.auto_approve_all
+
     def check(self, tool_name: str, tool_input: dict) -> PermissionDecision:
         guarded = self._core_guard(tool_name, tool_input)
         if guarded is not None:
             return guarded
+
+        if self.auto_approve_all:
+            return PermissionDecision(
+                behavior=PermissionBehavior.ALLOW,
+                reason="Auto-approval is enabled for this session (/approval).",
+                allow_for_session=False,
+            )
 
         if tool_name in CONTROLLED_TOOLS and self.mode is PermissionMode.PLAN:
             return PermissionDecision(

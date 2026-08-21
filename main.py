@@ -895,11 +895,19 @@ async def cmd_compact(arg: str, history: list, session: AgentSession) -> None:
     )
 
 
+async def cmd_approval(arg: str, history: list, session: AgentSession) -> None:
+    del arg, history
+    manager = session.permission_service.manager
+    enabled = manager.toggle_auto_approve_all()
+    state = "enabled (no human approval needed)" if enabled else "disabled (approval restored)"
+    print(f"[permissions] auto-approval {state}")
+
+
 async def cmd_help(arg: str, history: list, session: AgentSession) -> None:
     del arg, history, session
     print(
         "commands: /compact [focus]  |  /mode <default|plan>  |  "
-        "/permissions  |  /sessions  |  /help   (q or exit to quit)"
+        "/permissions  |  /approval  |  /sessions  |  /help   (q or exit to quit)"
     )
 
 
@@ -961,6 +969,7 @@ async def cmd_sessions(arg: str, history: list, session: AgentSession) -> None:
 
 
 COMMANDS = {
+    "approval": cmd_approval,
     "compact": cmd_compact,
     "help": cmd_help,
     "mode": cmd_mode,
