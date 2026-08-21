@@ -138,9 +138,13 @@ python main.py --no-session       # disable persistence for this run
 python main.py --session-dir /tmp/my-sessions
 ```
 
-In-session command:
+In-session commands:
 
 - `/sessions` — list saved sessions in the current workspace.
+- `/approval` — toggle human approval on/off. Enter it once to disable approval
+  prompts (the agent runs autonomously); enter it again to restore interactive
+  approval. Core safety guards (workspace escapes, hard-denied shell commands,
+  sensitive files) still apply when auto-approval is on.
 
 Resume behavior:
 
