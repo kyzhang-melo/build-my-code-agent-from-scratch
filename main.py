@@ -638,12 +638,6 @@ async def run_one_turn(state: LoopState, session: AgentSession) -> StepOutcome |
     output_text = getattr(response, "output_text", "") or ""
     response_output = getattr(response, "output", None) or []
 
-    if output_text:
-        state.messages.append({
-            "role": "assistant",
-            "content": output_text,
-        })
-    
     tool_calls = []
     for item in response_output:
         item_type = _response_item_attr(item, "type")
@@ -688,6 +682,13 @@ async def run_one_turn(state: LoopState, session: AgentSession) -> StepOutcome |
 
             tool_calls.append(item)
 
+    # Assistant text is recorded after reasoning/function_call items so the
+    # replayed history preserves the response's original item order.
+    # Thinking-mode providers (e.g. DeepSeek) require reasoning_text to
+    # precede its function_call; text-first ordering breaks that pairing.
+    if output_text and tool_calls:
+        state.messages.append({"role": "assistant", "content": output_text})
+
     if not tool_calls:
         response_text = output_text.strip()
         if not response_text:
@@ -705,6 +706,11 @@ async def run_one_turn(state: LoopState, session: AgentSession) -> StepOutcome |
             return StepOutcome(stop_reason="completed", final_text=warning)
 
         state.empty_response_nudges = 0
+        # Append the final answer after reasoning/tool items so the replayed
+        # history preserves the response's original item order. Thinking-mode
+        # providers (e.g. DeepSeek) require reasoning_text to precede its
+        # function_call; text-first ordering breaks that pairing.
+        state.messages.append({"role": "assistant", "content": response_text})
         nudge = session.stop_gate.check(response_text)
         if nudge is None:
             gate_decision = "allow"
