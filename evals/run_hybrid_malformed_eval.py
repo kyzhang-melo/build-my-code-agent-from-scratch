@@ -152,6 +152,7 @@ class HybridResult:
     provider_accepted_replay: bool = False
     replay_input_sanitized: bool = False
     error_feedback_present: bool = False
+    replay_pairing_order_valid: bool = False
     corrected_tool_call_completed: bool = False
     fixture_result_correct: bool = False
     api_calls: int = 0
@@ -168,6 +169,7 @@ class HybridResult:
             and self.provider_accepted_replay
             and self.replay_input_sanitized
             and self.error_feedback_present
+            and self.replay_pairing_order_valid
             and self.corrected_tool_call_completed
             and self.fixture_result_correct
         )
@@ -229,9 +231,32 @@ def evaluate(
         result.error_feedback_present = has_error
         _record(result, "error_feedback_in_replay_input", has_error,
                 "" if has_error else "no function_call_output with 'invalid arguments' in replay input")
+        call_index = next((
+            index for index, item in enumerate(replay_input)
+            if isinstance(item, dict)
+            and item.get("type") == "function_call"
+            and item.get("call_id") == hybrid_client.injected_call_id
+        ), -1)
+        output_index = next((
+            index for index, item in enumerate(replay_input)
+            if isinstance(item, dict)
+            and item.get("type") == "function_call_output"
+            and item.get("call_id") == hybrid_client.injected_call_id
+        ), -1)
+        pairing_order_valid = (
+            0 <= call_index < output_index
+            and not any(
+                isinstance(item, dict) and item.get("role") in ("assistant", "user", "system")
+                for item in replay_input[call_index + 1:output_index]
+            )
+        )
+        result.replay_pairing_order_valid = pairing_order_valid
+        _record(result, "replay_pairing_order_valid", pairing_order_valid,
+                "" if pairing_order_valid else "message boundary appeared inside call/result exchange")
     else:
         _record(result, "replay_input_sanitized", False, "no replay API request captured")
         _record(result, "error_feedback_in_replay_input", False, "no replay API request captured")
+        _record(result, "replay_pairing_order_valid", False, "no replay API request captured")
 
     # 5. Corrected edit_file call completed successfully.
     successful_edits = [
@@ -325,6 +350,7 @@ async def run_hybrid_eval(args: argparse.Namespace) -> int:
         "provider_accepted_replay": result.provider_accepted_replay,
         "replay_input_sanitized": result.replay_input_sanitized,
         "error_feedback_present": result.error_feedback_present,
+        "replay_pairing_order_valid": result.replay_pairing_order_valid,
         "corrected_tool_call_completed": result.corrected_tool_call_completed,
         "fixture_result_correct": result.fixture_result_correct,
         "api_calls": result.api_calls,

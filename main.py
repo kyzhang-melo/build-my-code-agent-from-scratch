@@ -23,7 +23,15 @@ from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.styles import Style
-from message_utils import extract_usage, normalize_messages, response_item_to_dict
+from message_utils import (
+    assistant_text,
+    assistant_tool_call_ids,
+    build_assistant_message,
+    build_tool_result_messages,
+    extract_usage,
+    make_text_assistant_message,
+    normalize_messages,
+)
 from permissions import PermissionManager, PermissionMode, PermissionService, TerminalApprovalHandler
 from prompts import GLOB_DISCOVERY_RULES, build_explore_system, build_parent_system
 from sandbox import LocalSandbox, Sandbox
@@ -567,10 +575,9 @@ async def run_one_turn(state: LoopState, session: AgentSession) -> StepOutcome |
     # Returns None to keep looping, or a StepOutcome when the turn ends.
     if session.max_api_calls and state.api_call_count >= session.max_api_calls:
         warning = f"Warning: stopped after max_api_calls={session.max_api_calls}."
-        state.messages.append({
-            "role": "assistant",
-            "content": warning,
-        })
+        state.messages.append(make_text_assistant_message(
+            warning, model_id=MODEL_ID or "", provider=OPENROUTER_PROVIDER or "",
+        ))
         return StepOutcome(stop_reason="max_api_calls", final_text=warning)
 
     state.api_call_count += 1
@@ -637,67 +644,18 @@ async def run_one_turn(state: LoopState, session: AgentSession) -> StepOutcome |
 
     output_text = getattr(response, "output_text", "") or ""
     response_output = getattr(response, "output", None) or []
-
-    tool_calls = []
-    # Replay-order contract: history must preserve the provider's output
-    # item pairing. Two invariants matter for thinking-mode providers:
-    #   - reasoning_text must precede its function_call;
-    #   - function_call_output must immediately follow its function_call
-    #     (no assistant text in between).
-    # When the response carries tool calls, its text accompanies the calls, so
-    # it must be recorded BEFORE the reasoning/call items to keep call and
-    # output adjacent. Text is emitted in item order below otherwise.
-    response_has_tool_calls = any(
-        _response_item_attr(item, "type") == "function_call"
-        for item in response_output
+    assistant_message, tool_calls = build_assistant_message(
+        response_output,
+        output_text,
+        model_id=MODEL_ID or "",
+        provider=OPENROUTER_PROVIDER or "",
     )
-    if output_text and response_has_tool_calls:
-        state.messages.append({"role": "assistant", "content": output_text})
-    for item in response_output:
-        item_type = _response_item_attr(item, "type")
-        if item_type == "reasoning":
-            reasoning = response_item_to_dict(item)
-            if reasoning.get("type") == "reasoning":
-                state.messages.append(reasoning)
-            continue
-
-        if item_type == "function_call":
-            raw_arguments = _response_item_attr(item, "arguments", "{}")
-            # Provider-facing history must only contain valid JSON arguments;
-            # a malformed function_call replayed to the Provider causes a 400
-            # that kills the agent loop before the model ever sees the tool
-            # error output. Normalize here: the tool layer still receives the
-            # original SDK item (via tool_calls below) so it can report the
-            # exact parse error; only the replayed history is sanitized.
-            try:
-                parsed = json.loads(raw_arguments)
-            except (json.JSONDecodeError, TypeError):
-                replay_arguments = "{}"
-                malformed = True
-            else:
-                replay_arguments = json.dumps(parsed)
-                malformed = False
-            function_call = {
-                "type": "function_call",
-                "call_id": _response_item_attr(item, "call_id", ""),
-                "name": _response_item_attr(item, "name", ""),
-                "arguments": replay_arguments,
-            }
-            # Drop the Provider-assigned item id when arguments were malformed.
-            # The id may be paired with the original malformed record on the
-            # Provider side; replaying it with sanitized arguments can violate
-            # pairing constraints. call_id is retained so the function_call
-            # still pairs with its function_call_output.
-            if not malformed:
-                item_id = _response_item_attr(item, "id")
-                if item_id:
-                    function_call["id"] = item_id
-            state.messages.append(function_call)
-
-            tool_calls.append(item)
+    # One response is one atomic history record. Tool results are appended only
+    # after this complete ordered block list has been recorded.
+    state.messages.append(assistant_message)
 
     if not tool_calls:
-        response_text = output_text.strip()
+        response_text = assistant_text(assistant_message).strip()
         if not response_text:
             if state.empty_response_nudges < EMPTY_RESPONSE_MAX_NUDGES:
                 state.empty_response_nudges += 1
@@ -709,15 +667,12 @@ async def run_one_turn(state: LoopState, session: AgentSession) -> StepOutcome |
                 "after retry."
             )
             state.empty_response_nudges = 0
-            state.messages.append({"role": "assistant", "content": warning})
+            state.messages.append(make_text_assistant_message(
+                warning, model_id=MODEL_ID or "", provider=OPENROUTER_PROVIDER or "",
+            ))
             return StepOutcome(stop_reason="completed", final_text=warning)
 
         state.empty_response_nudges = 0
-        # Append the final answer after reasoning/tool items so the replayed
-        # history preserves the response's original item order. Thinking-mode
-        # providers (e.g. DeepSeek) require reasoning_text to precede its
-        # function_call; text-first ordering breaks that pairing.
-        state.messages.append({"role": "assistant", "content": response_text})
         nudge = session.stop_gate.check(response_text)
         if nudge is None:
             gate_decision = "allow"
@@ -761,7 +716,9 @@ async def run_one_turn(state: LoopState, session: AgentSession) -> StepOutcome |
             # Nudge budget exhausted: accept the stop anyway.
             note = session.stop_gate.give_up_note()
             if note is not None:
-                state.messages.append({"role": "assistant", "content": note})
+                state.messages.append(make_text_assistant_message(
+                    note, model_id=MODEL_ID or "", provider=OPENROUTER_PROVIDER or "",
+                ))
         state.nudges = 0
         # Turn ends on a model message with no tool calls: this is the answer.
         return StepOutcome(stop_reason="completed", final_text=response_text)
@@ -769,14 +726,24 @@ async def run_one_turn(state: LoopState, session: AgentSession) -> StepOutcome |
     state.empty_response_nudges = 0
     # Surface assistant text that accompanies tool calls; otherwise it would be
     # retained in history but never shown, swallowing real deliverables.
-    if output_text and session.on_text is not None:
-        session.on_text(output_text)
+    visible_text = assistant_text(assistant_message)
+    if visible_text and session.on_text is not None:
+        session.on_text(visible_text)
 
     results, _ = await execute_configured_tool_calls(tool_calls, session, api_call=state.api_call_count)
     if not results:
+        state.messages.pop()
         return StepOutcome(stop_reason="completed", final_text="")
 
-    state.messages.extend(results)
+    result_messages = build_tool_result_messages(
+        results, call_order=assistant_tool_call_ids(assistant_message),
+    )
+    expected_ids = assistant_tool_call_ids(assistant_message)
+    actual_ids = [message["call_id"] for message in result_messages]
+    if actual_ids != expected_ids:
+        state.messages.pop()
+        raise RuntimeError("tool execution returned an incomplete or mismatched result batch")
+    state.messages.extend(result_messages)
     state.nudges = 0
     return None
 
@@ -1126,6 +1093,8 @@ def _print_resume_diagnostics(store: SessionStoreProtocol) -> None:
         ("orphan calls", diagnostics.dropped_orphan_calls),
         ("orphan outputs", diagnostics.dropped_orphan_outputs),
         ("invalid JSONL lines", diagnostics.ignored_invalid_lines),
+        ("incomplete exchanges", diagnostics.dropped_incomplete_exchanges),
+        ("cross-runtime exchanges", diagnostics.textualized_cross_runtime_exchanges),
     ]
     changed = [f"{label}={count}" for label, count in details if count]
     if changed:

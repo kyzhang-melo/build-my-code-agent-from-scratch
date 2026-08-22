@@ -156,9 +156,14 @@ def test_find_cut_index_keeps_complete_recent_turn(load_module) -> None:
         {"role": "user", "content": "old request " + "x" * 200},
         {"role": "assistant", "content": "old answer " + "x" * 200},
         {"role": "user", "content": "recent request"},
-        {"type": "function_call", "call_id": "c1", "name": "bash", "arguments": "{}"},
-        {"type": "function_call_output", "call_id": "c1", "output": "recent output"},
-        {"role": "assistant", "content": "recent answer"},
+        {"role": "assistant", "content": [{
+            "type": "tool_call", "name": "bash", "arguments": "{}",
+            "pairing": {"call_id": "c1"},
+        }], "runtime": {"model_id": "m", "provider": "p", "protocol": "responses"}},
+        {"role": "tool", "call_id": "c1", "content": "recent output", "is_error": False},
+        {"role": "assistant", "content": [{
+            "type": "text", "text": "recent answer", "source": "test",
+        }], "runtime": {"model_id": "m", "provider": "p", "protocol": "responses"}},
     ]
 
     cut = cc.find_cut_index(messages, keep_recent_tokens=20)

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+from hypothesis import given, strategies as st
+
 
 def test_normalize_messages_preserves_boundaries_and_strips(load_module) -> None:
     message_utils = load_module("message_utils", "message_utils.py")
@@ -80,3 +84,68 @@ def test_normalize_messages_does_not_merge_summary_with_user(load_module) -> Non
     assert len(out) == 2
     assert out[0]["content"].startswith("[CONTEXT SUMMARY]")
     assert out[1]["content"] == "what happened?"
+
+
+def test_output_text_fallback_has_one_deterministic_boundary(load_module) -> None:
+    message_utils = load_module("message_utils", "message_utils.py")
+    reasoning = SimpleNamespace(type="reasoning", id="rs_1", summary=[])
+    call = SimpleNamespace(
+        type="function_call", id="fc_1", call_id="c1", name="bash", arguments="{}",
+    )
+
+    assistant, _ = message_utils.build_assistant_message(
+        [reasoning, call], "fallback", model_id="m", provider="p",
+    )
+
+    assert [block["type"] for block in assistant["content"]] == [
+        "reasoning", "text", "tool_call",
+    ]
+    assert assistant["content"][1]["source"] == "output_text_fallback"
+
+
+@given(st.lists(st.sampled_from(["reasoning", "message", "call"]), max_size=8))
+def test_assistant_serialization_preserves_provider_item_order(kinds) -> None:
+    """Logical round-trip never reorders provider-originated response blocks."""
+    import message_utils
+
+    items = []
+    expected = []
+    call_ids = []
+    for index, kind in enumerate(kinds):
+        if kind == "reasoning":
+            items.append(SimpleNamespace(type="reasoning", id=f"rs_{index}", summary=[]))
+            expected.append(("reasoning", f"rs_{index}"))
+        elif kind == "message":
+            text = f"text-{index}"
+            items.append(SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(type="output_text", text=text)],
+            ))
+            expected.append(("text", text))
+        else:
+            call_id = f"call_{index}"
+            call_ids.append(call_id)
+            items.append(SimpleNamespace(
+                type="function_call", id=f"fc_{index}", call_id=call_id,
+                name="bash", arguments="{}",
+            ))
+            expected.append(("call", call_id))
+
+    assistant, _ = message_utils.build_assistant_message(
+        items, "fallback", model_id="m", provider="p",
+    )
+    history = [assistant, *message_utils.build_tool_result_messages(
+        [{"call_id": call_id, "output": "ok"} for call_id in call_ids],
+        call_order=call_ids,
+    )]
+    serialized = message_utils.normalize_messages(history)
+    actual = []
+    for item in serialized:
+        if item.get("type") == "reasoning":
+            actual.append(("reasoning", item.get("id")))
+        elif item.get("type") == "function_call":
+            actual.append(("call", item.get("call_id")))
+        elif item.get("role") == "assistant" and item.get("content") != "fallback":
+            actual.append(("text", item.get("content")))
+
+    assert actual == expected

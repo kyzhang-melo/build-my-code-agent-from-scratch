@@ -3,3 +3,4 @@ pydantic
 prompt-toolkit==3.0.52
 python-dotenv
 pytest
+hypothesis

@@ -331,3 +331,50 @@
 - Lesson: when an API demands item pairing, never reorder items while
   persisting history; keep the provider's response order verbatim. Also,
   per-item "what did the provider actually return" dumps beat spec reading.
+
+### Structural replay-order refactor
+
+#### What I've done
+
+- Replaced flat, per-item assistant history writes with one logical assistant
+  message per model response. Each assistant message owns an ordered block list
+  containing reasoning, visible text, and tool calls.
+- Stored tool results as independent `role="tool"` messages immediately after
+  the complete assistant message, ordered by the tool-call blocks rather than
+  asynchronous completion time.
+- Centralized Responses API serialization in `message_utils.py`. Reasoning
+  provider data, `call_id`, and provider item IDs are stored on their blocks and
+  restored only when producing the next API request.
+- Defined the only `output_text` fallback rule: when no text block exists in
+  `response.output`, insert one synthetic text block immediately before the
+  first tool call, or at the end when there is no tool call.
+- Added structural validation for incomplete, duplicated, unknown, or
+  interrupted tool exchanges. A malformed current exchange fails before it is
+  persisted as partial history.
+- Added cross-runtime replay defense. When the model or provider changes,
+  provider-specific reasoning and IDs are not replayed; completed historical
+  tool exchanges are converted to ordinary assistant text.
+- Upgraded session persistence to schema version 2 with conservative migration
+  of version 1 flat histories, and made compaction retain complete logical
+  assistant/tool exchanges.
+- Adapted explore-subagent, SWE-bench sequence, and malformed hybrid eval paths
+  to the logical message format. The hybrid eval now verifies that replay does
+  not insert a message boundary inside a call/result exchange.
+- Added Hypothesis to the test dependencies and introduced a property test that
+  generates response-item sequences and verifies logical-message serialization
+  preserves the provider-originated item order and pairing identifiers.
+
+#### Why
+
+- The earlier order-level fix still depended on several append sites in
+  `run_one_turn()` happening in exactly the right order. A future response shape
+  or control-flow change could silently recreate invalid replay history.
+- Making a complete assistant response the storage unit turns ordering into a
+  property of the data structure. Provider conversion is now a pure expansion
+  step instead of another place where ordering decisions are made.
+- Cross-model sessions cannot safely reuse another provider's reasoning
+  signatures or item IDs. Textualizing those exchanges preserves useful context
+  without triggering provider pairing validation.
+- Property-based round-trip coverage protects response shapes that are easy to
+  miss with a few hand-written fixtures, especially mixed reasoning, text, and
+  parallel tool-call sequences.

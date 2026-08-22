@@ -27,6 +27,14 @@ CURATED_IDS = [
 ]
 
 
+def assistant_text(text: str) -> dict:
+    return {
+        "role": "assistant",
+        "content": [{"type": "text", "text": text, "source": "test"}],
+        "runtime": {"model_id": "old", "provider": "", "protocol": "responses"},
+    }
+
+
 def git(cwd: Path, *args: str) -> str:
     return subprocess.run(
         ["git", *args], cwd=cwd, check=True, text=True, capture_output=True
@@ -131,18 +139,24 @@ def test_episode_reopens_history_but_uses_clean_next_base(monkeypatch, tmp_path)
             (session.workspace.root / "first.txt").write_text("first patch\n")
             (session.workspace.root / ".transcripts").mkdir()
             (session.workspace.root / ".transcripts" / "snapshot.md").write_text("runtime only\n")
-            state.messages.extend([
-                {"type": "function_call", "call_id": "call-1", "name": "read_file", "arguments": "{}"},
-                {"type": "function_call_output", "call_id": "call-1", "output": "inspected models"},
-                {"role": "assistant", "content": "first episode complete"},
-            ])
+            state.messages.extend([{
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_call", "name": "read_file", "arguments": "{}",
+                    "pairing": {"call_id": "call-1"},
+                }],
+                "runtime": {"model_id": "old", "provider": "", "protocol": "responses"},
+            }, {
+                "role": "tool", "call_id": "call-1",
+                "content": "inspected models", "is_error": False,
+            }, assistant_text("first episode complete")])
         else:
             assert (session.workspace.root / "state.txt").read_text() == "base-2\n"
             assert not (session.workspace.root / "first.txt").exists()
-            assert any(msg.get("content") == "first episode complete" for msg in state.messages)
-            assert any(msg.get("output") == "inspected models" for msg in state.messages)
+            assert any("first episode complete" in str(msg.get("content")) for msg in state.messages)
+            assert any(msg.get("content") == "inspected models" for msg in state.messages)
             (session.workspace.root / "second.txt").write_text("second patch\n")
-            state.messages.append({"role": "assistant", "content": "second episode complete"})
+            state.messages.append(assistant_text("second episode complete"))
         state.api_call_count = 1
         return SimpleNamespace(stop_reason="completed", final_text="done", api_calls=1)
 
@@ -175,25 +189,25 @@ def test_error_episode_rolls_back_history_and_todo(monkeypatch, tmp_path) -> Non
         nonlocal calls
         calls += 1
         if calls == 1:
-            state.messages.append({"role": "assistant", "content": "committed marker"})
+            state.messages.append(assistant_text("committed marker"))
             session.todo.update(TodoParams.model_validate({"items": [{
                 "content": "kept", "status": "pending", "active_form": "Keeping"
             }]}))
             return SimpleNamespace(stop_reason="max_api_calls", final_text="budget", api_calls=5)
         if calls == 2:
             assert [item.content for item in session.todo.state.items] == ["kept"]
-            state.messages.append({"role": "assistant", "content": "failed marker"})
+            state.messages.append(assistant_text("failed marker"))
             session.todo.update(TodoParams.model_validate({"items": [{
                 "content": "discarded", "status": "pending", "active_form": "Discarding"
             }]}))
             state.api_call_count = 2
             raise RuntimeError("provider failed")
         contents = [str(msg.get("content", "")) for msg in state.messages]
-        assert "committed marker" in contents
-        assert "failed marker" not in contents
+        assert any("committed marker" in content for content in contents)
+        assert not any("failed marker" in content for content in contents)
         assert not any("owner__repo-2" in content for content in contents)
         assert [item.content for item in session.todo.state.items] == ["kept"]
-        state.messages.append({"role": "assistant", "content": "after rollback"})
+        state.messages.append(assistant_text("after rollback"))
         return SimpleNamespace(stop_reason="completed", final_text="done", api_calls=1)
 
     monkeypatch.setitem(sys.modules, "main", fake_main(agent_loop))

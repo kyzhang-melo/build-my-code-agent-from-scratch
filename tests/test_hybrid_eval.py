@@ -101,6 +101,7 @@ def test_hybrid_result_requires_every_protocol_check() -> None:
         provider_accepted_replay=True,
         replay_input_sanitized=True,
         error_feedback_present=True,
+        replay_pairing_order_valid=True,
         corrected_tool_call_completed=True,
         fixture_result_correct=True,
     )
@@ -112,6 +113,7 @@ def test_hybrid_result_requires_every_protocol_check() -> None:
         "provider_accepted_replay",
         "replay_input_sanitized",
         "error_feedback_present",
+        "replay_pairing_order_valid",
         "corrected_tool_call_completed",
         "fixture_result_correct",
     )

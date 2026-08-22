@@ -2,7 +2,9 @@
 
 Each session is one ``<session_dir>/<session_id>.jsonl`` file outside the
 workspace by default. The first line is a ``session_header``; subsequent lines
-are ``message`` entries (one per history dict) or ``history_reset`` markers.
+are ``message`` entries (one per logical history message) or ``history_reset``
+markers. Version 2 stores an assistant response atomically as ordered blocks;
+version 1 flat-item sessions are migrated conservatively when resumed.
 
 Because ``context_compact.py`` still rewrites ``state.messages`` in place, the
 store detects compaction by comparing the live history against the persisted
@@ -29,7 +31,7 @@ from typing import Any, Protocol
 from message_utils import ResumeSanitizeDiagnostics, sanitize_resumed_history
 from workspace import Workspace
 
-CURRENT_SESSION_VERSION = 1
+CURRENT_SESSION_VERSION = 2
 SESSION_DIR_ENV = "MYCODEAGENT_SESSION_DIR"
 DEFAULT_AGENT_DIR_NAME = ".mycodeagent"
 SESSION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -257,15 +259,12 @@ class SessionStore:
         header = cls._parse_header(entries_raw[0])
         if header is None:
             raise ValueError(f"Session file has no valid header: {resolved}")
-        if header.version != CURRENT_SESSION_VERSION:
+        if header.version not in (1, CURRENT_SESSION_VERSION):
             if header.version > CURRENT_SESSION_VERSION:
                 raise ValueError(
                     f"Session version {header.version} is newer than supported "
                     f"version {CURRENT_SESSION_VERSION}"
                 )
-            raise ValueError(
-                f"Session version {header.version} requires a migration"
-            )
         validate_session_id(header.session_id)
 
         header_cwd = Path(header.cwd).resolve()

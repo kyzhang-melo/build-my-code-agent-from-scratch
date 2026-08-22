@@ -182,12 +182,11 @@ def test_run_one_turn_tool_call_replay_order(load_module, monkeypatch, tmp_path)
     state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
     _run(main_module.run_one_turn(state, session))
 
-    # Expected order: user, assistant text, reasoning, function_call,
-    # function_call_output. No assistant text between call and output.
-    types_seq = [m.get("type") or m.get("role") for m in state.messages]
-    assert types_seq == [
-        "user", "assistant", "reasoning", "function_call", "function_call_output",
+    assert [m.get("role") for m in state.messages] == ["user", "assistant", "tool"]
+    assert [block["type"] for block in state.messages[1]["content"]] == [
+        "reasoning", "text", "tool_call",
     ]
+    assert state.messages[2]["call_id"] == "c1"
 
 
 def test_run_one_turn_full_iteration(load_module, monkeypatch, tmp_path) -> None:
@@ -230,10 +229,12 @@ def test_run_one_turn_full_iteration(load_module, monkeypatch, tmp_path) -> None
     assert captured["input"][1]["content"] == "task part 2"
     assert "max_output_tokens" not in captured
     assert "reasoning" not in captured
-    assert any(m.get("type") == "function_call" and m.get("call_id") == "c1" for m in state.messages)
-    assert any(m.get("role") == "assistant" and m.get("content") == "Running command..." for m in state.messages)
-    assert state.messages[-1]["type"] == "function_call_output"
-    assert state.messages[-1]["output"] == "ok"
+    assistant = state.messages[-2]
+    assert assistant["role"] == "assistant"
+    assert [b["type"] for b in assistant["content"]] == ["text", "tool_call"]
+    assert assistant["content"][1]["pairing"]["call_id"] == "c1"
+    assert state.messages[-1]["role"] == "tool"
+    assert state.messages[-1]["content"] == "ok"
 
 
 def test_run_one_turn_uses_session_generation_config(
@@ -537,7 +538,7 @@ def test_run_one_turn_contract_warns_after_max_nudges(load_module, monkeypatch, 
     assert outcome is not None
     assert outcome.stop_reason == "completed"
     assert state.messages[-1]["role"] == "assistant"
-    assert "Ending with unresolved todo items" in state.messages[-1]["content"]
+    assert "Ending with unresolved todo items" in state.messages[-1]["content"][0]["text"]
     # Give-up path stops: the text is delivered as final_text, not surfaced twice.
     assert outcome.final_text == "Done."
     assert surfaced == []
@@ -611,7 +612,7 @@ def test_run_one_turn_tool_calls_extend_messages(load_module, monkeypatch, tmp_p
     assert outcome is None
     assert state.api_call_count == 1
     assert state.empty_response_nudges == 0
-    assert state.messages[-1]["type"] == "function_call_output"
+    assert state.messages[-1]["role"] == "tool"
 
 
 def test_run_one_turn_reasoning_only_response_is_nudged(load_module, monkeypatch, tmp_path) -> None:
@@ -625,8 +626,9 @@ def test_run_one_turn_reasoning_only_response_is_nudged(load_module, monkeypatch
 
     assert outcome is None
     assert state.empty_response_nudges == 1
-    assert state.messages[-2]["type"] == "reasoning"
-    assert state.messages[-2]["summary"][0]["text"] == "thought"
+    assert state.messages[-2]["role"] == "assistant"
+    reasoning = state.messages[-2]["content"][0]["provider_item"]
+    assert reasoning["summary"][0]["text"] == "thought"
     assert state.messages[-1]["role"] == "user"
     assert "assistant-visible text" in state.messages[-1]["content"]
 
@@ -679,7 +681,7 @@ def test_run_one_turn_empty_response_after_retry_returns_warning(load_module, mo
     assert "empty response with no tool calls" in outcome.final_text
     assert state.empty_response_nudges == 0
     assert state.messages[-1]["role"] == "assistant"
-    assert state.messages[-1]["content"] == outcome.final_text
+    assert state.messages[-1]["content"][0]["text"] == outcome.final_text
 
 
 def test_run_one_turn_debugs_empty_output_text_shape(load_module, monkeypatch, capsys, tmp_path) -> None:
@@ -785,7 +787,8 @@ def test_run_one_turn_subagent_accepts_after_max_attempts(load_module, monkeypat
     assert outcome is not None
     assert outcome.final_text == "Short."
     # ReportStopGate has no give-up note: no nudge or warning is appended.
-    assert state.messages[-1] == {"role": "assistant", "content": "Short."}
+    assert state.messages[-1]["role"] == "assistant"
+    assert state.messages[-1]["content"][0]["text"] == "Short."
 
 
 def test_run_one_turn_subagent_evaluates_only_current_text(load_module, monkeypatch, tmp_path) -> None:
@@ -818,7 +821,7 @@ def test_run_one_turn_budget_exhausted_returns_max_api_calls_outcome(load_module
     assert outcome is not None
     assert outcome.stop_reason == "max_api_calls"
     assert "stopped after max_api_calls" in outcome.final_text
-    assert state.messages[-1]["content"] == outcome.final_text
+    assert state.messages[-1]["content"][0]["text"] == outcome.final_text
 
 
 def test_agent_loop_injects_optional_turn_steering(
@@ -987,15 +990,16 @@ def test_malformed_json_arguments_normalized_in_history(load_module, monkeypatch
     assert len(captured_tool_calls) == 1
     assert captured_tool_calls[0].arguments == '{bad json'
     # Replayed history has sanitized arguments.
-    fc_records = [m for m in state.messages if m.get("type") == "function_call"]
+    fc_records = [b for m in state.messages if m.get("role") == "assistant"
+                  for b in m["content"] if b.get("type") == "tool_call"]
     assert len(fc_records) == 1
     assert fc_records[0]["arguments"] == "{}"
-    assert "id" not in fc_records[0]
-    assert fc_records[0]["call_id"] == "c1"
+    assert "item_id" not in fc_records[0]["pairing"]
+    assert fc_records[0]["pairing"]["call_id"] == "c1"
     # Error output preserved with parse error detail.
-    fco_records = [m for m in state.messages if m.get("type") == "function_call_output"]
+    fco_records = [m for m in state.messages if m.get("role") == "tool"]
     assert len(fco_records) == 1
-    assert "Expecting" in fco_records[0]["output"]
+    assert "Expecting" in fco_records[0]["content"]
 
 
 def test_valid_json_arguments_preserved_with_id(load_module, monkeypatch, tmp_path) -> None:
@@ -1021,11 +1025,12 @@ def test_valid_json_arguments_preserved_with_id(load_module, monkeypatch, tmp_pa
     state = main_module.LoopState(messages=[{"role": "user", "content": "run"}])
     _run(main_module.run_one_turn(state, session))
 
-    fc = [m for m in state.messages if m.get("type") == "function_call"][0]
+    fc = [b for m in state.messages if m.get("role") == "assistant"
+          for b in m["content"] if b.get("type") == "tool_call"][0]
     import json
     assert json.loads(fc["arguments"]) == {"command": "echo hi"}
-    assert fc["id"] == "fc_abc"
-    assert fc["call_id"] == "c1"
+    assert fc["pairing"]["item_id"] == "fc_abc"
+    assert fc["pairing"]["call_id"] == "c1"
 
 
 def test_mixed_batch_valid_and_malformed(load_module, monkeypatch, tmp_path) -> None:
@@ -1058,14 +1063,16 @@ def test_mixed_batch_valid_and_malformed(load_module, monkeypatch, tmp_path) -> 
     state = main_module.LoopState(messages=[{"role": "user", "content": "do both"}])
     _run(main_module.run_one_turn(state, session))
 
-    fc_records = {m["call_id"]: m for m in state.messages if m.get("type") == "function_call"}
-    assert fc_records["c1"]["id"] == "fc_valid"
+    blocks = [b for m in state.messages if m.get("role") == "assistant"
+              for b in m["content"] if b.get("type") == "tool_call"]
+    fc_records = {b["pairing"]["call_id"]: b for b in blocks}
+    assert fc_records["c1"]["pairing"]["item_id"] == "fc_valid"
     import json
     json.loads(fc_records["c1"]["arguments"])  # valid JSON
-    assert "id" not in fc_records["c2"]
+    assert "item_id" not in fc_records["c2"]["pairing"]
     assert fc_records["c2"]["arguments"] == "{}"
 
-    fco_call_ids = {m["call_id"] for m in state.messages if m.get("type") == "function_call_output"}
+    fco_call_ids = {m["call_id"] for m in state.messages if m.get("role") == "tool"}
     assert fco_call_ids == {"c1", "c2"}
 
 
@@ -1397,9 +1404,7 @@ def test_repl_prints_complete_resume_sanitization_diagnostics(
     output = capsys.readouterr().out
     assert "[session] resume sanitized:" in output
     assert "reasoning=1" in output
-    assert "function_call ids=2" in output
-    assert "orphan calls=1" in output
-    assert "orphan outputs=1" in output
+    assert "cross-runtime exchanges=1" in output
     assert "invalid JSONL lines=1" in output
 
 

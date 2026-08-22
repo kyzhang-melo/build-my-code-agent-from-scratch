@@ -31,6 +31,35 @@ def _create_store(workspace: Workspace, *args, **kwargs) -> SessionStore:
     return SessionStore.create(workspace, *args, **kwargs)
 
 
+def _assistant(*blocks, model="model-a", provider="") -> dict:
+    return {
+        "role": "assistant",
+        "content": list(blocks),
+        "runtime": {"model_id": model, "provider": provider, "protocol": "responses"},
+    }
+
+
+def _text(text: str) -> dict:
+    return {"type": "text", "text": text, "source": "test"}
+
+
+def _tool_call(call_id="c1", item_id="fc1") -> dict:
+    return {
+        "type": "tool_call", "name": "bash", "arguments": "{}",
+        "pairing": {"call_id": call_id, "item_id": item_id},
+    }
+
+
+def _reasoning() -> dict:
+    return {"type": "reasoning", "provider_item": {
+        "type": "reasoning", "id": "r1", "summary": "thinking...",
+    }}
+
+
+def _tool_result(call_id="c1", content="done") -> dict:
+    return {"role": "tool", "call_id": call_id, "content": content, "is_error": False}
+
+
 # ---------------------------------------------------------------------------
 # SessionStore: create + sync + messages round-trip
 # ---------------------------------------------------------------------------
@@ -79,7 +108,7 @@ def test_messages_projection_matches_history(workspace) -> None:
     store = _create_store(workspace, "test-id-3", "model-a")
     history = [
         {"role": "user", "content": "hello"},
-        {"role": "assistant", "content": "hi"},
+        _assistant(_text("hi")),
         {"role": "user", "content": "do something"},
     ]
     store.sync(history)
@@ -117,7 +146,7 @@ def test_create_sync_open_roundtrip(workspace) -> None:
     store = _create_store(workspace, "test-id-5", "model-a")
     history = [
         {"role": "user", "content": "hello"},
-        {"role": "assistant", "content": "world"},
+        _assistant(_text("world")),
     ]
     store.sync(history)
 
@@ -127,14 +156,34 @@ def test_create_sync_open_roundtrip(workspace) -> None:
     assert reopened.messages() == history
 
 
+def test_v1_history_migrates_and_first_sync_writes_v2(workspace) -> None:
+    store = _create_store(workspace, "legacy", "model-a")
+    store.sync([
+        {"role": "user", "content": "run"},
+        {"type": "function_call", "id": "fc1", "call_id": "c1",
+         "name": "bash", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": "done"},
+    ])
+    lines = store.path.read_text().splitlines()
+    header = json.loads(lines[0])
+    header["version"] = 1
+    store.path.write_text("\n".join([json.dumps(header), *lines[1:]]) + "\n")
+
+    reopened = SessionStore.open(store.path, workspace, "model-a")
+    migrated = reopened.messages()
+    assert [message.get("role") for message in migrated] == ["user", "assistant", "tool"]
+
+    reopened.sync(migrated)
+    assert json.loads(store.path.read_text().splitlines()[0])["version"] == 2
+
+
 def test_resume_different_model_drops_reasoning(workspace) -> None:
     store = _create_store(workspace, "test-id-6", "model-a")
     history = [
         {"role": "user", "content": "hello"},
-        {"type": "reasoning", "id": "r1", "summary": "thinking..."},
-        {"type": "function_call", "id": "fc1", "call_id": "c1", "name": "bash", "arguments": "{}"},
-        {"type": "function_call_output", "call_id": "c1", "output": "done"},
-        {"role": "assistant", "content": "result"},
+        _assistant(_reasoning(), _tool_call()),
+        _tool_result(),
+        _assistant(_text("result")),
     ]
     store.sync(history)
 
@@ -143,30 +192,23 @@ def test_resume_different_model_drops_reasoning(workspace) -> None:
 
     # Reasoning should be dropped.
     assert not any(m.get("type") == "reasoning" for m in projected)
-    # function_call id should be stripped, call_id retained.
-    fc = [m for m in projected if m.get("type") == "function_call"]
-    assert len(fc) == 1
-    assert "id" not in fc[0]
-    assert fc[0]["call_id"] == "c1"
-    # function_call_output should survive.
-    fco = [m for m in projected if m.get("type") == "function_call_output"]
-    assert len(fco) == 1
+    assert not any(m.get("role") == "tool" for m in projected)
+    assert any("Historical tool call" in str(m.get("content")) for m in projected)
 
 
 def test_resume_same_model_preserves_reasoning_and_id(workspace) -> None:
     store = _create_store(workspace, "test-id-7", "model-a")
     history = [
-        {"type": "reasoning", "id": "r1", "summary": "thinking..."},
-        {"type": "function_call", "id": "fc1", "call_id": "c1", "name": "bash", "arguments": "{}"},
-        {"type": "function_call_output", "call_id": "c1", "output": "done"},
+        _assistant(_reasoning(), _tool_call()),
+        _tool_result(),
     ]
     store.sync(history)
 
     reopened = SessionStore.open(store.path, workspace, "model-a")
     projected = reopened.messages()
-    assert any(m.get("type") == "reasoning" for m in projected)
-    fc = [m for m in projected if m.get("type") == "function_call"]
-    assert fc[0].get("id") == "fc1"
+    assistant = projected[0]
+    assert assistant["content"][0]["provider_item"]["id"] == "r1"
+    assert assistant["content"][1]["pairing"]["item_id"] == "fc1"
 
 
 def test_resume_same_model_different_provider_sanitizes(workspace) -> None:
@@ -174,15 +216,8 @@ def test_resume_same_model_different_provider_sanitizes(workspace) -> None:
         workspace, "test-provider", "model-a", "provider-a",
     )
     store.sync([
-        {"type": "reasoning", "id": "r1", "summary": "thinking"},
-        {
-            "type": "function_call",
-            "id": "fc1",
-            "call_id": "c1",
-            "name": "bash",
-            "arguments": "{}",
-        },
-        {"type": "function_call_output", "call_id": "c1", "output": "done"},
+        _assistant(_reasoning(), _tool_call(), provider="provider-a"),
+        _tool_result(),
     ])
 
     reopened = SessionStore.open(
@@ -191,10 +226,9 @@ def test_resume_same_model_different_provider_sanitizes(workspace) -> None:
     projected = reopened.messages()
 
     assert not any(item.get("type") == "reasoning" for item in projected)
-    call = next(item for item in projected if item.get("type") == "function_call")
-    assert "id" not in call
+    assert not any(item.get("role") == "tool" for item in projected)
     assert reopened.resume_diagnostics.dropped_reasoning == 1
-    assert reopened.resume_diagnostics.stripped_function_call_ids == 1
+    assert reopened.resume_diagnostics.textualized_cross_runtime_exchanges == 1
 
 
 def test_resume_drops_orphan_trailing_function_call(workspace) -> None:
@@ -636,12 +670,12 @@ def test_history_prefix_change_is_detected_even_when_tail_is_unchanged(workspace
     store = _create_store(workspace, "test-prefix", "model-a")
     original = [
         {"role": "user", "content": "old"},
-        {"role": "assistant", "content": "same tail"},
+        _assistant(_text("same tail")),
     ]
     store.sync(original)
     changed = [
         {"role": "user", "content": "new"},
-        {"role": "assistant", "content": "same tail"},
+        _assistant(_text("same tail")),
     ]
     store.sync(changed)
 

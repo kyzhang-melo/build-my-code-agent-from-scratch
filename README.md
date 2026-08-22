@@ -49,13 +49,14 @@ remain restricted to the workdir.
 - `prompt-toolkit==3.0.52`
 - `python-dotenv`
 - `pytest`
+- `hypothesis` (property-based protocol and replay-order tests)
 
 Install dependencies (example):
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install openai "prompt-toolkit==3.0.52" python-dotenv
+pip install openai "prompt-toolkit==3.0.52" python-dotenv pytest hypothesis
 ```
 
 Or install from file:
@@ -152,8 +153,9 @@ Resume behavior:
 - The session's cwd must match the current working directory. A mismatch is rejected (the session header's cwd is not adopted, since that would let a
   disk file determine the workspace and permission boundary).
 - Permission mode and session-level approvals are not restored.
-- When the model or pinned provider has changed, `reasoning` items and provider-assigned `function_call.id` values are dropped during load. `call_id` is retained so tool-call/output pairing stays intact.
-- Unpaired function calls and outputs, including partially completed parallel tool batches, are removed before replay. A safe diagnostic count is printed whenever resume sanitization changes the loaded history.
+- Session schema v2 stores each model response as one assistant message with ordered reasoning, text, and tool-call blocks; tool results are separate messages immediately following it. Version 1 flat histories are migrated conservatively on resume.
+- When the model or pinned provider has changed, provider-specific reasoning and item IDs are not replayed. Completed tool exchanges are converted to ordinary assistant text instead of carrying structural pairing data across runtimes.
+- Incomplete or invalid tool exchanges, including partially completed parallel batches, are removed before replay. A safe diagnostic count is printed whenever resume sanitization changes the loaded history.
 - Todo state, including an explicitly cleared plan, is restored so `TodoStopGate` remains consistent after resume.
 - A turn interrupted before `agent_loop` completes is discarded; resume starts from the last completed turn, avoiding accidental replay of tool side effects.
 - A per-session lock enforces one CLI writer at a time. A second process trying to resume the same active session is rejected.
