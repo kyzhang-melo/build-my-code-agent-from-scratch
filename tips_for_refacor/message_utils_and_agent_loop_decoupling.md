@@ -144,3 +144,57 @@ myAgentHarness 应在早期把逻辑消息模型和协议转换 API 明确定义
 loop 依赖稳定的 message abstraction，而不是依赖某个 provider 当前的 wire
 format。这样未来增加 thinking model、切换 provider、引入持久化或 context
 compaction 时，改动会集中在协议适配层，而不会再次牵动整个 harness。
+
+## 社区佐证：这是 Responses API agent 开发的普遍坑（2026-08 调研）
+
+这个坑并非本项目独有。GitHub 与 OpenAI 官方论坛有大量同类事故，说明
+"配对约束真实存在但未文档化"是这个生态的普遍现状：
+
+### 官方 SDK 仓库的未解 issue
+
+- openai/openai-python#3009 与 openai/openai-node#1791：标题即
+  "undocumented reasoning+message pairing constraint breaks multi-turn
+  conversations"。核心内容：reasoning 与 message items 必须在 input 中
+  作为连续对出现，但文档从未说明；最常见的模式——过滤
+  `response.output` 只保留 messages——会静默产生孤儿 items，下一轮 400。
+  该问题曾导致 OpenClaw（64.9k forks）在 gpt-5.3-codex 上崩溃，最终他们
+  不得不添加 `downgradeOpenAIReasoningBlocks()` 来剥离孤儿 reasoning。
+- openai/openai-python#3008：把 `response.output` 经 `model_dump()` 原样
+  回传，第二轮 400——SDK 会编造 `status: None` 等字段，API 拒绝未知 null
+  参数。同样是"忠实回放"与"序列化边界"没有分离的问题。
+
+### OpenAI 官方论坛的同款报错
+
+- "'function_call' was provided without its required 'reasoning' item"
+  （本项目 bug 1 的 OpenAI 原版报错）：从 o3-mini 换 o4-mini 后必现；
+  社区 workaround 是在 function_call 前补一个空 reasoning item。
+- "400 No tool call found for function call output with call_id"
+  （本项目 bug 2 的 OpenAI 原版）：多个帖子，甚至 store: true 且正确
+  echo 也会偶发。
+- "Item 'rs_...' of type 'reasoning' was provided without its required
+  following item"：OpenAI 官方模型上 reasoning↔message 也有配对约束，
+  不只 DeepSeek 这类第三方 thinking 模型。
+- openclaw/openclaw#12885：store: false 时回放含 rs_ id 的历史直接 404
+  "Item not found"——reasoning item ID 的生命周期还受服务端存储策略影响。
+
+### 官方文档只写"应该做"，没写"违反会怎样"
+
+- Reasoning models 指南：pass back any reasoning items returned with
+  the last function call（语气是 recommend，实际是硬约束）。
+- Cookbook（Handling Function Calls with Reasoning Models）：it is
+  essential that we preserve any reasoning and function call responses
+  in our conversation history。
+- Conversation state 指南：Replaying the complete output keeps
+  reasoning items and assistant phase values intact。
+
+### 三条被反复验证的规律
+
+1. 配对约束真实存在但未文档化：reasoning → function_call →
+   function_call_output 的顺序与配对在 OpenAI 官方模型、OpenRouter 的
+   DeepSeek 等多处生效，报错文案各异但根因相同。
+2. 最常见的触发模式就是对 `response.output` 做过滤或重排后再回放——
+   正是扁平追加式 harness 的天然形态。
+3. 成熟项目的解法殊途同归：OpenClaw 加 downgradeOpenAIReasoningBlocks()，
+   pi 用 thinkingSignature 完整保存原始 item，本项目用逻辑消息 + 忠实
+   序列化 + 跨 runtime textualize——本质都是"存储 provider 无关结构，
+   回放时完整还原或显式降级，绝不猜测顺序"。
