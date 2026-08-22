@@ -83,6 +83,22 @@ def test_copy_command(load_module, capsys, tmp_path, monkeypatch) -> None:
     assert copied["text"] == "latest answer"
     assert "copied last response" in capsys.readouterr().out
 
+    # Logical block format: content is a list of blocks.
+    history = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "reasoning", "provider_item": {}},
+                {"type": "text", "text": "block answer"},
+            ],
+            "runtime": {"model_id": "m", "provider": "p", "protocol": "responses"},
+        },
+    ]
+    assert _run(main_module.handle_command("/copy", history, session)) is True
+    assert copied["text"] == "block answer"
+    assert "copied last response" in capsys.readouterr().out
+
 
 def test_permission_mode_commands(load_module, capsys, tmp_path) -> None:
     main_module = load_module("main", "main.py")

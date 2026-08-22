@@ -922,13 +922,17 @@ def _copy_to_clipboard(text: str) -> str | None:
 
 
 def _last_assistant_text(history: list) -> str | None:
-    """Return the most recent assistant text message in the history."""
+    """Return the most recent assistant text message in the history.
+
+    Handles both the logical block format (content is a list of blocks) and
+    the legacy plain-string format.
+    """
     for message in reversed(history):
         if message.get("role") != "assistant":
             continue
-        content = message.get("content")
-        if isinstance(content, str) and content.strip():
-            return content
+        text = assistant_text(message).strip()
+        if text:
+            return text
     return None
 
 
