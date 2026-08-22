@@ -639,6 +639,20 @@ async def run_one_turn(state: LoopState, session: AgentSession) -> StepOutcome |
     response_output = getattr(response, "output", None) or []
 
     tool_calls = []
+    # Replay-order contract: history must preserve the provider's output
+    # item pairing. Two invariants matter for thinking-mode providers:
+    #   - reasoning_text must precede its function_call;
+    #   - function_call_output must immediately follow its function_call
+    #     (no assistant text in between).
+    # When the response carries tool calls, its text accompanies the calls, so
+    # it must be recorded BEFORE the reasoning/call items to keep call and
+    # output adjacent. Text is emitted in item order below otherwise.
+    response_has_tool_calls = any(
+        _response_item_attr(item, "type") == "function_call"
+        for item in response_output
+    )
+    if output_text and response_has_tool_calls:
+        state.messages.append({"role": "assistant", "content": output_text})
     for item in response_output:
         item_type = _response_item_attr(item, "type")
         if item_type == "reasoning":
@@ -681,13 +695,6 @@ async def run_one_turn(state: LoopState, session: AgentSession) -> StepOutcome |
             state.messages.append(function_call)
 
             tool_calls.append(item)
-
-    # Assistant text is recorded after reasoning/function_call items so the
-    # replayed history preserves the response's original item order.
-    # Thinking-mode providers (e.g. DeepSeek) require reasoning_text to
-    # precede its function_call; text-first ordering breaks that pairing.
-    if output_text and tool_calls:
-        state.messages.append({"role": "assistant", "content": output_text})
 
     if not tool_calls:
         response_text = output_text.strip()

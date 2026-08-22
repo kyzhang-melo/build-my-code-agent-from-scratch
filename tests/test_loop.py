@@ -154,6 +154,42 @@ def _client_for_response(response, captured: dict | None = None):
     return types.SimpleNamespace(responses=types.SimpleNamespace(create=fake_create))
 
 
+def test_run_one_turn_tool_call_replay_order(load_module, monkeypatch, tmp_path) -> None:
+    """Text accompanying tool calls must be recorded BEFORE the reasoning /
+    function_call items so that call -> function_call_output stay adjacent,
+    and reasoning must precede its function_call. Thinking-mode providers
+    (e.g. DeepSeek) reject replayed history that breaks either pairing."""
+    main_module = load_module("main", "main.py")
+    session = _parent(main_module, tmp_path)
+
+    def item(type_, **kw):
+        return types.SimpleNamespace(type=type_, **kw)
+
+    reasoning = item("reasoning", content=[{"type": "reasoning_text", "text": "think"}], summary=[])
+    function_call = item("function_call", call_id="c1", name="bash", arguments='{"command":"echo hi"}')
+    fake_response = types.SimpleNamespace(
+        output=[reasoning, function_call],
+        output_text="Running command...",
+    )
+
+    monkeypatch.setattr(main_module, "client", _client_for_response(fake_response, {}))
+
+    async def fake_execute(_output, *_args, **_kwargs):
+        return ([{"type": "function_call_output", "call_id": "c1", "output": "ok"}], False)
+
+    monkeypatch.setattr(main_module, "execute_tool_calls_async", fake_execute)
+
+    state = main_module.LoopState(messages=[{"role": "user", "content": "task"}])
+    _run(main_module.run_one_turn(state, session))
+
+    # Expected order: user, assistant text, reasoning, function_call,
+    # function_call_output. No assistant text between call and output.
+    types_seq = [m.get("type") or m.get("role") for m in state.messages]
+    assert types_seq == [
+        "user", "assistant", "reasoning", "function_call", "function_call_output",
+    ]
+
+
 def test_run_one_turn_full_iteration(load_module, monkeypatch, tmp_path) -> None:
     main_module = load_module("main", "main.py")
     session = _parent(main_module, tmp_path)
