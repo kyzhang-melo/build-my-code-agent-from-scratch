@@ -298,3 +298,36 @@
 ### Items for improvement
 
 - Context compact still has room for improvement: summaries should preserve more file-level technical details, function names, and already-confirmed conclusions so the agent does not need to re-read source files for follow-up questions after compaction.
+
+## Aug 22
+
+### What I've done
+
+- Removed the 60-call `max_api_calls` cap: both parent and subagent budgets now default to `0`, which the stop gate treats as unlimited.
+- Added an interactive `/approval` command that toggles human approval off/on for the session; core safety guards (workspace escapes, hard-denied shell commands, sensitive files) still apply when auto-approval is on.
+- Added a `/copy` command that copies the most recent model response to the system clipboard (pbcopy / wl-copy / xclip / xsel).
+- Fixed a thinking-mode 400 bug: `run_one_turn()` used to append the final `output_text` to history *before* the reasoning/function_call items, inverting the response's item order.
+
+### Why (the thinking-mode 400 bug, worth remembering)
+
+- Symptom: on the 8th API call of a turn, DeepSeek's thinking model returned
+  `400: The reasoning_text in the thinking mode must be passed back to the API`,
+  which crashed the whole agent loop (the request path re-raises after tracing).
+- Root cause: history recording order. The loop appended the assistant text
+  first, then iterated `response.output` to append `reasoning` and
+  `function_call` items. The replayed history therefore looked like
+  `assistant text -> reasoning -> ... -> function_call`, i.e. some
+  `function_call` items had no preceding paired `reasoning_text`.
+- Thinking-mode providers (DeepSeek et al.) require each tool call to be
+  preceded by its own reasoning item when history is replayed; a text-first
+  ordering silently breaks that pairing. It only surfaces after enough
+  multi-tool turns, which is why early calls succeeded.
+- Diagnosis method: dump the persisted session JSONL and check the actual item
+  order. Item 22 was the final answer text and item 23 was *its own* reasoning,
+  proving the order inversion without guessing.
+- Fix: append `output_text` only *after* processing the response items, in both
+  the tool-call path and the final-answer path, so replayed history preserves
+  the model's original `[reasoning, function_call, ..., text]` ordering.
+- Lesson: when an API demands item pairing, never reorder items while
+  persisting history; keep the provider's response order verbatim. Also,
+  per-item "what did the provider actually return" dumps beat spec reading.
